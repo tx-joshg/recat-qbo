@@ -12,8 +12,10 @@
 //    Intuit/demo consent screen).
 //  - GET /auth/qbo/callback returns to /setup?connected=<companyId>.
 //  - /connect (connect another company) re-enters at the Connect step via
-//    /setup?step=connect — REAL mode when the instance has Intuit credentials,
-//    demo otherwise.
+//    /setup?step=connect and shows the same demo-vs-real chooser as the Start
+//    step. /setup?step=connect&mode=real (the Settings upgrade card) skips the
+//    chooser; the real path detours through Credentials when the instance has
+//    no Intuit credentials yet, then returns to Connect.
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
@@ -131,9 +133,10 @@ function initialProgress(): WizardProgress {
   // OAuth callback failure — stay on the Connect step so the user can retry.
   if (params.get('error') === 'connect_failed') return { ...base, stepId: 'connect', adminSent: false };
   if (params.get('step') === 'connect') {
-    // /connect re-entry — fresh connection; the mode resolves from the setup
-    // status once loaded (real when Intuit credentials exist, demo otherwise).
-    return { ...base, stepId: 'connect', mode: null, adminSent: false, companyId: null };
+    // /connect re-entry — fresh connection. ?mode=real skips the chooser
+    // (Settings upgrade card); otherwise the demo-vs-real chooser shows.
+    const mode: StartMode = params.get('mode') === 'real' ? 'real' : null;
+    return { ...base, stepId: 'connect', mode, adminSent: false, companyId: null };
   }
   return base;
 }
@@ -179,6 +182,43 @@ const fieldLabel = {
   marginBottom: 6,
 } as const;
 
+/** The demo-vs-real choice cards — shared by the Start step and the /connect
+ * re-entry chooser (styles verbatim from the Start step / prototype). */
+function ModeCards({
+  mode,
+  onSelect,
+}: {
+  mode: StartMode;
+  onSelect: (m: 'demo' | 'real') => void;
+}) {
+  const cardStyle = (m: 'demo' | 'real') =>
+    ({
+      flex: 1,
+      border: `1.5px solid ${mode === m ? 'var(--acc)' : 'var(--bd2)'}`,
+      background: 'var(--card)',
+      borderRadius: 10,
+      padding: '14px 16px',
+      cursor: 'pointer',
+    }) as const;
+  return (
+    <div style={{ display: 'flex', gap: 10 }}>
+      <label onClick={() => onSelect('demo')} style={cardStyle('demo')}>
+        <div style={{ fontSize: 14.5, fontWeight: 600 }}>Try the demo</div>
+        <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
+          A built-in fake QuickBooks with sample companies. No Intuit account, nothing to
+          configure — explore every feature safely.
+        </div>
+      </label>
+      <label onClick={() => onSelect('real')} style={cardStyle('real')}>
+        <div style={{ fontSize: 14.5, fontWeight: 600 }}>Connect my real QuickBooks</div>
+        <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
+          Bring your own free Intuit API keys. Demo data stays available on the side.
+        </div>
+      </label>
+    </div>
+  );
+}
+
 export default function Setup() {
   const {
     session,
@@ -196,8 +236,10 @@ export default function Setup() {
   const [connectFailed, setConnectFailed] = useState(
     () => new URLSearchParams(window.location.search).get('error') === 'connect_failed',
   );
-  // /connect entry — pick real/demo automatically from the setup status.
-  const [autoMode] = useState(
+  // /connect entry — the wizard was re-entered just to add a connection; the
+  // demo-vs-real chooser shows (unless ?mode=real pre-picked the real path),
+  // and the real path detours through Credentials when the instance has none.
+  const [connectEntry] = useState(
     () => new URLSearchParams(window.location.search).get('step') === 'connect',
   );
   const [stepId, setStepId] = useState<StepId>(initial.stepId);
@@ -270,12 +312,13 @@ export default function Setup() {
     };
   }, []);
 
-  // /connect entry: resolve the connection mode from the instance state —
-  // real when Intuit credentials exist, demo otherwise.
+  // /connect entry, real path: the instance has no Intuit credentials yet —
+  // collect them on the Credentials step first, then return to Connect
+  // (submitCredentials jumps straight back for connect re-entries).
   useEffect(() => {
-    if (!autoMode || mode !== null || !status) return;
-    setMode(status.credentialsSet ? 'real' : 'demo');
-  }, [autoMode, mode, status]);
+    if (!connectEntry || mode !== 'real' || stepId !== 'connect' || !status) return;
+    if (!status.credentialsSet) setStepId('credentials');
+  }, [connectEntry, mode, stepId, status]);
 
   // The Admin step is done already when a session exists and setup isn't needed.
   useEffect(() => {
@@ -414,12 +457,16 @@ export default function Setup() {
     }
   };
 
+  // Where Credentials leads: a /connect re-entry only detoured here for the
+  // keys, so it returns straight to Connect; the first-run flow continues on.
+  const afterCredentials = () => (connectEntry ? setStepId('connect') : goNext());
+
   const submitCredentials = async () => {
     const id = clientId.trim();
     const secret = clientSecret.trim();
     if (!id || !secret) {
       if (status?.credentialsSet) {
-        goNext();
+        afterCredentials();
         return;
       }
       toast('Enter your Intuit app client ID and secret');
@@ -429,7 +476,7 @@ export default function Setup() {
     try {
       await setup.credentials({ clientId: id, clientSecret: secret, env });
       setStatus((s) => (s ? { ...s, credentialsSet: true } : s));
-      goNext();
+      afterCredentials();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save the credentials');
     } finally {
@@ -617,6 +664,10 @@ export default function Setup() {
       return;
     }
     if (stepId === 'connect') {
+      if (mode === null) {
+        toast('Pick how you want to connect');
+        return;
+      }
       if (!companyId) {
         toast('Connect QuickBooks first');
         return;
@@ -714,41 +765,7 @@ export default function Setup() {
                 real flow never routes you to fake data. You can add the other kind of connection
                 later in Settings.
               </div>
-              <div style={{ display: 'flex', gap: 10 }}>
-                <label
-                  onClick={() => setMode('demo')}
-                  style={{
-                    flex: 1,
-                    border: `1.5px solid ${mode === 'demo' ? 'var(--acc)' : 'var(--bd2)'}`,
-                    background: 'var(--card)',
-                    borderRadius: 10,
-                    padding: '14px 16px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Try the demo</div>
-                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
-                    A built-in fake QuickBooks with sample companies. No Intuit account, nothing to
-                    configure — explore every feature safely.
-                  </div>
-                </label>
-                <label
-                  onClick={() => setMode('real')}
-                  style={{
-                    flex: 1,
-                    border: `1.5px solid ${mode === 'real' ? 'var(--acc)' : 'var(--bd2)'}`,
-                    background: 'var(--card)',
-                    borderRadius: 10,
-                    padding: '14px 16px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Connect my real QuickBooks</div>
-                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
-                    Bring your own free Intuit API keys. Demo data stays available on the side.
-                  </div>
-                </label>
-              </div>
+              <ModeCards mode={mode} onSelect={setMode} />
             </div>
           )}
 
@@ -1125,8 +1142,19 @@ export default function Setup() {
             </div>
           )}
 
-          {/* ---- step · Connect (real: env cards + Intuit; demo: one-click fake consent) ---- */}
-          {stepId === 'connect' && !syncing && (
+          {/* ---- step · Connect (no mode yet: the demo-vs-real chooser;
+               real: env cards + Intuit; demo: one-click fake consent) ---- */}
+          {stepId === 'connect' && !syncing && mode === null && (
+            <div>
+              <div style={stepTitle}>Connect another company</div>
+              <div style={stepCopy}>
+                Demo companies and real QuickBooks connections live side by side — pick where
+                this one comes from.
+              </div>
+              <ModeCards mode={mode} onSelect={setMode} />
+            </div>
+          )}
+          {stepId === 'connect' && !syncing && mode !== null && (
             <div>
               {mode === 'demo' ? (
                 <>
@@ -1145,11 +1173,6 @@ export default function Setup() {
                     companies later in Settings.
                   </div>
                 </>
-              )}
-              {mode === null && (
-                <div style={{ fontSize: 13, color: 'var(--fnt)', marginBottom: 14 }}>
-                  Checking this instance's QuickBooks configuration…
-                </div>
               )}
               {mode === 'real' && (
                 <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
@@ -1232,7 +1255,6 @@ export default function Setup() {
               {!companyId ? (
                 <button
                   onClick={() => void connectQbo()}
-                  disabled={mode === null}
                   className="sw-primary"
                   style={{
                     width: '100%',
@@ -1243,8 +1265,7 @@ export default function Setup() {
                     padding: 13,
                     fontSize: 15,
                     fontWeight: 600,
-                    cursor: mode === null ? 'default' : 'pointer',
-                    opacity: mode === null ? 0.6 : 1,
+                    cursor: 'pointer',
                     fontFamily: 'inherit',
                   }}
                 >

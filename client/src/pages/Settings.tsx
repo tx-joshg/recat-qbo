@@ -3,7 +3,9 @@
 // tags-required, category suggestions, team (admin), sync history, danger zone.
 
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import type { InstanceSettingsDto, SyncLogDto } from '@recat/shared';
+import { isDemoRealmId } from '@recat/shared';
 import { api, companies as companiesApi, instanceSettings } from '../lib/api';
 import { ToggleSwitch } from '../components/ui';
 import { useApp } from '../state/AppContext';
@@ -19,10 +21,23 @@ import TeamCard from './settings/TeamCard';
 import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
-  const { role, activeCompany, updateCompany, refreshCompanies, dryRun, tagsRequired, toast } =
-    useApp();
+  const {
+    role,
+    companies,
+    activeCompany,
+    updateCompany,
+    refreshCompanies,
+    dryRun,
+    tagsRequired,
+    toast,
+  } = useApp();
+  const navigate = useNavigate();
   const isAdmin = role === 'admin';
   const companyId = activeCompany?.id ?? null;
+
+  // Demo-only instance (every connected company is a built-in demo) — invite
+  // the admin to upgrade to real books. Gone the moment any real company exists.
+  const demoOnly = companies.length > 0 && companies.every((c) => isDemoRealmId(c.realmId));
 
   const [holdingOptions, setHoldingOptions] = useState<HoldingAccountOption[]>([]);
   const [syncLog, setSyncLog] = useState<SyncLogDto[]>([]);
@@ -131,6 +146,46 @@ export default function Settings() {
 
       {activeCompany && (
         <>
+          {/* upgrade to real books (admin, demo-only instances) */}
+          {isAdmin && demoOnly && (
+            <div
+              style={{
+                border: '1px solid var(--bd2)',
+                borderRadius: 10,
+                background: 'var(--card)',
+                padding: '20px 24px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 16,
+              }}
+            >
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 15, fontWeight: 600 }}>Ready for your real books?</div>
+                <div style={{ fontSize: 13.5, color: 'var(--mut)', marginTop: 3, lineHeight: 1.5 }}>
+                  Connect your real QuickBooks with your own free Intuit keys — the demo companies
+                  stay until you remove them.
+                </div>
+              </div>
+              <HoverButton
+                onClick={() => navigate('/connect?mode=real')}
+                style={{
+                  border: 'none',
+                  background: 'var(--acc)',
+                  color: '#fff',
+                  borderRadius: 7,
+                  padding: '9px 16px',
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+                hoverStyle={{ background: 'var(--accH)' }}
+              >
+                Connect real QuickBooks
+              </HoverButton>
+            </div>
+          )}
+
           {/* connection */}
           <ConnectionCard
             key={activeCompany.id}
