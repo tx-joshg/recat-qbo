@@ -51,6 +51,9 @@ const STEP_LABELS: Record<StepId, string> = {
 
 const REAL_STEPS: StepId[] = ['start', 'admin', 'credentials', 'email', 'connect', 'accounts', 'sync'];
 const DEMO_STEPS: StepId[] = ['start', 'admin', 'email', 'connect', 'accounts', 'sync'];
+// Add-a-company re-entries: Start/Admin/Credentials/Email are done facts on a
+// set-up instance, so the rail is just the connection itself.
+const CONNECT_STEPS: StepId[] = ['connect', 'accounts', 'sync'];
 
 /** The rail (and flow) for the chosen path. Before a choice is made the
  * full/real rail shows as the superset — it shrinks the moment demo is picked. */
@@ -90,6 +93,8 @@ interface WizardProgress {
   adminEmail: string;
   adminSent: boolean;
   companyId: string | null;
+  /** true when the wizard was re-entered just to add a connection. */
+  connectEntry: boolean;
 }
 
 const DEFAULT_PROGRESS: WizardProgress = {
@@ -100,6 +105,7 @@ const DEFAULT_PROGRESS: WizardProgress = {
   adminEmail: '',
   adminSent: false,
   companyId: null,
+  connectEntry: false,
 };
 
 function readSavedProgress(): WizardProgress | null {
@@ -120,6 +126,7 @@ function readSavedProgress(): WizardProgress | null {
       adminEmail: typeof p.adminEmail === 'string' ? p.adminEmail : '',
       adminSent: p.adminSent === true,
       companyId: typeof p.companyId === 'string' ? p.companyId : null,
+      connectEntry: p.connectEntry === true,
     };
   } catch {
     return null;
@@ -138,7 +145,7 @@ function initialProgress(): WizardProgress {
     // /connect re-entry — fresh connection. ?mode=real skips the chooser
     // (Settings upgrade card); otherwise the demo-vs-real chooser shows.
     const mode: StartMode = params.get('mode') === 'real' ? 'real' : null;
-    return { ...base, stepId: 'connect', mode, adminSent: false, companyId: null };
+    return { ...base, stepId: 'connect', mode, adminSent: false, companyId: null, connectEntry: true };
   }
   return base;
 }
@@ -241,9 +248,7 @@ export default function Setup() {
   // /connect entry — the wizard was re-entered just to add a connection; the
   // demo-vs-real chooser shows (unless ?mode=real pre-picked the real path),
   // and the real path detours through Credentials when the instance has none.
-  const [connectEntry] = useState(
-    () => new URLSearchParams(window.location.search).get('step') === 'connect',
-  );
+  const [connectEntry, setConnectEntry] = useState(initial.connectEntry);
   const [stepId, setStepId] = useState<StepId>(initial.stepId);
   const [mode, setMode] = useState<StartMode>(initial.mode);
   const [env, setEnv] = useState<QboEnv>(initial.env);
@@ -284,7 +289,13 @@ export default function Setup() {
   const connectedCompany = companyId ? companies.find((c) => c.id === companyId) ?? null : null;
 
   // The rail/flow for the chosen path (real is the superset before a choice).
-  const steps = stepsFor(mode);
+  // Add-a-company re-entries get the compact flow; Credentials joins the rail
+  // only while detoured there for genuinely missing keys.
+  const steps = connectEntry
+    ? stepId === 'credentials'
+      ? (['credentials', ...CONNECT_STEPS] as StepId[])
+      : CONNECT_STEPS
+    : stepsFor(mode);
   const stepIdx = Math.max(0, steps.indexOf(stepId));
   const goNext = () => setStepId(steps[Math.min(stepIdx + 1, steps.length - 1)] ?? 'sync');
   const goBack = () => setStepId(steps[Math.max(stepIdx - 1, 0)] ?? 'start');
@@ -303,9 +314,9 @@ export default function Setup() {
 
   // Persist progress so magic-link / OAuth departures resume where they left off.
   useEffect(() => {
-    const p: WizardProgress = { stepId, mode, env, syncMode, adminEmail, adminSent, companyId };
+    const p: WizardProgress = { stepId, mode, env, syncMode, adminEmail, adminSent, companyId, connectEntry };
     sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
-  }, [stepId, mode, env, syncMode, adminEmail, adminSent, companyId]);
+  }, [stepId, mode, env, syncMode, adminEmail, adminSent, companyId, connectEntry]);
 
   // Setup status (needsSetup / credentialsSet / redirectUri).
   useEffect(() => {
@@ -330,6 +341,25 @@ export default function Setup() {
     if (!connectEntry || mode !== 'real' || stepId !== 'connect' || !status) return;
     if (!status.credentialsSet) setStepId('credentials');
   }, [connectEntry, mode, stepId, status]);
+
+  // A set-up instance (admin exists, a company connected) re-opening /setup is
+  // here to add a connection, never to redo Start/Admin/Email — and saved
+  // Intuit keys are instance-wide, so Credentials only stays when they're
+  // genuinely missing. Jump straight to the Connect chooser.
+  useEffect(() => {
+    if (connectEntry || !session || !status || status.needsSetup || companies.length === 0) return;
+    const preConnect =
+      stepId === 'start' ||
+      stepId === 'admin' ||
+      stepId === 'email' ||
+      (stepId === 'credentials' && status.credentialsSet);
+    if (preConnect) {
+      setConnectEntry(true);
+      setMode(null);
+      setCompanyId(null);
+      setStepId('connect');
+    }
+  }, [connectEntry, session, status, companies, stepId]);
 
   // The Admin step is done already when a session exists and setup isn't needed.
   useEffect(() => {
@@ -458,6 +488,7 @@ export default function Setup() {
           adminEmail,
           adminSent: false,
           companyId,
+          connectEntry,
         };
         sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
         window.location.href = devLink;
@@ -571,7 +602,16 @@ export default function Setup() {
     setConnecting(true);
     try {
       // Flush progress before leaving for the consent screen (Intuit or demo).
-      const p: WizardProgress = { stepId, mode, env, syncMode, adminEmail, adminSent: false, companyId };
+      const p: WizardProgress = {
+        stepId,
+        mode,
+        env,
+        syncMode,
+        adminEmail,
+        adminSent: false,
+        companyId,
+        connectEntry,
+      };
       sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
       const { url } = await companiesApi.connectUrl(
         mode === 'demo' ? { mode: 'demo' } : { mode: 'real', env },
@@ -642,7 +682,9 @@ export default function Setup() {
     }
   };
 
-  const wBack = goBack;
+  // Back from an add-a-company credentials detour cancels back to Connect
+  // (goBack can't — Credentials sits at index 0 of the compact rail).
+  const wBack = () => (connectEntry && stepId === 'credentials' ? setStepId('connect') : goBack());
 
   const wNext = () => {
     if (busy || syncing) return;
@@ -733,7 +775,7 @@ export default function Setup() {
             }}
           />
           <span style={{ fontFamily: "'IBM Plex Sans'", fontSize: 14, color: 'var(--fnt)', marginLeft: 12 }}>
-            First-run setup
+            {connectEntry ? 'Add a company' : 'First-run setup'}
           </span>
         </div>
 
