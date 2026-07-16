@@ -14,6 +14,8 @@ import { useApp } from '../state/AppContext';
 /** Actual /auth/magic-link response (lib/api.ts types it void — see server routes/auth.ts). */
 interface MagicLinkResponse {
   ok: boolean;
+  /** false when this instance has no SMTP configured — no email was sent. */
+  delivered?: boolean;
   devLink?: string;
 }
 
@@ -24,6 +26,7 @@ export default function Login() {
   const [email, setEmail] = useState('');
   const [sent, setSent] = useState(false);
   const [devLink, setDevLink] = useState<string | null>(null);
+  const [delivered, setDelivered] = useState(true);
   const [sending, setSending] = useState(false);
 
   // Already signed in → the app. First boot (no admin user yet) → the wizard.
@@ -55,6 +58,7 @@ export default function Login() {
     try {
       const res = await api.post<MagicLinkResponse>('/auth/magic-link', { email: trimmed });
       setDevLink(res.devLink ?? null);
+      setDelivered(res.delivered ?? true);
       setSent(true);
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not send the link — try again');
@@ -173,33 +177,81 @@ export default function Login() {
               >
                 ✉
               </div>
-              <div style={{ fontFamily: "'Spectral',serif", fontSize: 21, fontWeight: 500 }}>
-                Check your inbox
-              </div>
-              <div style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}>
-                We sent a sign-in link to <b style={{ color: 'var(--ink)' }}>{email.trim()}</b>. It
-                expires in 15 minutes.
-              </div>
+              {delivered ? (
+                <>
+                  <div style={{ fontFamily: "'Spectral',serif", fontSize: 21, fontWeight: 500 }}>
+                    Check your inbox
+                  </div>
+                  <div
+                    style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}
+                  >
+                    We sent a sign-in link to <b style={{ color: 'var(--ink)' }}>{email.trim()}</b>.
+                    It expires in 15 minutes.
+                  </div>
+                </>
+              ) : devLink !== null ? (
+                <>
+                  <div style={{ fontFamily: "'Spectral',serif", fontSize: 21, fontWeight: 500 }}>
+                    You're one click away
+                  </div>
+                  <div
+                    style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}
+                  >
+                    This server doesn't send email yet, so nothing was mailed to{' '}
+                    <b style={{ color: 'var(--ink)' }}>{email.trim()}</b> — use your one-time
+                    sign-in link instead. You can set up email later in Settings.
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontFamily: "'Spectral',serif", fontSize: 21, fontWeight: 500 }}>
+                    Almost there
+                  </div>
+                  <div
+                    style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}
+                  >
+                    This server doesn't send email yet, so nothing was mailed. Your one-time
+                    sign-in link was printed to the server logs — open your deployment's logs
+                    (on Railway: the app service → View Logs) and look for the{' '}
+                    <code style={{ fontSize: 12.5 }}>[mailer:dev]</code> line.
+                  </div>
+                </>
+              )}
               {devLink !== null && (
                 <button
                   onClick={() => {
                     // Full navigation: the callback sets the session cookie and redirects to /.
                     window.location.href = devLink;
                   }}
-                  className="lg-dashed"
-                  style={{
-                    width: '100%',
-                    border: '1px dashed var(--bd)',
-                    background: 'var(--hl)',
-                    color: 'var(--mut)',
-                    borderRadius: 8,
-                    padding: 11,
-                    fontSize: 13.5,
-                    cursor: 'pointer',
-                    fontFamily: 'inherit',
-                  }}
+                  className={delivered ? 'lg-dashed' : 'lg-primary'}
+                  style={
+                    delivered
+                      ? {
+                          width: '100%',
+                          border: '1px dashed var(--bd)',
+                          background: 'var(--hl)',
+                          color: 'var(--mut)',
+                          borderRadius: 8,
+                          padding: 11,
+                          fontSize: 13.5,
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }
+                      : {
+                          width: '100%',
+                          background: 'var(--acc)',
+                          color: '#fff',
+                          border: 'none',
+                          borderRadius: 8,
+                          padding: 12,
+                          fontSize: 15,
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }
+                  }
                 >
-                  Open the sign-in link →
+                  Sign in →
                 </button>
               )}
             </div>

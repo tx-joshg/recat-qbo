@@ -141,8 +141,9 @@ setupRouter.post(
       update: { isInstanceAdmin: true, invitePending: false },
     });
     const { link } = await issueMagicLink(user);
-    const devLink = devLoginAllowed && !(await isSmtpConfigured()) ? link : undefined;
-    res.json(devLink !== undefined ? { ok: true, devLink } : { ok: true });
+    const smtp = await isSmtpConfigured();
+    const devLink = devLoginAllowed && !smtp ? link : undefined;
+    res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
   }),
 );
 

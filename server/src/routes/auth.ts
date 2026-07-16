@@ -54,16 +54,19 @@ authRouter.post(
       }
     }
 
+    // `delivered` reflects only whether this instance can send email — a
+    // per-instance constant, so it leaks nothing about account existence.
+    const smtp = await isSmtpConfigured();
     let devLink: string | undefined;
     if (user) {
       const { link } = await issueMagicLink(user);
       // Dev convenience: no SMTP configured → let the UI offer "open the
       // magic link →" directly. Only in mock mode or with an explicit
       // ALLOW_DEV_LOGIN=true — never inferred from NODE_ENV.
-      if (devLoginAllowed && !(await isSmtpConfigured())) devLink = link;
+      if (devLoginAllowed && !smtp) devLink = link;
     }
 
-    res.json(devLink !== undefined ? { ok: true, devLink } : { ok: true });
+    res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
   }),
 );
 

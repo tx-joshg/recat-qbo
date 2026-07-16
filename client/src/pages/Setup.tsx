@@ -39,6 +39,8 @@ const PROGRESS_KEY = 'recat.setupWizard.v2';
 /** POST /api/setup/admin — mirrors /auth/magic-link's dev-mode devLink. */
 interface AdminResponse {
   ok: boolean;
+  /** false when this instance has no SMTP configured — no email was sent. */
+  delivered?: boolean;
   devLink?: string;
 }
 
@@ -177,6 +179,7 @@ export default function Setup() {
 
   const [status, setStatus] = useState<SetupStatusX | null>(null);
   const [devLink, setDevLink] = useState<string | null>(null);
+  const [linkDelivered, setLinkDelivered] = useState(true);
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
   const [smtpHost, setSmtpHost] = useState('');
@@ -314,6 +317,7 @@ export default function Setup() {
     try {
       const res = await api.post<AdminResponse>('/api/setup/admin', { email });
       setDevLink(res.devLink ?? null);
+      setLinkDelivered(res.delivered ?? true);
       setAdminSent(true);
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not send the link — try again');
@@ -662,29 +666,66 @@ export default function Setup() {
                 >
                   ✉
                 </div>
-                <div style={stepTitle}>Check your inbox</div>
-                <div style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}>
-                  We sent a sign-in link to{' '}
-                  <b style={{ color: 'var(--ink)' }}>{adminEmail.trim()}</b>. It expires in 15
-                  minutes.
-                </div>
+                {linkDelivered ? (
+                  <>
+                    <div style={stepTitle}>Check your inbox</div>
+                    <div style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}>
+                      We sent a sign-in link to{' '}
+                      <b style={{ color: 'var(--ink)' }}>{adminEmail.trim()}</b>. It expires in 15
+                      minutes.
+                    </div>
+                  </>
+                ) : devLink !== null ? (
+                  <>
+                    <div style={stepTitle}>You're one click away</div>
+                    <div style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}>
+                      Email isn't set up yet (that's the next step), so nothing was mailed to{' '}
+                      <b style={{ color: 'var(--ink)' }}>{adminEmail.trim()}</b> — verify with your
+                      one-time sign-in link instead.
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={stepTitle}>Almost there</div>
+                    <div style={{ fontSize: 14, color: 'var(--mut)', margin: '6px 0 20px', lineHeight: 1.5 }}>
+                      Email isn't set up yet, so nothing was mailed. Your one-time sign-in link was
+                      printed to the server logs — open your deployment's logs and look for the{' '}
+                      <code style={{ fontSize: 12.5 }}>[mailer:dev]</code> line.
+                    </div>
+                  </>
+                )}
                 {devLink !== null && (
                   <button
                     onClick={() => void openSignInLink()}
-                    className="sw-dashed"
-                    style={{
-                      width: '100%',
-                      border: '1px dashed var(--bd)',
-                      background: 'var(--hl)',
-                      color: 'var(--mut)',
-                      borderRadius: 8,
-                      padding: 11,
-                      fontSize: 13.5,
-                      cursor: 'pointer',
-                      fontFamily: 'inherit',
-                    }}
+                    className={linkDelivered ? 'sw-dashed' : 'sw-primary'}
+                    style={
+                      linkDelivered
+                        ? {
+                            width: '100%',
+                            border: '1px dashed var(--bd)',
+                            background: 'var(--hl)',
+                            color: 'var(--mut)',
+                            borderRadius: 8,
+                            padding: 11,
+                            fontSize: 13.5,
+                            cursor: 'pointer',
+                            fontFamily: 'inherit',
+                          }
+                        : {
+                            width: '100%',
+                            background: 'var(--acc)',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: 8,
+                            padding: 12,
+                            fontSize: 15,
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                            fontFamily: 'inherit',
+                          }
+                    }
                   >
-                    Open the sign-in link →
+                    {linkDelivered ? 'Open the sign-in link →' : 'Verify & continue →'}
                   </button>
                 )}
               </div>
