@@ -1349,7 +1349,6 @@ export default function Setup() {
                     return (
                       <label
                         key={a.id}
-                        onClick={() => setSelected((sel) => ({ ...sel, [a.id]: !on }))}
                         style={{
                           display: 'flex',
                           alignItems: 'center',
@@ -1364,8 +1363,8 @@ export default function Setup() {
                         <input
                           type="checkbox"
                           checked={on}
-                          readOnly
-                          style={{ width: 16, height: 16, accentColor: 'var(--acc)', pointerEvents: 'none' }}
+                          onChange={() => setSelected((sel) => ({ ...sel, [a.id]: !sel[a.id] }))}
+                          style={{ width: 16, height: 16, accentColor: 'var(--acc)' }}
                         />
                         <span style={{ fontSize: 14.5, fontWeight: 500 }}>{a.name}</span>
                         <span style={{ marginLeft: 'auto', fontSize: 13, color: 'var(--fnt)' }}>
