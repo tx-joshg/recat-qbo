@@ -35,6 +35,21 @@ gh repo edit --add-topic quickbooks-online \
 - [ ] Confirm no real Intuit credentials or SMTP passwords in any tracked file
 - [ ] `npm run typecheck && npm test && npm run build` green
 
+## Railway one-click template
+
+Published: **https://railway.com/deploy/recat-qbo** (README button points here).
+Owned by Joshua Goble's Railway workspace. The app service deploys
+`ghcr.io/tx-joshg/recat-qbo:latest` — pushed automatically by
+`.github/workflows/docker.yml` on every push to main, so template deploys always
+get the latest release without republishing.
+To CHANGE the template config: build a scratch Railway project mirroring the
+desired services, then `railway templates create` + `railway templates publish`.
+Gotchas learned the hard way: literal variable values are stripped on generate —
+encode constants as `${{secret(1,"x")}}…` chains; expressions survive only when
+passed at service-creation time (`railway add --variables`), never via
+`railway variable set` (which resolves them eagerly); delete the scratch project
+afterwards.
+
 ## 4. After creation
 
 - [ ] Publish the Docker image: `ghcr.io/tx-joshg/recat-qbo` (compose file already references it)

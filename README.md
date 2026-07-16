@@ -9,6 +9,10 @@ and a complete append-only audit trail.
 
 The self-hosted alternative to per-client SaaS tools like Uncat. Your credentials, your server, your data — no third-party service in the middle, no telemetry, ever.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/recat-qbo)
+
+One click provisions the app + PostgreSQL with generated secrets, booting into **demo mode** — try the full loop against a built-in fake QuickBooks, then flip `QBO_MOCK` to `false` and connect your real books. Prefer your own server? See [Quick start](#quick-start).
+
 ![The categorization queue](docs/screenshots/queue.png)
 
 ## How it works
