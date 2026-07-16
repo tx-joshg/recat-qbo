@@ -258,6 +258,8 @@ export default function Login() {
           )}
         </div>
         <div style={{ textAlign: 'center', fontSize: 13.5, color: 'var(--fnt)' }}>
+          Access is by invitation — there's no self-signup.
+          <br />
           First run on this server?{' '}
           <Link to="/setup" style={{ fontWeight: 600 }}>
             Set up Recat

@@ -10,6 +10,7 @@ import { api, companies as companiesApi, instanceSettings } from '../lib/api';
 import { ToggleSwitch } from '../components/ui';
 import { useApp } from '../state/AppContext';
 import ConfirmDialog from '../components/ConfirmDialog';
+import AccessCard from './settings/AccessCard';
 import ApiAccessCard from './settings/ApiAccessCard';
 import ConnectionCard from './settings/ConnectionCard';
 import type { HoldingAccountOption } from './settings/ConnectionCard';
@@ -22,6 +23,7 @@ import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
   const {
+    session,
     role,
     companies,
     activeCompany,
@@ -261,6 +263,9 @@ export default function Settings() {
 
           {/* team (admin) */}
           {isAdmin && <TeamCard />}
+
+          {/* people with access — instance-wide (instance admins only) */}
+          {session?.isInstanceAdmin && <AccessCard />}
 
           {/* sync history */}
           <div
