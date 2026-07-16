@@ -742,8 +742,12 @@ export default function Setup() {
                   Intuit Developer Portal
                 </a>
                 . Never made one?{' '}
-                <a href="/docs/intuit-setup.md" target="_blank" rel="noreferrer">
-                  docs/intuit-setup.md
+                <a
+                  href="https://github.com/tx-joshg/recat-qbo/blob/main/docs/intuit-setup.md"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  the setup walkthrough
                 </a>{' '}
                 walks you through it in ~10 minutes.
               </div>
