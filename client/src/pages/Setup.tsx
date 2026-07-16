@@ -1013,6 +1013,24 @@ export default function Setup() {
                 Choose the environment, then authorize Recat with Intuit. You can connect more
                 companies later in Settings.
               </div>
+              {isMock && (
+                <div
+                  style={{
+                    border: '1px solid var(--amD)',
+                    background: 'var(--amB)',
+                    color: 'var(--amT)',
+                    borderRadius: 8,
+                    padding: '12px 16px',
+                    fontSize: 13.5,
+                    lineHeight: 1.5,
+                    margin: '-6px 0 18px',
+                  }}
+                >
+                  <b>Demo mode is on</b> — connections here use the built-in fake QuickBooks,
+                  not Intuit. To connect real books, set the <code>QBO_MOCK</code> environment
+                  variable to <code>false</code> on your server and restart.
+                </div>
+              )}
               <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
                 <label
                   onClick={() => setEnv('sandbox')}
