@@ -287,14 +287,13 @@ export default function ConnectionCard({
             {holdingOptions.map((h) => (
               <label
                 key={h.id}
-                onClick={() => toggleHolding(h.id)}
                 style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer' }}
               >
                 <input
                   type="checkbox"
                   checked={company.holdingAccountIds.includes(h.id)}
-                  readOnly
-                  style={{ width: 15, height: 15, accentColor: 'var(--acc)', pointerEvents: 'none' }}
+                  onChange={() => toggleHolding(h.id)}
+                  style={{ width: 15, height: 15, accentColor: 'var(--acc)' }}
                 />
                 {h.name}
                 <span style={{ color: 'var(--fnt)', fontSize: 12.5, marginLeft: 'auto' }}>
