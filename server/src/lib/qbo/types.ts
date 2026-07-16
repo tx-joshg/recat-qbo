@@ -1,0 +1,186 @@
+// The QuickBooks Online client interface. Two implementations:
+//  - RealQboClient (lib/qbo/real.ts): Intuit REST API with OAuth2
+//  - MockQboClient (lib/qbo/mock.ts): in-memory demo realm (QBO_MOCK=true)
+// All server code depends only on this interface so demo mode exercises
+// the exact same sync/write-back paths as production.
+
+export interface QboTokenSet {
+  accessToken: string;
+  refreshToken: string;
+  /** epoch ms when the access token expires */
+  expiresAt: number;
+}
+
+export interface QboAccountInfo {
+  qboId: string;
+  name: string;
+  /** e.g. "Expenses:Meals" — colon path from QBO FullyQualifiedName */
+  fullName: string;
+  /** normalized bucket: Income | COGS | Expenses | Asset | Liability | Equity | Bank | CreditCard | Other */
+  classification: string;
+  accountType: string;
+  active: boolean;
+}
+
+export interface QboTxnLine {
+  /** QBO line Id */
+  id: string;
+  amount: number;
+  /** account this line posts to */
+  accountQboId: string;
+  accountName: string;
+  memo?: string;
+}
+
+export interface QboTxn {
+  qboId: string;
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  syncToken: string;
+  date: string; // YYYY-MM-DD
+  payee: string;
+  memo?: string;
+  /**
+   * Signed sum of the HOLDING-account lines (+ = money in) — NOT the entity's
+   * TotalAmt. A multi-line entity that also carries already-categorized lines
+   * only exposes (and only ever has rewritten) its holding portion.
+   */
+  amount: number;
+  /** the bank/cc account the money moved through (display name) */
+  bankAccount: string;
+  /** ONLY the lines posting to holding accounts; other lines stay in `raw`. */
+  lines: QboTxnLine[];
+  raw: unknown;
+}
+
+export interface QboCompanyInfo {
+  realmId: string;
+  legalName: string;
+}
+
+/** One normalized row of a QBO-computed financial statement (values in dollars). */
+export interface QboStatementRow {
+  label: string;
+  kind: 'head' | 'line' | 'total' | 'grand';
+  indent: boolean;
+  /** present on account data rows — enables transaction drill-down */
+  accountQboId?: string;
+  /** one entry per statement column; empty for 'head' rows */
+  values: number[];
+}
+
+/** Normalized tree of a QBO Reports-API statement (P&L / Balance Sheet). */
+export interface QboStatement {
+  columns: { label: string }[];
+  rows: QboStatementRow[];
+}
+
+/** One underlying transaction of a statement row (from /reports/TransactionList). */
+export interface QboAccountTxn {
+  date: string; // YYYY-MM-DD
+  payee: string;
+  memo?: string;
+  /** signed; + = money in, per the report's natural amount */
+  amount: number;
+  txnType: string;
+  qboId: string;
+}
+
+export interface QboWriteResult {
+  ok: true;
+  newSyncToken: string;
+}
+
+export class QboSyncTokenConflict extends Error {
+  code = 'SYNC_TOKEN_CONFLICT' as const;
+  constructor(message = 'SyncToken conflict — this transaction was edited in QuickBooks after our last sync.') {
+    super(message);
+  }
+}
+
+export class QboAuthError extends Error {
+  code = 'QBO_AUTH' as const;
+}
+
+/**
+ * Per-realm QuickBooks client. Token persistence is the caller's job: every
+ * method may refresh tokens; `onTokensRefreshed` fires so the caller can
+ * persist the rotated refresh token immediately (QBO rotates it on use).
+ *
+ * Clients are constructed with the company's holding-account QBO ids;
+ * changedSince/fetchTxn/recategorize all interpret "the txn's lines" as the
+ * holding-account lines only — every other line on the entity is preserved
+ * verbatim by every write.
+ */
+export interface QboClient {
+  readonly realmId: string;
+
+  getCompanyInfo(): Promise<QboCompanyInfo>;
+  listAccounts(): Promise<QboAccountInfo[]>;
+
+  /**
+   * All txns (Purchase/Deposit/JournalEntry) with a line posting to any of the
+   * given accounts. The given ids (not the client's holding set) act as the
+   * line filter, so the setup wizard can probe candidate holding accounts.
+   */
+  listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]>;
+
+  /** Change Data Capture: entities changed since the timestamp. */
+  changedSince(isoTimestamp: string): Promise<{ txns: QboTxn[]; deletedQboIds: { qboType: string; qboId: string }[] }>;
+
+  /** Re-fetch one entity fresh (for SyncToken). Returns null if deleted. */
+  fetchTxn(qboType: QboTxn['qboType'], qboId: string): Promise<QboTxn | null>;
+
+  /**
+   * Rewrite ONLY the txn's holding-account lines as the given category lines,
+   * preserving every other line verbatim. `splits` always used — single
+   * category = one split of the full (holding-sum) amount.
+   * Throws QboSyncTokenConflict on stale token.
+   */
+  recategorize(
+    txn: QboTxn,
+    splits: { amount: number; accountQboId: string; memo?: string }[],
+  ): Promise<QboWriteResult>;
+
+  /**
+   * Undo: replace the lines posting to `fromAccountQboIds` (the categories a
+   * previous post wrote) with a single line back to `accountQboId` (holding),
+   * preserving every other line verbatim.
+   */
+  moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult>;
+
+  /**
+   * QBO's OWN P&L / Balance Sheet numbers via the Reports API — drift-free by
+   * construction. `startDate` is ignored by the balance sheet (point-in-time).
+   */
+  getStatement(
+    kind: 'pl' | 'bs',
+    params: { startDate?: string; endDate: string; basis: 'cash' | 'accrual'; summarizeBy?: 'Total' | 'Month' },
+  ): Promise<QboStatement>;
+
+  /** Underlying transactions of one account within a date range (row drill-down). */
+  getAccountTransactions(params: {
+    accountQboId: string;
+    startDate: string;
+    endDate: string;
+  }): Promise<QboAccountTxn[]>;
+
+  /** Create a QBO Transfer entity between two accounts. */
+  createTransfer(args: {
+    amount: number;
+    fromAccountQboId: string;
+    toAccountQboId: string;
+    date: string;
+    memo?: string;
+  }): Promise<{ qboId: string }>;
+}
+
+export interface QboClientFactory {
+  /** Build the Intuit consent URL for the OAuth flow (state = CSRF token). */
+  authorizeUrl(state: string): string;
+  /** Exchange an auth code for tokens. */
+  exchangeCode(code: string, realmId: string): Promise<QboTokenSet>;
+  /** Client for a connected company; persist rotated tokens via the callback. */
+  forCompany(companyId: string): Promise<QboClient>;
+  /** Revoke tokens on disconnect (best effort). */
+  revoke(companyId: string): Promise<void>;
+}

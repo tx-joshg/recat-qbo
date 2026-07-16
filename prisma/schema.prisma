@@ -1,0 +1,278 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  admin
+  categorizer
+  viewer
+}
+
+enum TxnStatus {
+  PENDING
+  POSTING
+  POSTED
+  DRY_RUN
+  ERROR
+  SUPERSEDED
+  REVERTED
+}
+
+enum SyncMode {
+  polling
+  webhook
+}
+
+enum QboEnv {
+  sandbox
+  production
+}
+
+model User {
+  id              String           @id @default(uuid())
+  email           String           @unique
+  name            String?
+  /// Instance admins manage instance settings, users, and company connections,
+  /// and implicitly hold the admin role in every company.
+  isInstanceAdmin Boolean          @default(false)
+  invitePending   Boolean          @default(false)
+  dashboardLayout Json?
+  createdAt       DateTime         @default(now())
+  magicLinks      MagicLinkToken[]
+  sessions        Session[]
+  memberships     Membership[]
+}
+
+/// Per-company role (handoff §5 matrix, scoped per specs.md §2).
+model Membership {
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  role      Role
+
+  @@id([userId, companyId])
+}
+
+model MagicLinkToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Company {
+  id                String        @id @default(uuid())
+  realmId           String        @unique
+  legalName         String
+  nickname          String
+  env               QboEnv        @default(sandbox)
+  syncMode          SyncMode      @default(polling)
+  pollIntervalMin   Int           @default(10)
+  holdingAccountIds Json          @default("[]")
+  dryRun            Boolean       @default(true)
+  tagsRequired      Boolean       @default(false)
+  accessToken       String? // encrypted (AES-256-GCM)
+  refreshToken      String? // encrypted (AES-256-GCM)
+  tokenExpiresAt    DateTime?
+  connectedAt       DateTime      @default(now())
+  disconnectedAt    DateTime?
+  lastSyncedAt      DateTime?
+  transactions      Transaction[]
+  tags              Tag[]
+  rules             Rule[]
+  savedReports      SavedReport[]
+  auditEntries      AuditEntry[]
+  qboAccounts       QboAccount[]
+  syncLogs          SyncLog[]
+  memberships       Membership[]
+}
+
+model Transaction {
+  id             String    @id @default(uuid())
+  companyId      String
+  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId          String
+  qboType        String // Purchase | Deposit | JournalEntry
+  qboSyncToken   String
+  date           DateTime
+  payee          String
+  memo           String?
+  amount         Decimal   @db.Decimal(14, 2) // signed; + = money in
+  bankAccount    String
+  status         TxnStatus @default(PENDING)
+  category       String? // chosen category display name (single-category case)
+  categoryQboId  String? // chosen QBO account id (single-category case)
+  splitLines     SplitLine[] // when present, replaces category (multi-category)
+  suggestion     Json? // { category, categoryQboId?, source: 'rule'|'history'|'ai', ruleId? }
+  errorCode      String?
+  errorMessage   String?
+  postedAt       DateTime?
+  postedByUserId String?
+  rawData        Json?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  txnTags        TxnTag[]
+
+  @@unique([companyId, qboType, qboId])
+  @@index([companyId, status])
+}
+
+model Tag {
+  id            String         @id @default(uuid())
+  companyId     String
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name          String
+  color         String
+  createdAt     DateTime       @default(now())
+  txnTags       TxnTag[]
+  ruleTags      RuleTag[]
+  splitLineTags SplitLineTag[]
+}
+
+/// One line of a split categorization. Reports attribute each line's amount to
+/// its own category and tags (never the whole transaction).
+model SplitLine {
+  id            String         @id @default(uuid())
+  txnId         String
+  txn           Transaction    @relation(fields: [txnId], references: [id], onDelete: Cascade)
+  idx           Int // display / QBO line order
+  amount        Decimal        @db.Decimal(14, 2) // signed, same sign as the txn
+  category      String
+  categoryQboId String?
+  memo          String?
+  tags          SplitLineTag[]
+
+  @@unique([txnId, idx])
+  @@index([category])
+}
+
+model SplitLineTag {
+  splitLineId String
+  splitLine   SplitLine @relation(fields: [splitLineId], references: [id], onDelete: Cascade)
+  tagId       String
+  tag         Tag       @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([splitLineId, tagId])
+}
+
+model TxnTag {
+  txnId String
+  txn   Transaction @relation(fields: [txnId], references: [id], onDelete: Cascade)
+  tagId String
+  tag   Tag         @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([txnId, tagId])
+}
+
+model Rule {
+  id            String    @id @default(uuid())
+  companyId     String
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /// Match order: lowest priority number wins when several rules match a payee.
+  priority      Int       @default(0)
+  matchField    String    @default("payee") // v1: payee contains, case-insensitive
+  matchText     String
+  category      String // category display name
+  categoryQboId String?
+  autoPost      Boolean   @default(false)
+  createdById   String?
+  createdAt     DateTime  @default(now())
+  ruleTags      RuleTag[]
+}
+
+model RuleTag {
+  ruleId String
+  rule   Rule   @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  tagId  String
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([ruleId, tagId])
+}
+
+model SavedReport {
+  id        String   @id @default(uuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String
+  config    Json // { range, flow, account, groupBy, tagIds }
+  createdAt DateTime @default(now())
+}
+
+// Append-only: the app exposes no update or delete path for this table.
+model AuditEntry {
+  id         String   @id @default(uuid())
+  companyId  String
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  at         DateTime @default(now())
+  actorId    String? // userId; null = system
+  actorLabel String // display name or 'system'
+  txnId      String?
+  payee      String
+  amount     Decimal  @db.Decimal(14, 2)
+  action     String // posted | dry-run | error | reverted | superseded | transfer | auto-posted
+  before     String // holding account
+  after      String // full category path, or split summary
+  payload    Json? // exact QBO request body (dry-run keeps it too)
+
+  @@index([companyId, at])
+}
+
+model QboAccount {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId          String
+  name           String
+  fullName       String // "Expenses · Meals" style path
+  classification String // Income | COGS | Expenses | Asset | Liability | Equity | Bank | Holding-eligible etc.
+  accountType    String?
+  active         Boolean  @default(true)
+  updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, qboId])
+}
+
+model SyncLog {
+  id        String   @id @default(uuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  kind      String // poll | webhook | manual | nightly | initial
+  ok        Boolean
+  message   String
+  at        DateTime @default(now())
+
+  @@index([companyId, at])
+}
+
+model AppConfig {
+  key       String   @id
+  value     String // encrypted where sensitive
+  encrypted Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model WebhookEvent {
+  id          String    @id @default(uuid())
+  payload     Json
+  processed   Boolean   @default(false)
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+}

@@ -1,0 +1,29 @@
+{
+  "name": "recat-qbo",
+  "description": "Self-hosted transaction categorization and review queue for QuickBooks Online. An open-source alternative to Uncat.",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c green,blue \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "test": "npm run test -w server",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:generate": "prisma generate",
+    "seed": "npm run seed -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "prisma": "^6.10.0"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}

@@ -1,0 +1,110 @@
+/*
+ * Recat global stylesheet.
+ * The reset, .rr custom-property blocks, keyframes, and [data-tip] tooltip CSS are
+ * ported VERBATIM from design_handoff_recat/Recat.dc.html — do not tweak values.
+ */
+
+body { margin:0; background:#eceae3; font-family:'IBM Plex Sans',sans-serif; }
+a { color:#2f5d50; } a:hover { color:#1e4238; }
+input, select, button { font-family:inherit; }
+
+.rr { --bg:#f1efe8; --sur:#fbfaf7; --card:#ffffff; --bd:#dcd8cf; --bd2:#e9e5db; --ink:#22211d; --mut:#6d685c; --fnt:#9b968a;
+      --acc:#2f5d50; --accH:#264c41; --hl:#f4f1e8; --rowbd:#f0ede5;
+      --amT:#8a6d1f; --amB:#f6edd4; --amD:#e8d9a8;
+      --erT:#a13b2e; --erB:#f8e8e4; --erD:#ecc9c1;
+      --okT:#2f5d50; --okB:#e8efe9; --okD:#c8d9cd;
+      --dark:#22211d; --darkInk:#fbfaf7; --sh:0 10px 30px rgba(50,45,35,.16); }
+.rr[data-theme="dark"] { --bg:#14130f; --sur:#1c1b16; --card:#232219; --bd:#3b392e; --bd2:#302e25; --ink:#ede9dc; --mut:#aaa494; --fnt:#7c7768;
+      --acc:#6fa892; --accH:#82bba5; --hl:#282720; --rowbd:#2b2a21;
+      --amT:#dbbd6a; --amB:#2c2513; --amD:#4d411f;
+      --erT:#e0846f; --erB:#301b16; --erD:#5c2f26;
+      --okT:#8fc3ae; --okB:#1d2a24; --okD:#33473d;
+      --dark:#ede9dc; --darkInk:#14130f; --sh:0 10px 30px rgba(0,0,0,.45); }
+.rr[data-density="compact"] { --rpv:7px; --rfs:13.5px; } .rr { --rpv:13px; --rfs:14.5px; }
+.rr ::selection { background:rgba(47,93,80,.2); }
+@keyframes rrspin { to { transform:rotate(360deg); } }
+@keyframes rrup { from { opacity:0; transform:translate(-50%,8px);} to { opacity:1; transform:translate(-50%,0);} }
+.rr [data-tip] { position:relative; }
+/* :active covers touch devices (no hover); harmless extra on desktop click-hold. */
+.rr [data-tip]:hover::after,
+.rr [data-tip]:focus-visible::after,
+.rr [data-tip]:active::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; transform:translateX(-50%); background:var(--dark); color:var(--darkInk); padding:8px 12px; border-radius:7px; font-size:12.5px; font-weight:500; line-height:1.45; width:max-content; max-width:min(260px, calc(100vw - 16px)); white-space:normal; z-index:70; box-shadow:0 8px 24px rgba(20,18,12,.3); pointer-events:none; text-align:left; }
+.rr [data-tip]:hover::before,
+.rr [data-tip]:focus-visible::before,
+.rr [data-tip]:active::before { content:''; position:absolute; bottom:calc(100% + 3px); left:50%; transform:translateX(-50%); border:5px solid transparent; border-top-color:var(--dark); z-index:70; pointer-events:none; }
+/* Position variants — the default bubble (above, centered) clips at viewport
+   edges: `down` for elements near the top (nav), `right`-aligned bubbles for
+   elements in rightmost columns. */
+.rr [data-tip][data-tip-pos="down"]:hover::after,
+.rr [data-tip][data-tip-pos="down"]:focus-visible::after,
+.rr [data-tip][data-tip-pos="down"]:active::after { bottom:auto; top:calc(100% + 8px); }
+.rr [data-tip][data-tip-pos="down"]:hover::before,
+.rr [data-tip][data-tip-pos="down"]:focus-visible::before,
+.rr [data-tip][data-tip-pos="down"]:active::before { bottom:auto; top:calc(100% + 3px); border-top-color:transparent; border-bottom-color:var(--dark); }
+.rr [data-tip][data-tip-align="right"]:hover::after,
+.rr [data-tip][data-tip-align="right"]:focus-visible::after,
+.rr [data-tip][data-tip-align="right"]:active::after { left:auto; right:0; transform:none; }
+
+/* ---------------------------------------------------------------------------
+ * Reusable utility classes. Every value below is copied from a recurring
+ * inline-style pattern in the prototype — keep them byte-identical.
+ * ------------------------------------------------------------------------- */
+
+/* Spectral page heading (every screen's title) */
+.rr .page-title { font-family:'Spectral',serif; font-size:27px; font-weight:500; }
+/* faint one-line subtitle under the page title */
+.rr .page-sub { font-size:14px; color:var(--fnt); margin-top:4px; }
+
+/* card container (rules/tags/settings/reports tables & panels) */
+.rr .card { border:1px solid var(--bd2); border-radius:10px; background:var(--card); box-shadow:0 1px 6px rgba(60,55,45,.05); }
+
+/* solid accent button (wizard Continue, login submit, save actions) */
+.rr .btn-primary { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:10px 22px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }
+.rr .btn-primary:hover { background:var(--accH); }
+
+/* bordered neutral button (Sync now, Copy, Export CSV, …) */
+.rr .btn-ghost { border:1px solid var(--bd); background:var(--card); color:var(--ink); border-radius:7px; padding:8px 14px; font-size:14px; font-weight:500; cursor:pointer; font-family:inherit; }
+.rr .btn-ghost:hover { background:var(--hl); }
+
+/* compact input (queue/audit search boxes, rule inputs) */
+.rr .input { border:1px solid var(--bd); border-radius:7px; padding:8px 13px; font-size:14px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }
+.rr .input:focus { border-color:var(--acc); }
+
+/* large input (login + wizard forms) */
+.rr .input-lg { width:100%; box-sizing:border-box; border:1px solid var(--bd); border-radius:8px; padding:11px 14px; font-size:15px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }
+.rr .input-lg:focus { border-color:var(--acc); box-shadow:0 0 0 3px rgba(47,93,80,.12); }
+
+/* select control (filters, report pickers) */
+.rr .select { border:1px solid var(--bd); border-radius:7px; padding:8px 10px; font-size:14px; background:var(--card); color:var(--ink); outline:none; cursor:pointer; font-family:inherit; }
+
+/* status pills — Posted ✓ / Dry run ✓ / Error ⓘ and audit action chips */
+.rr .pill-ok { font-size:12.5px; font-weight:600; color:var(--okT); background:var(--okB); border:1px solid var(--okD); padding:4px 10px; border-radius:99px; }
+.rr .pill-am { font-size:12.5px; font-weight:600; color:var(--amT); background:var(--amB); border:1px solid var(--amD); padding:4px 10px; border-radius:99px; }
+.rr .pill-er { font-size:12.5px; font-weight:600; color:var(--erT); background:var(--erB); border:1px solid var(--erD); padding:4px 10px; border-radius:99px; }
+
+/* circled-i info dot (pair with data-tip) */
+.rr .info-dot { width:15px; height:15px; border-radius:50%; border:1px solid var(--fnt); color:var(--fnt); display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:600; cursor:help; flex:none; }
+
+/* ---------------------------------------------------------------------------
+ * Hover/focus states ported from the prototype's style-hover / style-focus
+ * attributes. The elements these apply to keep their base styles inline, so
+ * `!important` is required for the hovered value to win — mirroring how the
+ * prototype's runtime swapped the inline style on hover. Values are verbatim.
+ * ------------------------------------------------------------------------- */
+
+/* menu/dropdown rows, ghost-ish buttons → background:var(--hl) */
+.rr .hov-hl:hover { background:var(--hl) !important; }
+/* solid accent buttons (Post, Invite, Create rule, Save split) → var(--accH) */
+.rr .hov-acc:hover { background:var(--accH) !important; }
+/* muted-color buttons (theme toggle, undo ↩, Cancel, resize ⛶) → var(--ink) */
+.rr .hov-ink:hover { color:var(--ink) !important; }
+/* delete × buttons → var(--erT) */
+.rr .hov-del:hover { color:var(--erT) !important; }
+/* dashed buttons (+ tag, ＋ Add line) and the queue Split button */
+.rr .hov-dash:hover { color:var(--ink) !important; border-color:var(--fnt) !important; }
+/* queue category-picker trigger → border-color:var(--fnt) */
+.rr .hov-brd:hover { border-color:var(--fnt) !important; }
+/* dark-bar 'esc' / 'Dismiss' (base opacity .55) → opacity:1 */
+.rr .hov-full:hover { opacity:1 !important; }
+/* inputs whose focus state is border-color:var(--acc) */
+.rr .foc-acc:focus { border-color:var(--acc) !important; }

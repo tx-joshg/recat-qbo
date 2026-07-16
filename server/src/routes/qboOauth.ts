@@ -1,0 +1,194 @@
+// QuickBooks OAuth routes (mounted at the app root):
+//   GET /auth/qbo/callback      — Intuit redirects here with code+state+realmId
+//   GET /auth/qbo/mock-consent  — mock mode only: a clearly-labelled fake
+//                                 consent page for the demo realms
+// State tokens are held in-memory with a 10-minute TTL (single-process app).
+
+import { Router } from 'express';
+import type { Company } from '@prisma/client';
+import { env } from '../env.js';
+import { encrypt, randomToken } from '../lib/crypto.js';
+import { asyncHandler, HttpError } from '../lib/http.js';
+import { prisma } from '../lib/prisma.js';
+import { qboFactory } from '../lib/qbo/factory.js';
+import { MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR, resolveMockRealmId } from '../lib/qbo/mock.js';
+import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
+
+// ---------------------------------------------------------------------------
+// OAuth state (CSRF) tokens
+// ---------------------------------------------------------------------------
+
+const STATE_TTL_MS = 10 * 60 * 1000;
+const states = new Map<string, number>(); // state → expiry epoch ms
+
+function pruneStates(): void {
+  const now = Date.now();
+  for (const [state, expiresAt] of states) {
+    if (expiresAt <= now) states.delete(state);
+  }
+}
+
+/** Issue a state token for a new connect flow (used by POST /api/companies/connect). */
+export function createOauthState(): string {
+  pruneStates();
+  const state = randomToken(16);
+  states.set(state, Date.now() + STATE_TTL_MS);
+  return state;
+}
+
+/** Single-use: returns true (and forgets the state) when valid and unexpired. */
+export function consumeOauthState(state: string): boolean {
+  pruneStates();
+  if (!states.has(state)) return false;
+  states.delete(state);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** "Harbor & Main Coffee Co." → "Harbor & Main Coffee"; "Bluebird Salon LLC" → "Bluebird Salon". */
+export function defaultNickname(legalName: string): string {
+  const suffix = /[,\s]+(co\.?|company|llc|l\.l\.c\.|inc\.?|incorporated|ltd\.?|corp\.?|corporation|plc|pllc|llp)$/i;
+  let name = legalName.trim();
+  while (suffix.test(name)) name = name.replace(suffix, '').trim();
+  name = name.replace(/[,\s]+$/, '').trim();
+  return name !== '' ? name : legalName.trim();
+}
+
+/** The wizard's env choice applies to the NEXT connection (AppConfig 'qboEnvDefault'); env var is the fallback. */
+async function defaultQboEnv(): Promise<'sandbox' | 'production'> {
+  const row = await prisma.appConfig.findUnique({ where: { key: 'qboEnvDefault' } });
+  if (row && (row.value === 'sandbox' || row.value === 'production')) return row.value;
+  return env.QBO_ENVIRONMENT;
+}
+
+function queryString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+export const qboOauthRouter = Router();
+
+qboOauthRouter.get(
+  '/auth/qbo/callback',
+  requireUser,
+  requireInstanceAdmin,
+  asyncHandler(async (req, res) => {
+    const code = queryString(req.query.code);
+    const state = queryString(req.query.state);
+    let realmId = queryString(req.query.realmId);
+
+    if (state === '' || !consumeOauthState(state)) {
+      throw new HttpError(400, 'Invalid or expired OAuth state — restart the connect flow.', 'BAD_STATE');
+    }
+    if (code === '') throw new HttpError(400, 'Missing authorization code', 'BAD_REQUEST');
+    if (realmId === '' && env.QBO_MOCK) {
+      const connected = await prisma.company.findMany({ where: { disconnectedAt: null }, select: { realmId: true } });
+      realmId = resolveMockRealmId(code, connected.map((c) => c.realmId));
+    }
+    if (realmId === '') throw new HttpError(400, 'Missing realmId', 'BAD_REQUEST');
+
+    try {
+      const tokens = await qboFactory.exchangeCode(code, realmId);
+      const tokenData = {
+        accessToken: encrypt(tokens.accessToken),
+        refreshToken: encrypt(tokens.refreshToken),
+        tokenExpiresAt: new Date(tokens.expiresAt),
+      };
+
+      // No Membership row is created for the connecting user: only instance
+      // admins can reach this route, and instance admins are implicitly
+      // 'admin' in every company — an explicit membership would be redundant.
+      const existing = await prisma.company.findUnique({ where: { realmId } });
+      let company: Company;
+      if (existing) {
+        // Reconnect: fresh tokens, clear the disconnect flag, keep nickname,
+        // holding accounts, and all history.
+        company = await prisma.company.update({
+          where: { id: existing.id },
+          data: { ...tokenData, disconnectedAt: null },
+        });
+      } else {
+        company = await prisma.company.create({
+          data: {
+            realmId,
+            legalName: realmId, // placeholder until getCompanyInfo below
+            nickname: realmId,
+            env: await defaultQboEnv(),
+            dryRun: true, // safe default — nothing touches the real books until the admin flips it
+            ...tokenData,
+          },
+        });
+      }
+
+      const client = await qboFactory.forCompany(company.id);
+      const info = await client.getCompanyInfo();
+      company = await prisma.company.update({
+        where: { id: company.id },
+        data: {
+          legalName: info.legalName,
+          ...(existing ? {} : { nickname: defaultNickname(info.legalName) }),
+        },
+      });
+
+      res.redirect(`${env.APP_URL}/setup?connected=${company.id}`);
+    } catch (err) {
+      console.error('[qbo-oauth] connect failed:', err);
+      res.redirect(`${env.APP_URL}/setup?error=connect_failed`);
+    }
+  }),
+);
+
+// Mock mode only: a self-contained fake consent page. This impersonates
+// nothing real — it is clearly labelled as the Recat demo.
+qboOauthRouter.get(
+  '/auth/qbo/mock-consent',
+  requireUser,
+  requireInstanceAdmin,
+  asyncHandler(async (req, res) => {
+    if (!env.QBO_MOCK) throw new HttpError(404, 'Not found', 'NOT_FOUND');
+    const state = queryString(req.query.state);
+    const link = (code: string, realmId: string): string =>
+      `/auth/qbo/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}&realmId=${encodeURIComponent(realmId)}`;
+
+    res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recat demo — fake Intuit consent</title>
+<style>
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f6f5f1; color: #1f2421; display: flex; min-height: 100vh;
+         align-items: center; justify-content: center; }
+  .card { background: #fff; border: 1px solid #ddd8cc; border-radius: 12px;
+          padding: 32px 36px; max-width: 420px; box-shadow: 0 2px 12px rgba(0,0,0,.06); }
+  .badge { display: inline-block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+           background: #fdf3d7; color: #8a6d1f; border: 1px solid #e8d9a8;
+           border-radius: 999px; padding: 3px 10px; margin-bottom: 14px; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  p { font-size: 14px; color: #5c635c; margin: 0 0 20px; line-height: 1.5; }
+  a.company { display: block; text-decoration: none; color: #1f2421; border: 1px solid #ccc7ba;
+              border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; font-size: 15px; }
+  a.company:hover { background: #f2f0e9; border-color: #9aa39a; }
+  a.company small { display: block; color: #8a8f88; font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge">Recat demo — fake Intuit consent</span>
+    <h1>Choose a demo company to connect</h1>
+    <p>This is a mock consent screen (QBO_MOCK=true). No real Intuit account is involved;
+       both companies are built-in sample data.</p>
+    <a class="company" href="${link('mock-harbor', MOCK_REALM_HARBOR)}">Harbor &amp; Main Coffee Co.<small>Coffee shop · realm ${MOCK_REALM_HARBOR}</small></a>
+    <a class="company" href="${link('mock-bluebird', MOCK_REALM_BLUEBIRD)}">Bluebird Salon LLC<small>Salon · realm ${MOCK_REALM_BLUEBIRD}</small></a>
+  </div>
+</body>
+</html>`);
+  }),
+);
