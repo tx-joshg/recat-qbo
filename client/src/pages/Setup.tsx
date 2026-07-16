@@ -32,6 +32,8 @@ import {
 import type { InstanceSettingsPatchBody } from '../lib/api';
 import type { SetupStatus } from '../lib/api';
 import { useApp } from '../state/AppContext';
+import type { SmtpProvider } from '../lib/smtpProviders';
+import SmtpPresets from '../components/SmtpPresets';
 import { Spinner } from '../components/ui';
 
 type StepId = 'start' | 'admin' | 'credentials' | 'email' | 'connect' | 'accounts' | 'sync';
@@ -260,6 +262,15 @@ export default function Setup() {
   const [smtpUser, setSmtpUser] = useState('');
   const [smtpPass, setSmtpPass] = useState('');
   const [smtpFrom, setSmtpFrom] = useState('');
+
+  // Quick-fill preset: host/port always; username only when the provider fixes
+  // it (otherwise it's the user's own address — leave whatever they typed).
+  // Never touches password or from.
+  const pickSmtpProvider = (p: SmtpProvider) => {
+    setSmtpHost(p.host);
+    setSmtpPort(String(p.port));
+    if (p.username !== null) setSmtpUser(p.username);
+  };
   // true → SMTP comes from env vars (from GET /api/instance/settings, admin-only).
   const [smtpEnvManaged, setSmtpEnvManaged] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -1046,6 +1057,9 @@ export default function Setup() {
                 </div>
               ) : (
                 <>
+                  <div style={{ marginBottom: 16 }}>
+                    <SmtpPresets host={smtpHost} onPick={pickSmtpProvider} />
+                  </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'flex', gap: 14 }}>
                       <div style={{ flex: 3 }}>

@@ -5,6 +5,8 @@
 import { useState } from 'react';
 import type { InstanceSettingsDto } from '@recat/shared';
 import { instanceSettings } from '../../lib/api';
+import type { SmtpProvider } from '../../lib/smtpProviders';
+import SmtpPresets from '../../components/SmtpPresets';
 import { InfoDot } from '../../components/ui';
 import { useApp } from '../../state/AppContext';
 import { errMsg } from './format';
@@ -54,6 +56,14 @@ export default function EmailCard({
   const [pass, setPass] = useState('');
   const [from, setFrom] = useState(settings.smtpHost !== '' ? settings.smtpFrom : '');
   const [busy, setBusy] = useState(false);
+
+  // Fill host/port (and username only when the provider fixes it); never touch
+  // the password or from address.
+  const pickProvider = (p: SmtpProvider) => {
+    setHost(p.host);
+    setPort(String(p.port));
+    if (p.username !== null) setUser(p.username);
+  };
 
   const patchBody = (): Parameters<typeof instanceSettings.patch>[0] => {
     const body: Parameters<typeof instanceSettings.patch>[0] = {};
@@ -135,14 +145,18 @@ export default function EmailCard({
           take precedence, so values saved here would be ignored.
         </div>
       ) : (
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))',
-            gap: 14,
-            marginTop: 16,
-          }}
-        >
+        <>
+          <div style={{ marginTop: 16 }}>
+            <SmtpPresets host={host} onPick={pickProvider} />
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))',
+              gap: 14,
+              marginTop: 16,
+            }}
+          >
           <div>
             <label style={fieldLabel}>SMTP host</label>
             <input
@@ -193,7 +207,8 @@ export default function EmailCard({
               style={{ ...inputStyle, fontFamily: 'inherit' }}
             />
           </div>
-        </div>
+          </div>
+        </>
       )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
