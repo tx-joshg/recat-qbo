@@ -18,6 +18,7 @@ import {
   QboSyncTokenConflict,
   type QboAccountInfo,
   type QboAccountTxn,
+  type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
   type QboStatement,
@@ -299,6 +300,56 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
         amount: reportNumber(at(colData, iAmount)?.value),
         txnType: at(colData, iType)?.value ?? '',
         qboId: at(colData, iDate)?.id ?? colData[0]?.id ?? '',
+      });
+    }
+  };
+  walk(raw.Rows?.Row ?? []);
+  return out;
+}
+
+/** The whole-company transaction-log columns, in the order we ask for them. */
+const TXN_LOG_COLUMNS = 'tx_date,txn_type,doc_num,name,memo,account_name,subt_nat_amount';
+
+/**
+ * Parse a whole-company /reports/TransactionList body (the log view). Same
+ * column-resolution rules as parseTransactionListReport, plus the posting
+ * account and doc number.
+ */
+export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
+  const cols = raw.Columns?.Column ?? [];
+  const colIndex = (type: string, titleWord: string): number => {
+    const byType = cols.findIndex((c) => c.ColType === type);
+    if (byType >= 0) return byType;
+    return cols.findIndex((c) => (c.ColTitle ?? '').toLowerCase().includes(titleWord));
+  };
+  const iDate = colIndex('tx_date', 'date');
+  const iType = colIndex('txn_type', 'transaction type');
+  const iDocNum = colIndex('doc_num', 'num');
+  const iName = colIndex('name', 'name');
+  const iMemo = colIndex('memo', 'memo');
+  const iAccount = colIndex('account_name', 'account');
+  const iAmount = colIndex('subt_nat_amount', 'amount');
+  const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
+    i >= 0 ? colData[i] : undefined;
+
+  const out: QboLogTxn[] = [];
+  const walk = (list: RawReportRow[]): void => {
+    for (const row of list) {
+      if (row.Rows?.Row) walk(row.Rows.Row); // grouped section — flatten
+      const colData = row.ColData;
+      if (!colData || colData.length === 0 || row.type === 'Section') continue;
+      const date = at(colData, iDate)?.value ?? '';
+      if (date === '') continue; // summary/blank row
+      const memo = at(colData, iMemo)?.value;
+      const docNum = at(colData, iDocNum)?.value;
+      out.push({
+        date,
+        txnType: at(colData, iType)?.value ?? '',
+        ...(docNum !== undefined && docNum !== '' ? { docNum } : {}),
+        payee: at(colData, iName)?.value ?? '',
+        ...(memo !== undefined && memo !== '' ? { memo } : {}),
+        account: at(colData, iAccount)?.value ?? '',
+        amount: reportNumber(at(colData, iAmount)?.value),
       });
     }
   };
@@ -973,6 +1024,16 @@ export class RealQboClient implements QboClient {
     });
     const raw = await this.request<RawReport>('GET', `/reports/TransactionList?${q.toString()}`);
     return parseTransactionListReport(raw);
+  }
+
+  async listTransactions(params: { startDate: string; endDate: string }): Promise<QboLogTxn[]> {
+    const q = new URLSearchParams({
+      start_date: params.startDate,
+      end_date: params.endDate,
+      columns: TXN_LOG_COLUMNS,
+    });
+    const raw = await this.request<RawReport>('GET', `/reports/TransactionList?${q.toString()}`);
+    return parseTransactionLogReport(raw);
   }
 
   async createTransfer(args: {

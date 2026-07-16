@@ -290,6 +290,25 @@ export interface StatementDrilldownDto {
   rows: StatementDrilldownRow[];
 }
 
+/** One row of the whole-company transaction log (read straight from QuickBooks). */
+export interface TransactionLogRowDto {
+  date: string; // YYYY-MM-DD
+  txnType: string;
+  docNum?: string;
+  payee: string;
+  memo?: string;
+  /** posting account/category as QBO reports it; multi-line entities read '- Split -' */
+  account: string;
+  /** signed; + = money in */
+  amount: number;
+}
+
+export interface TransactionLogDto {
+  start: string;
+  end: string;
+  rows: TransactionLogRowDto[];
+}
+
 export interface CustomReportRow {
   name: string;
   color: string | null;

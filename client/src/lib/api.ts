@@ -24,6 +24,7 @@ import type {
   SavedReportDto,
   SessionDto,
   StatementDrilldownDto,
+  TransactionLogDto,
   StatementDto,
   SuggestionSetting,
   SyncMode,
@@ -187,6 +188,8 @@ export interface SetupStatus {
   smtpConfigured: boolean;
   /** `${APP_URL}/auth/qbo/callback` — shown verbatim on the Credentials step. */
   redirectUri: string;
+  /** `${APP_URL}/webhooks/qbo` — shown on the Sync step when webhooks are picked. */
+  webhookUrl?: string;
 }
 
 /** Connect-flow choices for GET /api/companies/connect-url. */
@@ -310,6 +313,9 @@ export const reports = {
   /** Transactions behind one statement row: account = QBO account id, start/end = YYYY-MM-DD. */
   drilldown: (companyId: string, params: { account: string; start: string; end: string }) =>
     api.get<StatementDrilldownDto>(`/api/companies/${companyId}/reports/drilldown${qs({ ...params })}`),
+  /** Whole-company transaction log, straight from QuickBooks. start/end = YYYY-MM-DD. */
+  transactionLog: (companyId: string, params: { start: string; end: string }) =>
+    api.get<TransactionLogDto>(`/api/companies/${companyId}/reports/transaction-log${qs({ ...params })}`),
 };
 
 export const dashboardLayout = {

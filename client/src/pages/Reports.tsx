@@ -12,13 +12,15 @@ import type {
   StatementDrilldownRow,
   StatementDto,
   StatementRow,
+  TransactionLogDto,
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import { reports, savedReports, transactions } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 
-type RptTab = 'pl' | 'bs' | 'custom';
+type RptTab = 'pl' | 'bs' | 'custom' | 'txns';
+type LogRange = '30d' | '90d' | 'ytd' | '12m';
 type Compare = 'none' | 'prev' | 'py';
 type Basis = 'cash' | 'accrual';
 
@@ -174,11 +176,17 @@ export default function Reports() {
   const [saved, setSaved] = useState<SavedReportDto[]>([]);
   const [rptName, setRptName] = useState('');
 
+  // Transaction log
+  const [logRange, setLogRange] = useState<LogRange>('90d');
+  const [log, setLog] = useState<TransactionLogDto | null>(null);
+  const [logLoading, setLogLoading] = useState(false);
+  const [logFilter, setLogFilter] = useState('');
+
   const plCmpShown = plCols === 'total' && plPeriod !== 'ytd';
 
   // ---- statement fetch (refires on every control change) ----
   useEffect(() => {
-    if (!activeCompanyId || tab === 'custom') return;
+    if (!activeCompanyId || (tab !== 'pl' && tab !== 'bs')) return;
     let cancelled = false;
     const req =
       tab === 'pl'
@@ -207,6 +215,38 @@ export default function Reports() {
       cancelled = true;
     };
   }, [activeCompanyId, tab, plPeriod, plCols, plCmp, bsMonth, bsCmp, basis, toast]);
+
+  // ---- transaction log fetch ----
+  useEffect(() => {
+    if (!activeCompanyId || tab !== 'txns') return;
+    let cancelled = false;
+    const end = new Date();
+    const start = new Date(end);
+    if (logRange === '30d') start.setDate(start.getDate() - 30);
+    else if (logRange === '90d') start.setDate(start.getDate() - 90);
+    else if (logRange === '12m') start.setFullYear(start.getFullYear() - 1);
+    else {
+      start.setMonth(0);
+      start.setDate(1);
+    }
+    const ymd = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    setLogLoading(true);
+    reports
+      .transactionLog(activeCompanyId, { start: ymd(start), end: ymd(end) })
+      .then((r) => {
+        if (!cancelled) setLog(r);
+      })
+      .catch(() => {
+        if (!cancelled) toast('Could not load the transaction log');
+      })
+      .finally(() => {
+        if (!cancelled) setLogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCompanyId, tab, logRange, toast]);
 
   // ---- custom report fetch ----
   useEffect(() => {
@@ -328,11 +368,12 @@ export default function Reports() {
       >
         <div>
           <div className="page-title">Reports</div>
-          <div className="page-sub">Statements and custom slices, computed locally from synced data.</div>
+          <div className="page-sub">Statements and the transaction log read straight from QuickBooks; custom slices from synced data.</div>
         </div>
         <LabeledSelect label="Report" value={tab} onChange={(v) => setTab(v as RptTab)}>
           <option value="pl">Profit &amp; Loss</option>
           <option value="bs">Balance Sheet</option>
+          <option value="txns">Transaction log</option>
           <option value="custom">Custom &amp; tags</option>
         </LabeledSelect>
       </div>
@@ -396,8 +437,157 @@ export default function Reports() {
         </div>
       )}
 
+      {/* transaction log controls */}
+      {tab === 'txns' && (
+        <div style={controlCard}>
+          <LabeledSelect label="Period" value={logRange} onChange={(v) => setLogRange(v as LogRange)}>
+            <option value="30d">Last 30 days</option>
+            <option value="90d">Last 90 days</option>
+            <option value="ytd">This year</option>
+            <option value="12m">Last 12 months</option>
+          </LabeledSelect>
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--fnt)', marginBottom: 5 }}>Filter</div>
+            <input
+              className="input"
+              value={logFilter}
+              onChange={(e) => setLogFilter(e.target.value)}
+              placeholder="Payee, memo, category, type…"
+              style={{ minWidth: 220 }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* transaction log card */}
+      {tab === 'txns' && (
+        <div
+          style={{
+            border: '1px solid var(--bd2)',
+            borderRadius: 10,
+            background: 'var(--card)',
+            padding: '22px 24px',
+            boxShadow: '0 1px 6px rgba(60,55,45,.05)',
+            marginTop: 16,
+            overflowX: 'auto',
+          }}
+        >
+          {logLoading && !log ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '24px 0' }}>
+              <Spinner />
+            </div>
+          ) : log ? (
+            (() => {
+              const needle = logFilter.trim().toLowerCase();
+              const rows =
+                needle === ''
+                  ? log.rows
+                  : log.rows.filter((r) =>
+                      [r.payee, r.memo ?? '', r.account, r.txnType, r.docNum ?? '']
+                        .join(' ')
+                        .toLowerCase()
+                        .includes(needle),
+                    );
+              const total = rows.reduce((a, r) => a + r.amount, 0);
+              return (
+                <div style={{ minWidth: 640 }}>
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '86px 110px 1fr 220px 110px',
+                      gap: '0 14px',
+                      padding: '0 0 8px',
+                      borderBottom: '1px solid var(--bd)',
+                      fontSize: 11.5,
+                      fontWeight: 600,
+                      letterSpacing: '.05em',
+                      textTransform: 'uppercase',
+                      color: 'var(--fnt)',
+                    }}
+                  >
+                    <span>Date</span>
+                    <span>Type</span>
+                    <span>Payee / memo</span>
+                    <span>Category</span>
+                    <span style={{ textAlign: 'right' }}>Amount</span>
+                  </div>
+                  {rows.length === 0 && (
+                    <div style={{ padding: '18px 0', fontSize: 13.5, color: 'var(--fnt)' }}>
+                      No transactions in this period{needle !== '' ? ' match the filter' : ''}.
+                    </div>
+                  )}
+                  {rows.map((r, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '86px 110px 1fr 220px 110px',
+                        gap: '0 14px',
+                        alignItems: 'baseline',
+                        padding: '9px 0',
+                        borderBottom: '1px solid var(--rowbd)',
+                        fontSize: 13.5,
+                      }}
+                    >
+                      <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{fmtDate(r.date)}</span>
+                      <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{r.txnType}</span>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        <span style={{ fontWeight: 500 }}>{r.payee || '—'}</span>
+                        {r.memo !== undefined && (
+                          <span style={{ color: 'var(--fnt)', fontSize: 12.5 }}> · {r.memo}</span>
+                        )}
+                      </span>
+                      <span
+                        style={{
+                          color: 'var(--mut)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {r.account}
+                      </span>
+                      <span
+                        style={{
+                          textAlign: 'right',
+                          fontVariantNumeric: 'tabular-nums',
+                          fontWeight: 500,
+                          color: r.amount >= 0 ? 'var(--okT)' : 'var(--ink)',
+                        }}
+                      >
+                        {fmtMoney(r.amount)}
+                      </span>
+                    </div>
+                  ))}
+                  {rows.length > 0 && (
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 110px',
+                        gap: '0 14px',
+                        padding: '10px 0 0',
+                        fontSize: 13,
+                        color: 'var(--mut)',
+                      }}
+                    >
+                      <span>
+                        {rows.length} transaction{rows.length === 1 ? '' : 's'} · read live from
+                        QuickBooks
+                      </span>
+                      <span style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600, color: 'var(--ink)' }}>
+                        {fmtMoney(total)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              );
+            })()
+          ) : null}
+        </div>
+      )}
+
       {/* statement card */}
-      {tab !== 'custom' && stmt && (
+      {(tab === 'pl' || tab === 'bs') && stmt && (
         <div
           style={{
             border: '1px solid var(--bd2)',

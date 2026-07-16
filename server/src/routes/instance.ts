@@ -4,7 +4,7 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { redirectUri } from '../env.js';
+import { redirectUri, webhookUrl } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
@@ -124,6 +124,7 @@ setupRouter.get(
       credentialsSet: settings.intuitClientId !== '',
       smtpConfigured: settings.smtpHost !== '',
       redirectUri,
+      webhookUrl,
     });
   }),
 );

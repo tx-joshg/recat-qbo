@@ -86,6 +86,19 @@ export interface QboAccountTxn {
   qboId: string;
 }
 
+/** One row of the whole-company transaction log (from /reports/TransactionList). */
+export interface QboLogTxn {
+  date: string; // YYYY-MM-DD
+  txnType: string;
+  docNum?: string;
+  payee: string;
+  memo?: string;
+  /** posting account/category as QBO reports it; multi-line entities read '- Split -' */
+  account: string;
+  /** signed; + = money in, per the report's natural amount */
+  amount: number;
+}
+
 export interface QboWriteResult {
   ok: true;
   newSyncToken: string;
@@ -164,6 +177,9 @@ export interface QboClient {
     startDate: string;
     endDate: string;
   }): Promise<QboAccountTxn[]>;
+
+  /** Whole-company transaction log within a date range (QBO TransactionList). */
+  listTransactions(params: { startDate: string; endDate: string }): Promise<QboLogTxn[]>;
 
   /** Create a QBO Transfer entity between two accounts. */
   createTransfer(args: {

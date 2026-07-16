@@ -96,3 +96,6 @@ if (isProd) {
 
 /** OAuth callback registered with Intuit — the wizard shows this exact URL. */
 export const redirectUri = `${env.APP_URL}/auth/qbo/callback`;
+
+/** Webhook endpoint registered with Intuit — shown on the wizard's Sync step. */
+export const webhookUrl = `${env.APP_URL}/webhooks/qbo`;

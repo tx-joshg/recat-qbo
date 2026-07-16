@@ -19,6 +19,7 @@ import type {
   StatementDrilldownRow,
   StatementDto,
   StatementRow,
+  TransactionLogDto,
 } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
@@ -439,6 +440,22 @@ export async function statementDrilldown(
   return { accountName, rows };
 }
 
+// ---------- Transaction log ----------
+
+/**
+ * Whole-company transaction log, read straight from QuickBooks (TransactionList
+ * report) so it can never drift from the books. Demo companies serve the same
+ * shape from the mock realm store.
+ */
+export async function transactionLog(
+  companyId: string,
+  args: { start: string; end: string },
+): Promise<TransactionLogDto> {
+  const client = await qboFactory.forCompany(companyId);
+  const rows = await client.listTransactions({ startDate: args.start, endDate: args.end });
+  return { start: args.start, end: args.end, rows };
+}
+
 // ---------- Custom & tags ----------
 
 /** Plain-data inputs so computeCustomReport is pure and unit-testable. */
@@ -575,6 +592,60 @@ export async function customReport(companyId: string, cfg: SavedReportConfig): P
 
 // ---------- Dashboard ----------
 
+/**
+ * Dashboard numbers straight from QBO's month-summarized P&L (last 6 calendar
+ * months). Section totals are read from QBO's own summary rows; the expense
+ * side is derived as income − net income so it survives any section layout.
+ */
+async function qboDashboard(companyId: string): Promise<Omit<DashboardDataDto, 'pendingCount' | 'pendingTotal'>> {
+  const now = new Date();
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1));
+  const stmt = await qboStatement(companyId, 'pl', {
+    startDate: start.toISOString().slice(0, 10),
+    endDate: now.toISOString().slice(0, 10),
+    basis: 'accrual',
+    summarizeBy: 'Month',
+  });
+
+  const colCount = stmt.columns.length;
+  const hasTotalCol = colCount > 0 && /total/i.test(stmt.columns[colCount - 1]!.label);
+  const monthCols = hasTotalCol ? colCount - 1 : colCount;
+  const months = stmt.columns.slice(0, monthCols).map((c) => c.label.trim().slice(0, 3));
+
+  const val = (r: QboStatementRow | undefined, i: number): number => r?.values[i] ?? 0;
+  const spanTotal = (r: QboStatementRow): number =>
+    hasTotalCol ? val(r, colCount - 1) : r.values.reduce((a, b) => a + b, 0);
+
+  const summaries = stmt.rows.filter((r) => r.kind === 'total' || r.kind === 'grand');
+  const incomeRow = summaries.find((r) => /^total income$/i.test(r.label));
+  const cogsRow = summaries.find((r) => /^total cost of goods sold$/i.test(r.label));
+  const grands = stmt.rows.filter((r) => r.kind === 'grand');
+  const netRow = grands[grands.length - 1]; // QBO emits Net Income as the last grand row
+
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+  const rev = Array.from({ length: monthCols }, (_, i) => val(incomeRow, i));
+  const exp = Array.from({ length: monthCols }, (_, i) => r2(val(incomeRow, i) - val(netRow, i)));
+
+  const last = monthCols - 1;
+  const income = val(incomeRow, last);
+  const cogs = val(cogsRow, last);
+  const expenses = r2(income - val(netRow, last) - cogs);
+
+  // Top expense categories over the span: leaf rows outside the income sections.
+  let section = '';
+  const cats: { name: string; amount: number }[] = [];
+  for (const r of stmt.rows) {
+    if (r.kind === 'head' && !r.indent) section = r.label;
+    if (r.kind === 'line' && !/income/i.test(section)) {
+      const amount = r2(spanTotal(r));
+      if (amount > 0.004) cats.push({ name: r.label, amount });
+    }
+  }
+  const breakdown = cats.sort((a, b) => b.amount - a.amount).slice(0, 5);
+
+  return { months, rev, exp, breakdown, pl: { income, cogs, expenses } };
+}
+
 export async function dashboardData(companyId: string): Promise<DashboardDataDto> {
   const pend = await prisma.transaction.findMany({
     where: { companyId, status: { in: ['PENDING', 'ERROR'] } },
@@ -596,7 +667,15 @@ export async function dashboardData(companyId: string): Promise<DashboardDataDto
     };
   }
 
-  // Real mode: last 6 calendar months from POSTED txns.
+  // Real mode: QBO's own month-summarized P&L — drift-free, and populated even
+  // before Recat has processed anything (fresh connections carry full history).
+  try {
+    return { ...(await qboDashboard(companyId)), pendingCount, pendingTotal };
+  } catch {
+    // QBO unreachable — fall back to what Recat has posted locally.
+  }
+
+  // Fallback: last 6 calendar months from POSTED txns.
   const txns = await prisma.transaction.findMany({
     where: { companyId, status: 'POSTED' },
     include: { splitLines: true },

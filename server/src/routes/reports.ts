@@ -9,7 +9,7 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
-import { balanceSheet, customReport, profitAndLoss, statementDrilldown } from '../services/reports.js';
+import { balanceSheet, customReport, profitAndLoss, statementDrilldown, transactionLog } from '../services/reports.js';
 
 function scopedCompany(req: { company?: Company }): Company {
   if (!req.company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
@@ -37,6 +37,11 @@ const bsQuery = z.object({
 
 const drilldownQuery = z.object({
   account: z.string().min(1, 'QBO account id'),
+  start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
+  end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
+});
+
+const txnLogQuery = z.object({
   start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
   end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
 });
@@ -103,6 +108,15 @@ reportsRouter.get(
     const company = scopedCompany(req);
     const q = validate(drilldownQuery)(req.query);
     res.json(await statementDrilldown(company.id, { accountQboId: q.account, start: q.start, end: q.end }));
+  }),
+);
+
+reportsRouter.get(
+  '/transaction-log',
+  asyncHandler(async (req, res) => {
+    const company = scopedCompany(req);
+    const q = validate(txnLogQuery)(req.query);
+    res.json(await transactionLog(company.id, { start: q.start, end: q.end }));
   }),
 );
 

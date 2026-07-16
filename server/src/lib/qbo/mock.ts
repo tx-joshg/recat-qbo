@@ -14,6 +14,7 @@ import {
   QboSyncTokenConflict,
   type QboAccountInfo,
   type QboAccountTxn,
+  type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
   type QboStatement,
@@ -461,6 +462,28 @@ export class MockQboClient implements QboClient {
           qboId: t.qboId,
         };
       });
+  }
+
+  async listTransactions(params: { startDate: string; endDate: string }): Promise<QboLogTxn[]> {
+    await ensureMockRealmsHydrated();
+    const nameOf = (qboId: string): string =>
+      this.realm.accounts.find((a) => a.qboId === qboId)?.name ?? qboId;
+    return this.realm.txns
+      .filter((t) => !t.deleted && t.date >= params.startDate && t.date <= params.endDate)
+      .map((t) => {
+        const accountIds = [...new Set(t.lines.map((l) => l.accountQboId))];
+        return {
+          date: t.date,
+          txnType: t.qboType,
+          payee: t.payee,
+          ...(t.memo !== undefined ? { memo: t.memo } : {}),
+          // Same convention as QBO's TransactionList: one row per entity, with
+          // multi-line entities reading '- Split -'.
+          account: accountIds.length === 1 ? nameOf(accountIds[0]!) : '- Split -',
+          amount: t.amount,
+        };
+      })
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
   }
 
   // ---- writes (all bump SyncToken; stale tokens conflict, like real QBO) ----

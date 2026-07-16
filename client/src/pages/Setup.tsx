@@ -285,6 +285,8 @@ export default function Setup() {
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
   const [busy, setBusy] = useState(false);
+  // Sync step, webhook path: the Intuit verifier token (saved on finish).
+  const [verifierToken, setVerifierToken] = useState('');
 
   const connectedCompany = companyId ? companies.find((c) => c.id === companyId) ?? null : null;
 
@@ -431,6 +433,7 @@ export default function Setup() {
   }, [stepId, companyId, optionsFor, companies, toast]);
 
   const redirectUri = status?.redirectUri ?? `${window.location.origin}/auth/qbo/callback`;
+  const webhookEndpoint = status?.webhookUrl ?? `${window.location.origin}/webhooks/qbo`;
   const selectedIds = options?.filter((o) => selected[o.id]).map((o) => o.id) ?? [];
 
   // ---- step actions --------------------------------------------------------
@@ -649,6 +652,9 @@ export default function Setup() {
     }, 700);
     try {
       await companiesApi.setSyncMode(companyId, syncMode);
+      if (syncMode === 'webhook' && verifierToken.trim() !== '') {
+        await instanceSettings.patch({ webhookVerifierToken: verifierToken.trim() });
+      }
       // Saving the holding accounts kicks off the initial sync server-side.
       await companiesApi.setHoldingAccounts(companyId, selectedIds);
       let found: number | null = null;
@@ -1476,6 +1482,67 @@ export default function Setup() {
                   </div>
                 </label>
               </div>
+              {syncMode === 'webhook' && (
+                <div
+                  style={{
+                    marginTop: 14,
+                    border: '1px solid var(--bd)',
+                    background: 'var(--hl)',
+                    borderRadius: 10,
+                    padding: '16px 18px',
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    Webhook URL — paste this into your Intuit app's Webhooks section
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <code
+                      style={{
+                        flex: 1,
+                        fontSize: 12.5,
+                        background: 'var(--card)',
+                        border: '1px solid var(--bd)',
+                        borderRadius: 7,
+                        padding: '9px 12px',
+                        overflowX: 'auto',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {webhookEndpoint}
+                    </code>
+                    <button
+                      onClick={() => copyText(webhookEndpoint)}
+                      style={{
+                        border: '1px solid var(--bd)',
+                        background: 'var(--card)',
+                        borderRadius: 7,
+                        padding: '8px 14px',
+                        fontSize: 13,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 600, margin: '14px 0 6px' }}>
+                    Verifier token
+                  </div>
+                  <input
+                    className="input-lg"
+                    value={verifierToken}
+                    onChange={(e) => setVerifierToken(e.target.value)}
+                    placeholder="Paste the token Intuit shows after you save the webhook URL"
+                    autoComplete="off"
+                  />
+                  <div style={{ fontSize: 12.5, color: 'var(--fnt)', marginTop: 6, lineHeight: 1.5 }}>
+                    Intuit signs every event with this token; Recat rejects unsigned ones. You can
+                    also add or change it later in Settings → QuickBooks API access. Subscribe to
+                    Purchase, Deposit, and JournalEntry events.
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
