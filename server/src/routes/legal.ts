@@ -112,6 +112,34 @@ survive termination.</p>
   );
 });
 
+// Intuit's app form also asks for a Disconnect URL — the page users land on
+// after disconnecting the app from inside QuickBooks / My Apps.
+legalRouter.get('/disconnected', (_req, res) => {
+  res.type('html').send(
+    page(
+      'QuickBooks disconnected',
+      `
+<h1>QuickBooks connection disconnected</h1>
+<div class="sub">This Recat deployment can no longer access that QuickBooks company</div>
+<div class="card">
+<p>You (or someone on your Intuit account) disconnected Recat from a QuickBooks
+company. From this moment:</p>
+<ul>
+  <li><b>Syncing has stopped</b> — no new transactions will appear in the queue,
+  and nothing can be posted back to QuickBooks for that company.</li>
+  <li><b>Your local history is safe</b> — previously synced transactions and the
+  append-only audit log remain in this deployment's own database.</li>
+  <li><b>Nothing in QuickBooks was changed</b> by disconnecting.</li>
+</ul>
+<h2>To reconnect</h2>
+<p><a href="/">Sign in to Recat</a>, open <b>Settings</b> for the company, and
+click <b>Reconnect</b> — you'll be sent through the same QuickBooks consent
+screen as when you first connected, and syncing resumes where it left off.</p>
+</div>`,
+    ),
+  );
+});
+
 legalRouter.get('/privacy', (_req, res) => {
   const host = origin();
   res.type('html').send(

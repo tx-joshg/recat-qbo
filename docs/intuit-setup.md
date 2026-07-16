@@ -36,6 +36,15 @@ They describe exactly what a self-hosted Recat instance stores and shares
 (nothing leaves your server except QuickBooks API calls and your own SMTP).
 They're templates — replace them if your jurisdiction needs specific language.
 
+The form's **Launch URL** (also used for reconnecting) is simply your
+deployment's root, and the **Disconnect URL** is a built-in landing page that
+explains what happened and how to reconnect:
+
+```
+https://YOUR-RECAT-DOMAIN/
+https://YOUR-RECAT-DOMAIN/disconnected
+```
+
 ## 3. Grab your development (sandbox) keys
 
 Copy the **Client ID** and **Client Secret** from the Development tab into Recat's setup wizard (or `.env`). Set `QBO_ENVIRONMENT=sandbox`. Intuit gives every developer account a sandbox company with fake data — connect it and try the full loop safely.

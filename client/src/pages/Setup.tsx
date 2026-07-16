@@ -827,10 +827,15 @@ export default function Setup() {
                   </button>
                 </div>
                 <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--mut)', marginTop: 16 }}>
-                  EULA &amp; Privacy Policy URLs — Intuit asks for these too; this deployment
-                  serves ready-made pages
+                  Intuit also asks for EULA, Privacy Policy, Launch, and Disconnect URLs —
+                  this deployment serves them all, in that order
                 </div>
-                {[`${window.location.origin}/eula`, `${window.location.origin}/privacy`].map((u) => (
+                {[
+                  `${window.location.origin}/eula`,
+                  `${window.location.origin}/privacy`,
+                  `${window.location.origin}/`,
+                  `${window.location.origin}/disconnected`,
+                ].map((u) => (
                   <div
                     key={u}
                     style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, minWidth: 0 }}
