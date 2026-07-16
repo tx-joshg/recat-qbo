@@ -9,7 +9,8 @@ Thanks for helping! Recat writes to people's real accounting ledgers, so the bar
 git clone <repo-url> && cd recat
 npm install
 createdb recat                       # or point DATABASE_URL anywhere
-cp .env.example .env                 # set SESSION_SECRET + ENCRYPTION_KEY, QBO_MOCK=true
+cp .env.example .env                 # set SESSION_SECRET + ENCRYPTION_KEY, QBO_MOCK=true,
+                                     # and APP_URL=http://localhost:5173 (Vite dev port)
 npx prisma migrate dev
 npm run seed                         # demo data (2 mock companies)
 npm run dev                          # server :3001 + client :5173

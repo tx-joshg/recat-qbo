@@ -20,10 +20,12 @@
     "seed": "npm run seed -w server"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2",
-    "prisma": "^6.10.0"
+    "concurrently": "^9.1.2"
   },
   "prisma": {
     "schema": "prisma/schema.prisma"
+  },
+  "dependencies": {
+    "prisma": "^6.10.0"
   }
 }
