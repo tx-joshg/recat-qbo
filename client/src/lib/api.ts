@@ -8,6 +8,7 @@ import type {
   AuditEntryDto,
   CategorizeBody,
   CompanyDto,
+  ConnectMode,
   CompanyPatchBody,
   CustomReportDto,
   DashboardDataDto,
@@ -177,12 +178,23 @@ export interface InviteMemberResponse {
   devLink?: string;
 }
 
-/** TODO(server): confirm shape — used by /login and /setup routing. */
+/** GET /api/setup/status — used by /login and /setup routing. */
 export interface SetupStatus {
   needsSetup: boolean;
+  /** Real Intuit credentials are configured (env or wizard). The demo needs none. */
   credentialsSet: boolean;
   /** An SMTP host is present (env var or DB) — the wizard's Email step is optional. */
   smtpConfigured: boolean;
+  /** `${APP_URL}/auth/qbo/callback` — shown verbatim on the Credentials step. */
+  redirectUri: string;
+}
+
+/** Connect-flow choices for GET /api/companies/connect-url. */
+export interface ConnectUrlParams {
+  /** 'demo' → built-in fake QuickBooks; 'real' (default) → Intuit OAuth. */
+  mode: ConnectMode;
+  /** sandbox/production for the real flow; ignored for demo. */
+  env?: QboEnv;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,8 +213,10 @@ export const companies = {
   list: () => api.get<CompanyDto[]>('/api/companies'),
   patch: (id: string, body: CompanyPatchBody) => api.patch<CompanyDto>(`/api/companies/${id}`, body),
   sync: (id: string) => api.post<void>(`/api/companies/${id}/sync`),
-  /** Intuit OAuth consent URL for connecting a (new) company. */
-  connectUrl: () => api.get<{ url: string }>('/api/companies/connect-url'),
+  /** Consent URL for connecting a (new) company — mode=demo → the built-in
+   * fake consent page; mode=real → Intuit OAuth (env picks sandbox/production). */
+  connectUrl: (params: ConnectUrlParams) =>
+    api.get<{ url: string }>(`/api/companies/connect-url${qs({ mode: params.mode, env: params.env })}`),
   /** Disconnect: revoke tokens, keep history. */
   disconnect: (id: string) => api.del<void>(`/api/companies/${id}`),
   accounts: (id: string) => api.get<QboAccountDto[]>(`/api/companies/${id}/accounts`),

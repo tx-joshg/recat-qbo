@@ -7,9 +7,10 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { Company } from '@prisma/client';
 import type { CompanyDto, PollInterval, QboAccountDto, SyncLogDto } from '@recat/shared';
+import { parseConnectRequest } from '../lib/connectRequest.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
-import { qboFactory } from '../lib/qbo/factory.js';
+import { hasIntuitCredentials, qboFactory } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { syncCompany } from '../services/sync.js';
@@ -85,12 +86,23 @@ companiesRouter.get(
   }),
 );
 
-// Start the OAuth connect flow (instance admin — connecting a company is an
-// instance-level act). The client api uses GET /connect-url; POST /connect is
-// kept as the handoff §4 spelling of the same thing.
-const connectHandler = asyncHandler(async (_req, res) => {
-  const state = createOauthState();
-  res.json({ url: qboFactory.authorizeUrl(state) });
+// Start a connect flow (instance admin — connecting a company is an
+// instance-level act). The user's choices ride along:
+//   GET /connect-url?mode=real|demo&env=sandbox|production
+// mode=demo → the built-in fake consent page (no credentials needed, always
+// available); mode=real (default) → the Intuit authorize URL, 400 with an
+// actionable message when credentials are missing. The env choice is carried
+// on the state token so the callback records exactly what the user picked.
+// POST /connect is kept as the handoff §4 spelling of the same thing.
+const connectHandler = asyncHandler(async (req, res) => {
+  const body = typeof req.body === 'object' && req.body !== null ? (req.body as Record<string, unknown>) : {};
+  const input = {
+    mode: body.mode ?? req.query.mode,
+    env: body.env ?? req.query.env,
+  };
+  const parsed = parseConnectRequest(input, await hasIntuitCredentials());
+  const state = createOauthState({ mode: parsed.mode, env: parsed.env });
+  res.json({ url: qboFactory.authorizeUrl(state, parsed.mode) });
 });
 companiesRouter.get('/connect-url', requireInstanceAdmin, connectHandler);
 companiesRouter.post('/connect', requireInstanceAdmin, connectHandler);

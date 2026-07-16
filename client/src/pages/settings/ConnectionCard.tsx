@@ -3,6 +3,7 @@
 // accounts watched, polling/webhook sync mode, interval, sync now.
 
 import { useRef, useState } from 'react';
+import { isDemoRealmId } from '@recat/shared';
 import type { CompanyDto, PollInterval, SyncLogDto, SyncMode } from '@recat/shared';
 import { companies as companiesApi } from '../../lib/api';
 import { useApp } from '../../state/AppContext';
@@ -86,9 +87,13 @@ export default function ConnectionCard({
       .finally(() => setSyncing(false));
   };
 
+  const isDemo = isDemoRealmId(company.realmId);
+
+  // Reconnect re-runs the flow this company was made with: demo companies go
+  // back through the fake consent; real ones to Intuit with their stored env.
   const reconnect = () => {
     companiesApi
-      .connectUrl()
+      .connectUrl(isDemo ? { mode: 'demo' } : { mode: 'real', env: company.env })
       .then(({ url }) => {
         window.location.href = url;
       })
@@ -96,6 +101,23 @@ export default function ConnectionCard({
   };
 
   const disconnected = company.disconnectedAt !== null;
+
+  const demoBadge = isDemo && (
+    <span
+      data-tip="Built-in sample company — not connected to Intuit"
+      style={{
+        fontSize: 12,
+        fontWeight: 600,
+        color: 'var(--fnt)',
+        background: 'var(--hl)',
+        border: '1px solid var(--bd2)',
+        borderRadius: 99,
+        padding: '1px 8px',
+      }}
+    >
+      demo
+    </span>
+  );
 
   return (
     <div
@@ -227,6 +249,7 @@ export default function ConnectionCard({
             Connected
           </span>
         )}
+        {demoBadge}
         <HoverButton
           onClick={reconnect}
           style={{

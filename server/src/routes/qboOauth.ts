@@ -1,8 +1,14 @@
 // QuickBooks OAuth routes (mounted at the app root):
-//   GET /auth/qbo/callback      — Intuit redirects here with code+state+realmId
-//   GET /auth/qbo/mock-consent  — mock mode only: a clearly-labelled fake
-//                                 consent page for the demo realms
-// State tokens are held in-memory with a 10-minute TTL (single-process app).
+//   GET /auth/qbo/callback      — Intuit (or the fake consent page) redirects
+//                                 here with code+state+realmId
+//   GET /auth/qbo/mock-consent  — a clearly-labelled fake consent page for the
+//                                 demo realms; always available (the demo is a
+//                                 per-connection choice, not an env mode), but
+//                                 only reachable with a valid state token from
+//                                 a mode=demo connect flow.
+// State tokens are held in-memory with a 10-minute TTL (single-process app)
+// and carry the connect flow's user choices (mode + env) so the callback
+// honors exactly what the user picked — never a boot-time default.
 
 import { Router } from 'express';
 import type { Company } from '@prisma/client';
@@ -10,38 +16,48 @@ import { env } from '../env.js';
 import { encrypt, randomToken } from '../lib/crypto.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
-import { qboFactory } from '../lib/qbo/factory.js';
+import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
 import { MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR, resolveMockRealmId } from '../lib/qbo/mock.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
+import { installDemoFinancials } from '../services/demoFinancials.js';
 
 // ---------------------------------------------------------------------------
-// OAuth state (CSRF) tokens
+// OAuth state (CSRF) tokens — each carries the connect flow's choices.
 // ---------------------------------------------------------------------------
+
+export interface ConnectChoice {
+  mode: 'real' | 'demo';
+  /** sandbox/production for the REAL flow; null = fall back to the instance
+   * default (AppConfig 'qboEnvDefault', then env.QBO_ENVIRONMENT). */
+  env: 'sandbox' | 'production' | null;
+}
 
 const STATE_TTL_MS = 10 * 60 * 1000;
-const states = new Map<string, number>(); // state → expiry epoch ms
+const states = new Map<string, { expiresAt: number; choice: ConnectChoice }>();
 
 function pruneStates(): void {
   const now = Date.now();
-  for (const [state, expiresAt] of states) {
-    if (expiresAt <= now) states.delete(state);
+  for (const [state, entry] of states) {
+    if (entry.expiresAt <= now) states.delete(state);
   }
 }
 
-/** Issue a state token for a new connect flow (used by POST /api/companies/connect). */
-export function createOauthState(): string {
+/** Issue a state token for a new connect flow (used by /api/companies/connect-url). */
+export function createOauthState(choice: ConnectChoice): string {
   pruneStates();
   const state = randomToken(16);
-  states.set(state, Date.now() + STATE_TTL_MS);
+  states.set(state, { expiresAt: Date.now() + STATE_TTL_MS, choice });
   return state;
 }
 
-/** Single-use: returns true (and forgets the state) when valid and unexpired. */
-export function consumeOauthState(state: string): boolean {
+/** Single-use: returns the flow's choices (and forgets the state) when valid
+ * and unexpired; null otherwise. */
+export function consumeOauthState(state: string): ConnectChoice | null {
   pruneStates();
-  if (!states.has(state)) return false;
+  const entry = states.get(state);
+  if (!entry) return null;
   states.delete(state);
-  return true;
+  return entry.choice;
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +73,8 @@ export function defaultNickname(legalName: string): string {
   return name !== '' ? name : legalName.trim();
 }
 
-/** The wizard's env choice applies to the NEXT connection (AppConfig 'qboEnvDefault'); env var is the fallback. */
+/** Instance default env for real connections when the flow didn't pick one:
+ * AppConfig 'qboEnvDefault' (wizard Credentials step), then the env var. */
 async function defaultQboEnv(): Promise<'sandbox' | 'production'> {
   const row = await prisma.appConfig.findUnique({ where: { key: 'qboEnvDefault' } });
   if (row && (row.value === 'sandbox' || row.value === 'production')) return row.value;
@@ -83,23 +100,31 @@ qboOauthRouter.get(
     const state = queryString(req.query.state);
     let realmId = queryString(req.query.realmId);
 
-    if (state === '' || !consumeOauthState(state)) {
+    const choice = state !== '' ? consumeOauthState(state) : null;
+    if (!choice) {
       throw new HttpError(400, 'Invalid or expired OAuth state — restart the connect flow.', 'BAD_STATE');
     }
     if (code === '') throw new HttpError(400, 'Missing authorization code', 'BAD_REQUEST');
-    if (realmId === '' && env.QBO_MOCK) {
+    if (realmId === '' && choice.mode === 'demo') {
       const connected = await prisma.company.findMany({ where: { disconnectedAt: null }, select: { realmId: true } });
       realmId = resolveMockRealmId(code, connected.map((c) => c.realmId));
     }
     if (realmId === '') throw new HttpError(400, 'Missing realmId', 'BAD_REQUEST');
+    // A real Intuit code can never belong to a mock realm; refuse the cross.
+    if (choice.mode === 'real' && isMockRealmId(realmId)) {
+      throw new HttpError(400, 'Demo realm on a real connect flow — restart the connect flow.', 'BAD_REQUEST');
+    }
 
     try {
-      const tokens = await qboFactory.exchangeCode(code, realmId);
+      const tokens = await qboFactory.exchangeCode(code, realmId, choice.mode);
       const tokenData = {
         accessToken: encrypt(tokens.accessToken),
         refreshToken: encrypt(tokens.refreshToken),
         tokenExpiresAt: new Date(tokens.expiresAt),
       };
+      // The user's per-connection env choice wins; demo companies are always
+      // 'sandbox' (there is no production fake QuickBooks).
+      const companyEnv = choice.mode === 'demo' ? 'sandbox' : choice.env ?? (await defaultQboEnv());
 
       // No Membership row is created for the connecting user: only instance
       // admins can reach this route, and instance admins are implicitly
@@ -119,7 +144,7 @@ qboOauthRouter.get(
             realmId,
             legalName: realmId, // placeholder until getCompanyInfo below
             nickname: realmId,
-            env: await defaultQboEnv(),
+            env: companyEnv,
             dryRun: true, // safe default — nothing touches the real books until the admin flips it
             ...tokenData,
           },
@@ -136,6 +161,10 @@ qboOauthRouter.get(
         },
       });
 
+      // Demo connections get the prototype's financial series so the
+      // dashboard and reports show the full experience, not empty charts.
+      if (choice.mode === 'demo') await installDemoFinancials(company.id, realmId);
+
       res.redirect(`${env.APP_URL}/setup?connected=${company.id}`);
     } catch (err) {
       console.error('[qbo-oauth] connect failed:', err);
@@ -144,14 +173,15 @@ qboOauthRouter.get(
   }),
 );
 
-// Mock mode only: a self-contained fake consent page. This impersonates
-// nothing real — it is clearly labelled as the Recat demo.
+// A self-contained fake consent page for demo connections. This impersonates
+// nothing real — it is clearly labelled as the Recat demo. Always mounted
+// (demo is every deployment's evaluation path); reaching the callback still
+// requires the single-use state token minted by a mode=demo connect flow.
 qboOauthRouter.get(
   '/auth/qbo/mock-consent',
   requireUser,
   requireInstanceAdmin,
   asyncHandler(async (req, res) => {
-    if (!env.QBO_MOCK) throw new HttpError(404, 'Not found', 'NOT_FOUND');
     const state = queryString(req.query.state);
     const link = (code: string, realmId: string): string =>
       `/auth/qbo/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}&realmId=${encodeURIComponent(realmId)}`;
@@ -183,8 +213,8 @@ qboOauthRouter.get(
   <div class="card">
     <span class="badge">Recat demo — fake Intuit consent</span>
     <h1>Choose a demo company to connect</h1>
-    <p>This is a mock consent screen (QBO_MOCK=true). No real Intuit account is involved;
-       both companies are built-in sample data.</p>
+    <p>This is a mock consent screen for Recat's built-in demo. No real Intuit
+       account is involved; both companies are built-in sample data.</p>
     <a class="company" href="${link('mock-harbor', MOCK_REALM_HARBOR)}">Harbor &amp; Main Coffee Co.<small>Coffee shop · realm ${MOCK_REALM_HARBOR}</small></a>
     <a class="company" href="${link('mock-bluebird', MOCK_REALM_BLUEBIRD)}">Bluebird Salon LLC<small>Salon · realm ${MOCK_REALM_BLUEBIRD}</small></a>
   </div>

@@ -4,6 +4,7 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties, MouseEvent } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
+import { isDemoRealmId } from '@recat/shared';
 import type { Role, UserDto } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 
@@ -49,6 +50,26 @@ const tabBase: CSSProperties = {
   alignItems: 'center',
   gap: 7,
 };
+
+/** Small 'demo' pill for demo companies (company switcher rows). */
+function DemoBadge() {
+  return (
+    <span
+      style={{
+        fontSize: 12,
+        fontWeight: 600,
+        color: 'var(--fnt)',
+        background: 'var(--hl)',
+        border: '1px solid var(--bd2)',
+        borderRadius: 99,
+        padding: '0 7px',
+        flex: 'none',
+      }}
+    >
+      demo
+    </span>
+  );
+}
 
 /** Queue pending-count badge (shared by desktop tabs and the mobile menu rows). */
 function QueueBadge({ count }: { count: number }) {
@@ -335,8 +356,25 @@ export default function Nav() {
                           {co.nickname.charAt(0).toUpperCase()}
                         </span>
                         <span style={{ flex: 1, minWidth: 0 }}>
-                          <span style={{ display: 'block', fontSize: 14, fontWeight: 600 }}>
-                            {co.nickname}
+                          <span
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              fontSize: 14,
+                              fontWeight: 600,
+                            }}
+                          >
+                            <span
+                              style={{
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                              }}
+                            >
+                              {co.nickname}
+                            </span>
+                            {isDemoRealmId(co.realmId) && <DemoBadge />}
                           </span>
                           <span
                             style={{
@@ -545,8 +583,21 @@ export default function Nav() {
                     {co.nickname.charAt(0).toUpperCase()}
                   </span>
                   <span style={{ flex: 1, minWidth: 0 }}>
-                    <span style={{ display: 'block', fontSize: 14, fontWeight: 600 }}>
-                      {co.nickname}
+                    <span
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        fontSize: 14,
+                        fontWeight: 600,
+                      }}
+                    >
+                      <span
+                        style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                      >
+                        {co.nickname}
+                      </span>
+                      {isDemoRealmId(co.realmId) && <DemoBadge />}
                     </span>
                     <span
                       style={{

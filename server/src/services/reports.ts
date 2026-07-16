@@ -1,13 +1,14 @@
 // Reports & dashboard computation.
 //
-// Two data sources:
-//  - Demo mode (QBO_MOCK): the seed stores the prototype's financial series in
-//    AppConfig (`demo:fin/plBases/bs:<companyId>`) so every screen matches the
-//    design pixel-for-pixel. The P&L/BS math replicates the prototype exactly.
-//  - Real mode: statements are QBO's OWN numbers via the Reports API
+// Two data sources, decided PER COMPANY (demo and real companies coexist):
+//  - Demo companies: connecting one installs the prototype's financial series
+//    in AppConfig (`demo:fin/plBases/bs:<companyId>`) so every screen matches
+//    the design pixel-for-pixel. The P&L/BS math replicates the prototype.
+//  - Real companies: statements are QBO's OWN numbers via the Reports API
 //    (QboClient.getStatement) — drift-free by construction. Row drill-down
 //    fetches the underlying transactions per account (getAccountTransactions);
-//    in demo mode drill-down reads the local mirror (Transaction + SplitLine).
+//    for demo companies drill-down reads the local mirror (Transaction +
+//    SplitLine).
 
 import type {
   CustomReportDto,
@@ -19,9 +20,8 @@ import type {
   StatementDto,
   StatementRow,
 } from '@recat/shared';
-import { env } from '../env.js';
 import { prisma } from '../lib/prisma.js';
-import { qboFactory } from '../lib/qbo/factory.js';
+import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
 import type { QboStatement, QboStatementRow } from '../lib/qbo/types.js';
 
 const M_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -370,8 +370,8 @@ export async function balanceSheet(
 
 /**
  * The transactions behind one statement row (account) within the statement's
- * period. Real mode asks QBO itself (/reports/TransactionList); demo mode
- * reads the local mirror — POSTED txns whose category (or split-line
+ * period. Real companies ask QBO itself (/reports/TransactionList); demo
+ * companies read the local mirror — POSTED txns whose category (or split-line
  * category) posts to that account. Demo P&L rows without mirrored txns return
  * [] (expected demo artifact — the synthetic series has no per-txn backing).
  */
@@ -384,7 +384,10 @@ export async function statementDrilldown(
   });
   const accountName = account?.name ?? '';
 
-  if (!env.QBO_MOCK) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const isDemoCompany = company !== null && isMockRealmId(company.realmId);
+
+  if (!isDemoCompany) {
     const client = await qboFactory.forCompany(companyId);
     const txns = await client.getAccountTransactions({
       accountQboId: args.accountQboId,

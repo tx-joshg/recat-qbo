@@ -1,8 +1,9 @@
 // The QuickBooks Online client interface. Two implementations:
 //  - RealQboClient (lib/qbo/real.ts): Intuit REST API with OAuth2
-//  - MockQboClient (lib/qbo/mock.ts): in-memory demo realm (QBO_MOCK=true)
-// All server code depends only on this interface so demo mode exercises
-// the exact same sync/write-back paths as production.
+//  - MockQboClient (lib/qbo/mock.ts): in-memory demo realms (demo companies)
+// All server code depends only on this interface so demo companies exercise
+// the exact same sync/write-back paths as production. Which implementation a
+// company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
 export interface QboTokenSet {
   accessToken: string;
@@ -174,13 +175,18 @@ export interface QboClient {
   }): Promise<{ qboId: string }>;
 }
 
+/** How a connection is made: real Intuit OAuth, or the built-in demo. */
+export type QboConnectMode = 'real' | 'demo';
+
 export interface QboClientFactory {
-  /** Build the Intuit consent URL for the OAuth flow (state = CSRF token). */
-  authorizeUrl(state: string): string;
-  /** Exchange an auth code for tokens. */
-  exchangeCode(code: string, realmId: string): Promise<QboTokenSet>;
-  /** Client for a connected company; persist rotated tokens via the callback. */
+  /** Consent URL for the connect flow (state = CSRF token). mode 'demo' →
+   * the built-in fake consent page; 'real' → the Intuit authorize URL. */
+  authorizeUrl(state: string, mode: QboConnectMode): string;
+  /** Exchange an auth code for tokens (mode must match authorizeUrl's). */
+  exchangeCode(code: string, realmId: string, mode: QboConnectMode): Promise<QboTokenSet>;
+  /** Client for a connected company; dispatches mock vs real on the
+   * company's realmId. Persists rotated tokens via the callback. */
   forCompany(companyId: string): Promise<QboClient>;
-  /** Revoke tokens on disconnect (best effort). */
+  /** Revoke tokens on disconnect (best effort; no-op for demo companies). */
   revoke(companyId: string): Promise<void>;
 }

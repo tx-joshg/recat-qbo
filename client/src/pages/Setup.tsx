@@ -1,13 +1,19 @@
-// First-run setup wizard — 6 steps (Admin → Credentials → Email → Connect →
-// Accounts → Sync) plus the first-sync spinner. All styles are ported verbatim
-// from design_handoff_recat/Recat.dc.html lines 68–177; step/nav/env/connect
-// logic mirrors the prototype's renderVals() wizard section (lines 1374–1408).
+// First-run setup wizard. The FIRST step is the demo-vs-real choice; the rail
+// then reflects the chosen path:
+//   demo: Start → Admin → Email → Connect → Accounts → Sync
+//   real: Start → Admin → Credentials → Email → Connect → Accounts → Sync
+// All styles are ported verbatim from design_handoff_recat/Recat.dc.html
+// lines 68–177; nav/env/connect logic mirrors the prototype's renderVals()
+// wizard section (lines 1374–1408).
 //
 // Flow notes:
-//  - Progress persists in sessionStorage so the wizard survives the two
-//    full-page departures (magic-link sign-in, Intuit OAuth consent).
+//  - Progress (including the chosen mode) persists in sessionStorage so the
+//    wizard survives the two full-page departures (magic-link sign-in, the
+//    Intuit/demo consent screen).
 //  - GET /auth/qbo/callback returns to /setup?connected=<companyId>.
-//  - /connect (connect another company) re-enters at step 4 via /setup?step=4.
+//  - /connect (connect another company) re-enters at the Connect step via
+//    /setup?step=connect — REAL mode when the instance has Intuit credentials,
+//    demo otherwise.
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
@@ -26,14 +32,34 @@ import type { SetupStatus } from '../lib/api';
 import { useApp } from '../state/AppContext';
 import { Spinner } from '../components/ui';
 
-const STEP_NAMES = ['Admin', 'Credentials', 'Email', 'Connect', 'Accounts', 'Sync'] as const;
-// v2: the Email step shifted Connect/Accounts/Sync from 3/4/5 to 4/5/6 — the
-// key bump keeps stale v1 step numbers from resuming on the wrong step.
-const PROGRESS_KEY = 'recat.setupWizard.v2';
+type StepId = 'start' | 'admin' | 'credentials' | 'email' | 'connect' | 'accounts' | 'sync';
+type StartMode = 'demo' | 'real' | null;
+
+const STEP_LABELS: Record<StepId, string> = {
+  start: 'Start',
+  admin: 'Admin',
+  credentials: 'Credentials',
+  email: 'Email',
+  connect: 'Connect',
+  accounts: 'Accounts',
+  sync: 'Sync',
+};
+
+const REAL_STEPS: StepId[] = ['start', 'admin', 'credentials', 'email', 'connect', 'accounts', 'sync'];
+const DEMO_STEPS: StepId[] = ['start', 'admin', 'email', 'connect', 'accounts', 'sync'];
+
+/** The rail (and flow) for the chosen path. Before a choice is made the
+ * full/real rail shows as the superset — it shrinks the moment demo is picked. */
+function stepsFor(mode: StartMode): StepId[] {
+  return mode === 'demo' ? DEMO_STEPS : REAL_STEPS;
+}
+
+// v3: the Start (demo vs real) step landed and steps became ids — the key
+// bump keeps stale numeric step progress from resuming on the wrong step.
+const PROGRESS_KEY = 'recat.setupWizard.v3';
 
 // ---------------------------------------------------------------------------
-// Server shapes not yet pinned down in lib/api.ts (typed locally; see the
-// TODO(server) notes in lib/api.ts — routes are being built to match).
+// Server shapes not pinned down in lib/api.ts (typed locally).
 // ---------------------------------------------------------------------------
 
 /** POST /api/setup/admin — mirrors /auth/magic-link's dev-mode devLink. */
@@ -42,14 +68,6 @@ interface AdminResponse {
   /** false when this instance has no SMTP configured — no email was sent. */
   delivered?: boolean;
   devLink?: string;
-}
-
-/** GET /api/setup/status with the optional fields the wizard can use. */
-interface SetupStatusX extends SetupStatus {
-  /** true when the server runs against the in-memory mock QuickBooks (QBO_MOCK). */
-  mock?: boolean;
-  /** `${APP_URL}/auth/qbo/callback` — falls back to window.location.origin. */
-  redirectUri?: string;
 }
 
 /** GET /api/companies/:id/holding-account-options — accounts + txn counts. */
@@ -61,7 +79,8 @@ interface HoldingAccountOption {
 }
 
 interface WizardProgress {
-  step: number;
+  stepId: StepId;
+  mode: StartMode;
   env: QboEnv;
   syncMode: SyncMode;
   adminEmail: string;
@@ -70,7 +89,8 @@ interface WizardProgress {
 }
 
 const DEFAULT_PROGRESS: WizardProgress = {
-  step: 1,
+  stepId: 'start',
+  mode: null,
   env: 'sandbox',
   syncMode: 'polling',
   adminEmail: '',
@@ -83,8 +103,14 @@ function readSavedProgress(): WizardProgress | null {
     const raw = sessionStorage.getItem(PROGRESS_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<WizardProgress>;
+    const mode: StartMode = p.mode === 'demo' || p.mode === 'real' ? p.mode : null;
+    const stepId: StepId =
+      typeof p.stepId === 'string' && (stepsFor(mode) as string[]).includes(p.stepId)
+        ? (p.stepId as StepId)
+        : 'start';
     return {
-      step: typeof p.step === 'number' && p.step >= 1 && p.step <= 6 ? p.step : 1,
+      stepId,
+      mode,
       env: p.env === 'production' ? 'production' : 'sandbox',
       syncMode: p.syncMode === 'webhook' ? 'webhook' : 'polling',
       adminEmail: typeof p.adminEmail === 'string' ? p.adminEmail : '',
@@ -96,18 +122,18 @@ function readSavedProgress(): WizardProgress | null {
   }
 }
 
-/** Saved progress, overridden by ?connected=<companyId> / ?error / ?step=<n>. */
+/** Saved progress, overridden by ?connected=<companyId> / ?error / ?step=connect. */
 function initialProgress(): WizardProgress {
   const params = new URLSearchParams(window.location.search);
   const base = readSavedProgress() ?? DEFAULT_PROGRESS;
   const connected = params.get('connected');
-  if (connected) return { ...base, step: 4, companyId: connected, adminSent: false };
+  if (connected) return { ...base, stepId: 'connect', companyId: connected, adminSent: false };
   // OAuth callback failure — stay on the Connect step so the user can retry.
-  if (params.get('error') === 'connect_failed') return { ...base, step: 4, adminSent: false };
-  const stepParam = Number(params.get('step'));
-  if (Number.isInteger(stepParam) && stepParam >= 1 && stepParam <= 6) {
-    // Explicit step re-entry (e.g. /connect → step 4) starts a fresh connection.
-    return { ...base, step: stepParam, adminSent: false, companyId: stepParam <= 4 ? null : base.companyId };
+  if (params.get('error') === 'connect_failed') return { ...base, stepId: 'connect', adminSent: false };
+  if (params.get('step') === 'connect') {
+    // /connect re-entry — fresh connection; the mode resolves from the setup
+    // status once loaded (real when Intuit credentials exist, demo otherwise).
+    return { ...base, stepId: 'connect', mode: null, adminSent: false, companyId: null };
   }
   return base;
 }
@@ -170,14 +196,19 @@ export default function Setup() {
   const [connectFailed, setConnectFailed] = useState(
     () => new URLSearchParams(window.location.search).get('error') === 'connect_failed',
   );
-  const [step, setStep] = useState(initial.step);
+  // /connect entry — pick real/demo automatically from the setup status.
+  const [autoMode] = useState(
+    () => new URLSearchParams(window.location.search).get('step') === 'connect',
+  );
+  const [stepId, setStepId] = useState<StepId>(initial.stepId);
+  const [mode, setMode] = useState<StartMode>(initial.mode);
   const [env, setEnv] = useState<QboEnv>(initial.env);
   const [syncMode, setSyncMode] = useState<SyncMode>(initial.syncMode);
   const [adminEmail, setAdminEmail] = useState(initial.adminEmail);
   const [adminSent, setAdminSent] = useState(initial.adminSent);
   const [companyId, setCompanyId] = useState<string | null>(initial.companyId);
 
-  const [status, setStatus] = useState<SetupStatusX | null>(null);
+  const [status, setStatus] = useState<SetupStatus | null>(null);
   const [devLink, setDevLink] = useState<string | null>(null);
   const [linkDelivered, setLinkDelivered] = useState(true);
   const [clientId, setClientId] = useState('');
@@ -199,6 +230,12 @@ export default function Setup() {
 
   const connectedCompany = companyId ? companies.find((c) => c.id === companyId) ?? null : null;
 
+  // The rail/flow for the chosen path (real is the superset before a choice).
+  const steps = stepsFor(mode);
+  const stepIdx = Math.max(0, steps.indexOf(stepId));
+  const goNext = () => setStepId(steps[Math.min(stepIdx + 1, steps.length - 1)] ?? 'sync');
+  const goBack = () => setStepId(steps[Math.max(stepIdx - 1, 0)] ?? 'start');
+
   // Consume the query string once (its values are already in initial state).
   useEffect(() => {
     if (window.location.search) navigate('/setup', { replace: true });
@@ -213,15 +250,15 @@ export default function Setup() {
 
   // Persist progress so magic-link / OAuth departures resume where they left off.
   useEffect(() => {
-    const p: WizardProgress = { step, env, syncMode, adminEmail, adminSent, companyId };
+    const p: WizardProgress = { stepId, mode, env, syncMode, adminEmail, adminSent, companyId };
     sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
-  }, [step, env, syncMode, adminEmail, adminSent, companyId]);
+  }, [stepId, mode, env, syncMode, adminEmail, adminSent, companyId]);
 
-  // Setup status (needsSetup / credentialsSet / mock / redirectUri).
+  // Setup status (needsSetup / credentialsSet / redirectUri).
   useEffect(() => {
     let cancelled = false;
     api
-      .get<SetupStatusX>('/api/setup/status')
+      .get<SetupStatus>('/api/setup/status')
       .then((s) => {
         if (!cancelled) setStatus(s);
       })
@@ -233,11 +270,19 @@ export default function Setup() {
     };
   }, []);
 
-  // Step 1 is done already when a session exists and setup isn't needed.
+  // /connect entry: resolve the connection mode from the instance state —
+  // real when Intuit credentials exist, demo otherwise.
   useEffect(() => {
-    if (step !== 1 || adminSent || sessionLoading) return;
-    if (session && status && !status.needsSetup) setStep(2);
-  }, [step, adminSent, session, sessionLoading, status]);
+    if (!autoMode || mode !== null || !status) return;
+    setMode(status.credentialsSet ? 'real' : 'demo');
+  }, [autoMode, mode, status]);
+
+  // The Admin step is done already when a session exists and setup isn't needed.
+  useEffect(() => {
+    if (stepId !== 'admin' || adminSent || sessionLoading) return;
+    if (session && status && !status.needsSetup) goNext();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stepId, adminSent, session, sessionLoading, status]);
 
   // Returning from OAuth: make sure the connected company is in the list.
   useEffect(() => {
@@ -248,11 +293,11 @@ export default function Setup() {
     });
   }, [companyId, session, companies, refreshCompanies]);
 
-  // Step 3 (Email): load current SMTP settings once — prefills the fields and
+  // Email step: load current SMTP settings once — prefills the fields and
   // tells us whether the server environment already manages email.
   const [smtpLoaded, setSmtpLoaded] = useState(false);
   useEffect(() => {
-    if (step !== 3 || !session || smtpLoaded) return;
+    if (stepId !== 'email' || !session || smtpLoaded) return;
     let cancelled = false;
     instanceSettings
       .get()
@@ -272,11 +317,11 @@ export default function Setup() {
     return () => {
       cancelled = true;
     };
-  }, [step, session, smtpLoaded]);
+  }, [stepId, session, smtpLoaded]);
 
-  // Step 5: load holding-account options (once per connected company).
+  // Accounts step: load holding-account options (once per connected company).
   useEffect(() => {
-    if (step !== 5 || !companyId || optionsFor === companyId) return;
+    if (stepId !== 'accounts' || !companyId || optionsFor === companyId) return;
     let cancelled = false;
     fetchHoldingOptions(companyId)
       .then((opts) => {
@@ -299,10 +344,9 @@ export default function Setup() {
     return () => {
       cancelled = true;
     };
-  }, [step, companyId, optionsFor, companies, toast]);
+  }, [stepId, companyId, optionsFor, companies, toast]);
 
   const redirectUri = status?.redirectUri ?? `${window.location.origin}/auth/qbo/callback`;
-  const isMock = status?.mock === true;
   const selectedIds = options?.filter((o) => selected[o.id]).map((o) => o.id) ?? [];
 
   // ---- step actions --------------------------------------------------------
@@ -326,8 +370,14 @@ export default function Setup() {
     }
   };
 
+  // The step right after Admin on the current path (Credentials or Email).
+  const afterAdmin = (): StepId => {
+    const flow = stepsFor(mode);
+    return flow[flow.indexOf('admin') + 1] ?? 'email';
+  };
+
   // Dev shortcut: consume the magic link in place (the callback sets the
-  // session cookie), then resume at step 2 without leaving /setup.
+  // session cookie), then resume at the next step without leaving /setup.
   const openSignInLink = async () => {
     if (!devLink || busy) return;
     setBusy(true);
@@ -338,15 +388,23 @@ export default function Setup() {
       const s = await auth.session();
       setSession(s.user);
       setAdminSent(false);
-      setStep(2);
+      setStepId(afterAdmin());
     } catch {
       if (fetched) {
         toast('Sign-in failed — request a new link');
         setAdminSent(false);
       } else {
         // Network hiccup on the in-place fetch — fall back to a full
-        // navigation; persist step 2 so a later /setup visit resumes there.
-        const p: WizardProgress = { step: 2, env, syncMode, adminEmail, adminSent: false, companyId };
+        // navigation; persist the next step so a later /setup visit resumes there.
+        const p: WizardProgress = {
+          stepId: afterAdmin(),
+          mode,
+          env,
+          syncMode,
+          adminEmail,
+          adminSent: false,
+          companyId,
+        };
         sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
         window.location.href = devLink;
         return;
@@ -360,8 +418,8 @@ export default function Setup() {
     const id = clientId.trim();
     const secret = clientSecret.trim();
     if (!id || !secret) {
-      if (isMock || status?.credentialsSet) {
-        setStep(3);
+      if (status?.credentialsSet) {
+        goNext();
         return;
       }
       toast('Enter your Intuit app client ID and secret');
@@ -371,7 +429,7 @@ export default function Setup() {
     try {
       await setup.credentials({ clientId: id, clientSecret: secret, env });
       setStatus((s) => (s ? { ...s, credentialsSet: true } : s));
-      setStep(3);
+      goNext();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save the credentials');
     } finally {
@@ -425,7 +483,7 @@ export default function Setup() {
     const allBlank =
       smtpHost.trim() === '' && smtpUser.trim() === '' && smtpPass === '' && smtpFrom.trim() === '';
     if (smtpEnvManaged || allBlank) {
-      setStep(4);
+      goNext();
       return;
     }
     if (smtpHost.trim() === '') {
@@ -436,7 +494,7 @@ export default function Setup() {
     try {
       await saveEmail();
       setStatus((s) => (s ? { ...s, smtpConfigured: true } : s));
-      setStep(4);
+      goNext();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save the email settings');
     } finally {
@@ -444,19 +502,30 @@ export default function Setup() {
     }
   };
 
+  // Server said the real flow lacks credentials — surfaced on the Connect
+  // step with a Back-to-Credentials affordance.
+  const [missingCreds, setMissingCreds] = useState<string | null>(null);
+
   const connectQbo = async () => {
-    if (connecting) return;
+    if (connecting || mode === null) return;
     setConnectFailed(false);
+    setMissingCreds(null);
     setConnecting(true);
     try {
-      // Flush progress before leaving for the Intuit consent screen.
-      const p: WizardProgress = { step, env, syncMode, adminEmail, adminSent: false, companyId };
+      // Flush progress before leaving for the consent screen (Intuit or demo).
+      const p: WizardProgress = { stepId, mode, env, syncMode, adminEmail, adminSent: false, companyId };
       sessionStorage.setItem(PROGRESS_KEY, JSON.stringify(p));
-      const { url } = await companiesApi.connectUrl();
+      const { url } = await companiesApi.connectUrl(
+        mode === 'demo' ? { mode: 'demo' } : { mode: 'real', env },
+      );
       window.location.href = url;
     } catch (err) {
       setConnecting(false);
-      toast(err instanceof Error ? err.message : 'Could not start the Intuit connection');
+      if (err instanceof ApiError && err.code === 'MISSING_CREDENTIALS') {
+        setMissingCreds(err.message);
+        return;
+      }
+      toast(err instanceof Error ? err.message : 'Could not start the connection');
     }
   };
 
@@ -515,13 +584,21 @@ export default function Setup() {
     }
   };
 
-  const wBack = () => setStep((s) => Math.max(1, s - 1));
+  const wBack = goBack;
 
   const wNext = () => {
     if (busy || syncing) return;
-    if (step === 1) {
+    if (stepId === 'start') {
+      if (mode === null) {
+        toast('Pick how you want to start');
+        return;
+      }
+      goNext();
+      return;
+    }
+    if (stepId === 'admin') {
       if (session && status && !status.needsSetup) {
-        setStep(2);
+        goNext();
         return;
       }
       if (adminSent) {
@@ -531,34 +608,34 @@ export default function Setup() {
       void submitAdmin();
       return;
     }
-    if (step === 2) {
+    if (stepId === 'credentials') {
       void submitCredentials();
       return;
     }
-    if (step === 3) {
+    if (stepId === 'email') {
       void submitEmail();
       return;
     }
-    if (step === 4) {
+    if (stepId === 'connect') {
       if (!companyId) {
         toast('Connect QuickBooks first');
         return;
       }
-      setStep(5);
+      goNext();
       return;
     }
-    if (step === 5) {
+    if (stepId === 'accounts') {
       if (selectedIds.length === 0) {
         toast('Pick at least one account to watch');
         return;
       }
-      setStep(6);
+      goNext();
       return;
     }
     void finish();
   };
 
-  const showSkip = companies.length > 0 || isMock;
+  const showSkip = companies.length > 0;
   const companyName = connectedCompany?.legalName ?? 'QuickBooks company';
   const companyInitial = (companyName.trim().charAt(0) || 'Q').toUpperCase();
 
@@ -598,22 +675,22 @@ export default function Setup() {
           </span>
         </div>
 
-        {/* step rail */}
+        {/* step rail — reflects the chosen path (no Credentials step on the demo path) */}
         <div style={{ display: 'flex', gap: 8 }}>
-          {STEP_NAMES.map((label, i) => (
-            <div key={label} style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {steps.map((id, i) => (
+            <div key={id} style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
               <div
                 style={{
                   height: 4,
                   borderRadius: 2,
-                  background: i < step ? 'var(--acc)' : 'var(--bd)',
+                  background: i <= stepIdx ? 'var(--acc)' : 'var(--bd)',
                 }}
               />
               <div
                 className="sw-step-label"
-                style={{ fontSize: 12, fontWeight: 600, color: i < step ? 'var(--ink)' : 'var(--fnt)' }}
+                style={{ fontSize: 12, fontWeight: 600, color: i <= stepIdx ? 'var(--ink)' : 'var(--fnt)' }}
               >
-                {label}
+                {STEP_LABELS[id]}
               </div>
             </div>
           ))}
@@ -628,8 +705,55 @@ export default function Setup() {
             boxShadow: '0 2px 12px rgba(60,55,45,.06)',
           }}
         >
-          {/* ---- step 1 · Admin ---- */}
-          {step === 1 && !syncing && (
+          {/* ---- step · Start (demo vs real — the choice that drives the flow) ---- */}
+          {stepId === 'start' && !syncing && (
+            <div>
+              <div style={stepTitle}>How do you want to start?</div>
+              <div style={stepCopy}>
+                Your choice here is honored end to end — the demo never touches Intuit, and the
+                real flow never routes you to fake data. You can add the other kind of connection
+                later in Settings.
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <label
+                  onClick={() => setMode('demo')}
+                  style={{
+                    flex: 1,
+                    border: `1.5px solid ${mode === 'demo' ? 'var(--acc)' : 'var(--bd2)'}`,
+                    background: 'var(--card)',
+                    borderRadius: 10,
+                    padding: '14px 16px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Try the demo</div>
+                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
+                    A built-in fake QuickBooks with sample companies. No Intuit account, nothing to
+                    configure — explore every feature safely.
+                  </div>
+                </label>
+                <label
+                  onClick={() => setMode('real')}
+                  style={{
+                    flex: 1,
+                    border: `1.5px solid ${mode === 'real' ? 'var(--acc)' : 'var(--bd2)'}`,
+                    background: 'var(--card)',
+                    borderRadius: 10,
+                    padding: '14px 16px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Connect my real QuickBooks</div>
+                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
+                    Bring your own free Intuit API keys. Demo data stays available on the side.
+                  </div>
+                </label>
+              </div>
+            </div>
+          )}
+
+          {/* ---- step · Admin ---- */}
+          {stepId === 'admin' && !syncing && (
             !adminSent ? (
               <div>
                 <div style={stepTitle}>Create the admin account</div>
@@ -734,8 +858,8 @@ export default function Setup() {
             )
           )}
 
-          {/* ---- step 2 · Credentials ---- */}
-          {step === 2 && !syncing && (
+          {/* ---- step · Credentials (real path only) ---- */}
+          {stepId === 'credentials' && !syncing && (
             <div>
               <div style={stepTitle}>Intuit app credentials</div>
               <div style={stepCopy}>
@@ -753,11 +877,6 @@ export default function Setup() {
                 </a>{' '}
                 walks you through it in ~10 minutes.
               </div>
-              {isMock && (
-                <div style={{ fontSize: 13, color: 'var(--fnt)', margin: '-12px 0 18px' }}>
-                  Demo mode — mock QuickBooks, keys optional.
-                </div>
-              )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                 <div>
                   <label style={fieldLabel}>Client ID</label>
@@ -879,17 +998,18 @@ export default function Setup() {
             </div>
           )}
 
-          {/* ---- step 3 · Email ---- */}
-          {step === 3 && !syncing && (
+          {/* ---- step · Email ---- */}
+          {stepId === 'email' && !syncing && (
             <div>
               <div style={stepTitle}>Email for sign-in links</div>
               <div style={stepCopy}>
                 Recat signs everyone in with magic links, so it needs a way to send email. Any SMTP
                 provider works — Resend, Postmark, SES, or your own.
               </div>
-              {isMock && (
+              {mode === 'demo' && (
                 <div style={{ fontSize: 13, color: 'var(--fnt)', margin: '-12px 0 18px' }}>
-                  Demo mode — sign-in links print to the server log, SMTP optional.
+                  Demo path — while only demo companies are connected, sign-in links appear as a
+                  one-click button, so SMTP is optional.
                 </div>
               )}
               {smtpEnvManaged ? (
@@ -983,7 +1103,7 @@ export default function Setup() {
                       Send test email
                     </button>
                     <button
-                      onClick={() => setStep(4)}
+                      onClick={goNext}
                       className="sw-dashed"
                       style={{
                         flex: 1,
@@ -1005,15 +1125,74 @@ export default function Setup() {
             </div>
           )}
 
-          {/* ---- step 4 · Connect ---- */}
-          {step === 4 && !syncing && (
+          {/* ---- step · Connect (real: env cards + Intuit; demo: one-click fake consent) ---- */}
+          {stepId === 'connect' && !syncing && (
             <div>
-              <div style={stepTitle}>Connect QuickBooks</div>
-              <div style={stepCopy}>
-                Choose the environment, then authorize Recat with Intuit. You can connect more
-                companies later in Settings.
-              </div>
-              {isMock && (
+              {mode === 'demo' ? (
+                <>
+                  <div style={stepTitle}>Connect a demo company</div>
+                  <div style={stepCopy}>
+                    You'll pick one of two built-in sample companies on a clearly-labelled fake
+                    consent screen — no Intuit account involved. You can connect more companies
+                    (demo or real) later in Settings.
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={stepTitle}>Connect QuickBooks</div>
+                  <div style={stepCopy}>
+                    Choose the environment, then authorize Recat with Intuit. You can connect more
+                    companies later in Settings.
+                  </div>
+                </>
+              )}
+              {mode === null && (
+                <div style={{ fontSize: 13, color: 'var(--fnt)', marginBottom: 14 }}>
+                  Checking this instance's QuickBooks configuration…
+                </div>
+              )}
+              {mode === 'real' && (
+                <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
+                  <label
+                    onClick={() => setEnv('sandbox')}
+                    style={{
+                      flex: 1,
+                      border: `1.5px solid ${env === 'sandbox' ? 'var(--acc)' : 'var(--bd2)'}`,
+                      background: 'var(--card)',
+                      borderRadius: 10,
+                      padding: '14px 16px',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontSize: 14.5, fontWeight: 600 }}>Sandbox</div>
+                    <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2 }}>
+                      Test company, instant keys
+                    </div>
+                  </label>
+                  <label
+                    onClick={() => setEnv('production')}
+                    style={{
+                      flex: 1,
+                      border: `1.5px solid ${env === 'production' ? 'var(--acc)' : 'var(--bd2)'}`,
+                      background: 'var(--card)',
+                      borderRadius: 10,
+                      padding: '14px 16px',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontSize: 14.5, fontWeight: 600 }}>Production</div>
+                    <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2 }}>
+                      Real books — needs Intuit approval
+                    </div>
+                  </label>
+                </div>
+              )}
+              {connectFailed && !companyId && (
+                <div style={{ fontSize: 13.5, color: 'var(--erT)', margin: '-10px 0 14px' }}>
+                  QuickBooks connection failed — try again.
+                </div>
+              )}
+              {missingCreds !== null && (
                 <div
                   style={{
                     border: '1px solid var(--amD)',
@@ -1023,56 +1202,37 @@ export default function Setup() {
                     padding: '12px 16px',
                     fontSize: 13.5,
                     lineHeight: 1.5,
-                    margin: '-6px 0 18px',
+                    margin: '-6px 0 14px',
                   }}
                 >
-                  <b>Demo mode is on</b> — connections here use the built-in fake QuickBooks,
-                  not Intuit. To connect real books, set the <code>QBO_MOCK</code> environment
-                  variable to <code>false</code> on your server and restart.
-                </div>
-              )}
-              <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
-                <label
-                  onClick={() => setEnv('sandbox')}
-                  style={{
-                    flex: 1,
-                    border: `1.5px solid ${env === 'sandbox' ? 'var(--acc)' : 'var(--bd2)'}`,
-                    background: 'var(--card)',
-                    borderRadius: 10,
-                    padding: '14px 16px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Sandbox</div>
-                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2 }}>
-                    Test company, instant keys
-                  </div>
-                </label>
-                <label
-                  onClick={() => setEnv('production')}
-                  style={{
-                    flex: 1,
-                    border: `1.5px solid ${env === 'production' ? 'var(--acc)' : 'var(--bd2)'}`,
-                    background: 'var(--card)',
-                    borderRadius: 10,
-                    padding: '14px 16px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>Production</div>
-                  <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2 }}>
-                    Real books — needs Intuit approval
-                  </div>
-                </label>
-              </div>
-              {connectFailed && !companyId && (
-                <div style={{ fontSize: 13.5, color: 'var(--erT)', margin: '-10px 0 14px' }}>
-                  QuickBooks connection failed — try again.
+                  {missingCreds}
+                  <button
+                    onClick={() => {
+                      setMissingCreds(null);
+                      setStepId('credentials');
+                    }}
+                    style={{
+                      display: 'block',
+                      marginTop: 8,
+                      border: '1px solid var(--amD)',
+                      background: 'transparent',
+                      color: 'var(--amT)',
+                      borderRadius: 6,
+                      padding: '6px 12px',
+                      fontSize: 13,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    ← Back to credentials
+                  </button>
                 </div>
               )}
               {!companyId ? (
                 <button
                   onClick={() => void connectQbo()}
+                  disabled={mode === null}
                   className="sw-primary"
                   style={{
                     width: '100%',
@@ -1083,11 +1243,18 @@ export default function Setup() {
                     padding: 13,
                     fontSize: 15,
                     fontWeight: 600,
-                    cursor: 'pointer',
+                    cursor: mode === null ? 'default' : 'pointer',
+                    opacity: mode === null ? 0.6 : 1,
                     fontFamily: 'inherit',
                   }}
                 >
-                  {connecting ? 'Redirecting to Intuit…' : 'Connect QuickBooks →'}
+                  {connecting
+                    ? mode === 'demo'
+                      ? 'Opening the demo consent…'
+                      : 'Redirecting to Intuit…'
+                    : mode === 'demo'
+                      ? 'Connect a demo company →'
+                      : 'Connect QuickBooks →'}
                 </button>
               ) : (
                 <div
@@ -1130,8 +1297,8 @@ export default function Setup() {
             </div>
           )}
 
-          {/* ---- step 5 · Accounts ---- */}
-          {step === 5 && !syncing && (
+          {/* ---- step · Accounts ---- */}
+          {stepId === 'accounts' && !syncing && (
             <div>
               <div style={stepTitle}>Which accounts should Recat watch?</div>
               <div style={stepCopy}>
@@ -1177,8 +1344,8 @@ export default function Setup() {
             </div>
           )}
 
-          {/* ---- step 6 · Sync mode ---- */}
-          {step === 6 && !syncing && (
+          {/* ---- step · Sync mode ---- */}
+          {stepId === 'sync' && !syncing && (
             <div>
               <div style={stepTitle}>How should Recat stay in sync?</div>
               <div style={stepCopy}>
@@ -1271,7 +1438,7 @@ export default function Setup() {
                   fontWeight: 600,
                   cursor: 'pointer',
                   fontFamily: 'inherit',
-                  visibility: step > 1 ? 'visible' : 'hidden',
+                  visibility: stepIdx > 0 ? 'visible' : 'hidden',
                 }}
               >
                 ← Back
@@ -1291,7 +1458,7 @@ export default function Setup() {
                   fontFamily: 'inherit',
                 }}
               >
-                {step === 6 ? 'Finish — run first sync' : 'Continue →'}
+                {stepId === 'sync' ? 'Finish — run first sync' : 'Continue →'}
               </button>
             </div>
           )}
@@ -1299,7 +1466,7 @@ export default function Setup() {
 
         {showSkip && (
           <div style={{ textAlign: 'center', fontSize: 13, color: 'var(--fnt)' }}>
-            <Link to="/">{isMock ? 'Skip setup — jump to the demo queue →' : 'Skip setup →'}</Link>
+            <Link to="/">Skip setup →</Link>
           </div>
         )}
       </div>

@@ -42,6 +42,11 @@ Owned by Joshua Goble's Railway workspace. The app service deploys
 `ghcr.io/tx-joshg/recat-qbo:latest` — pushed automatically by
 `.github/workflows/docker.yml` on every push to main, so template deploys always
 get the latest release without republishing.
+The template no longer needs to set `QBO_MOCK`: the demo is a per-connection
+choice on the setup wizard's first step (any deployment can add demo
+companies), and `QBO_MOCK` only gates the local-dev seed. Real secrets
+(SESSION_SECRET / ENCRYPTION_KEY) are always required in production —
+the template already generates them.
 To CHANGE the template config: build a scratch Railway project mirroring the
 desired services, then `railway templates create` + `railway templates publish`.
 Gotchas learned the hard way: literal variable values are stripped on generate —

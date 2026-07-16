@@ -4,11 +4,12 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { devLoginAllowed, env } from '../env.js';
+import { redirectUri } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
+import { devLoginAllowed } from '../services/devLogin.js';
 import {
   getInstanceSettings,
   getInstanceSettingsDto,
@@ -118,9 +119,11 @@ setupRouter.get(
     const settings = await getInstanceSettings();
     res.json({
       needsSetup: adminCount === 0,
-      credentialsSet: env.QBO_MOCK || settings.intuitClientId !== '',
+      // Real Intuit credentials only — the demo needs none and is always
+      // available (it's a per-connection choice in the wizard, not a mode).
+      credentialsSet: settings.intuitClientId !== '',
       smtpConfigured: settings.smtpHost !== '',
-      mock: env.QBO_MOCK,
+      redirectUri,
     });
   }),
 );
@@ -142,7 +145,7 @@ setupRouter.post(
     });
     const { link } = await issueMagicLink(user);
     const smtp = await isSmtpConfigured();
-    const devLink = devLoginAllowed && !smtp ? link : undefined;
+    const devLink = !smtp && (await devLoginAllowed()) ? link : undefined;
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
   }),
 );

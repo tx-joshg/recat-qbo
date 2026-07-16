@@ -6,10 +6,11 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { Membership, User } from '@prisma/client';
 import type { SessionDto, UserDto } from '@recat/shared';
-import { devLoginAllowed, env } from '../env.js';
+import { env } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import { devLoginAllowed } from '../services/devLogin.js';
 import {
   clearCookieOptions,
   createSession,
@@ -61,9 +62,9 @@ authRouter.post(
     if (user) {
       const { link } = await issueMagicLink(user);
       // Dev convenience: no SMTP configured → let the UI offer "open the
-      // magic link →" directly. Only in mock mode or with an explicit
-      // ALLOW_DEV_LOGIN=true — never inferred from NODE_ENV.
-      if (devLoginAllowed && !smtp) devLink = link;
+      // magic link →" directly. Auto-locked the moment a real (non-demo)
+      // company is connected, unless ALLOW_DEV_LOGIN=true forces it.
+      if (!smtp && (await devLoginAllowed())) devLink = link;
     }
 
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });

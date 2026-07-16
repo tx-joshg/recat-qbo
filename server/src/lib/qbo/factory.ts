@@ -1,10 +1,13 @@
-// qboFactory — picks the real Intuit client or the in-memory mock based on
-// env.QBO_MOCK, and owns token persistence for connected companies.
+// qboFactory — one factory that dispatches per company: MockQboClient when the
+// company's realmId is one of the two built-in demo realms, RealQboClient
+// otherwise. Demo vs real is a per-connection user choice (the connect flow's
+// `mode`), never a boot-time env var. The factory also owns token persistence
+// for connected companies.
 //
 // Cross-agent modules (lib/crypto, services/instanceSettings) are imported
-// lazily so mock mode (and the demo seed) can run before they exist.
+// lazily so the demo seed can run before they exist.
 
-import type { QboClient, QboClientFactory, QboTokenSet } from './types.js';
+import type { QboClient, QboClientFactory, QboConnectMode, QboTokenSet } from './types.js';
 import { env, redirectUri } from '../../env.js';
 import { prisma } from '../prisma.js';
 import { QboAuthError } from './types.js';
@@ -15,7 +18,18 @@ import {
   revokeIntuitToken,
   type QboEnvironment,
 } from './real.js';
-import { MockQboClient, mockAuthorizeUrl, mockTokenSet } from './mock.js';
+import {
+  MOCK_REALM_BLUEBIRD,
+  MOCK_REALM_HARBOR,
+  MockQboClient,
+  mockAuthorizeUrl,
+  mockTokenSet,
+} from './mock.js';
+
+/** Is this realm one of the built-in demo companies? */
+export function isMockRealmId(realmId: string): boolean {
+  return realmId === MOCK_REALM_HARBOR || realmId === MOCK_REALM_BLUEBIRD;
+}
 
 interface IntuitCreds {
   clientId: string;
@@ -42,7 +56,14 @@ async function refreshCreds(): Promise<IntuitCreds> {
   return cachedCreds;
 }
 
-if (!env.QBO_MOCK) void refreshCreds();
+void refreshCreds();
+
+/** Are Intuit app credentials configured (env vars or wizard-entered)? The
+ * real connect flow requires them; demo connections never do. */
+export async function hasIntuitCredentials(): Promise<boolean> {
+  const creds = await refreshCreds();
+  return creds.clientId !== '' && creds.clientSecret !== '';
+}
 
 async function loadCompany(companyId: string) {
   const company = await prisma.company.findUnique({ where: { id: companyId } });
@@ -58,21 +79,35 @@ function holdingIdsOf(company: { holdingAccountIds: unknown }): string[] {
 
 // ---------------------------------------------------------------------------
 
-const realFactory: QboClientFactory = {
-  authorizeUrl(state: string): string {
+export const qboFactory: QboClientFactory = {
+  authorizeUrl(state: string, mode: QboConnectMode): string {
+    if (mode === 'demo') return mockAuthorizeUrl(state);
     // Kick a background refresh so the *next* call sees wizard-entered creds;
     // env-configured deployments are always correct on the first call.
     void refreshCreds();
     return intuitAuthorizeUrl({ clientId: cachedCreds.clientId, redirectUri, state });
   },
 
-  async exchangeCode(code: string): Promise<QboTokenSet> {
+  async exchangeCode(code: string, _realmId: string, mode: QboConnectMode): Promise<QboTokenSet> {
+    if (mode === 'demo') {
+      // The mock ignores tokens entirely; the routes layer picks the realm via
+      // resolveMockRealmId() from mock.ts.
+      return mockTokenSet();
+    }
     const creds = await refreshCreds();
     return exchangeAuthCode({ clientId: creds.clientId, clientSecret: creds.clientSecret, redirectUri, code });
   },
 
   async forCompany(companyId: string): Promise<QboClient> {
     const company = await loadCompany(companyId);
+
+    // Per-company dispatch: demo companies (mock realms) get the in-memory
+    // fake QuickBooks; everything else talks to Intuit. Demo and real
+    // companies coexist on the same instance.
+    if (isMockRealmId(company.realmId)) {
+      return new MockQboClient(company.realmId, holdingIdsOf(company));
+    }
+
     if (!company.accessToken || !company.refreshToken) {
       throw new QboAuthError(`Company "${company.nickname}" has no QuickBooks tokens — reconnect required`);
     }
@@ -107,6 +142,7 @@ const realFactory: QboClientFactory = {
   async revoke(companyId: string): Promise<void> {
     const company = await prisma.company.findUnique({ where: { id: companyId } });
     if (!company?.refreshToken) return;
+    if (isMockRealmId(company.realmId)) return; // nothing to revoke for demo companies
     try {
       const creds = await refreshCreds();
       const { decrypt } = await import('../crypto.js');
@@ -120,28 +156,3 @@ const realFactory: QboClientFactory = {
     }
   },
 };
-
-// ---------------------------------------------------------------------------
-
-const mockFactory: QboClientFactory = {
-  authorizeUrl(state: string): string {
-    return mockAuthorizeUrl(state);
-  },
-
-  async exchangeCode(): Promise<QboTokenSet> {
-    // The mock ignores tokens entirely; the routes layer picks the realm via
-    // resolveMockRealmId() from mock.ts.
-    return mockTokenSet();
-  },
-
-  async forCompany(companyId: string): Promise<QboClient> {
-    const company = await loadCompany(companyId);
-    return new MockQboClient(company.realmId, holdingIdsOf(company));
-  },
-
-  async revoke(): Promise<void> {
-    // nothing to revoke in mock mode
-  },
-};
-
-export const qboFactory: QboClientFactory = env.QBO_MOCK ? mockFactory : realFactory;

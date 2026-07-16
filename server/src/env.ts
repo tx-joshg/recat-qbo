@@ -56,9 +56,10 @@ const schema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true' || v === '1'),
-  // DANGER: exposes magic-link URLs in API responses to anyone who can reach
-  // the login form — anyone with the link IS that user. Only ever set this on
-  // a private dev instance; never on a deployment holding real books.
+  // DANGER: forces magic-link URLs into API responses even when real books
+  // are connected — anyone with the link IS that user. Normally unneeded:
+  // devLink is auto-allowed while the instance has no real company connected
+  // and auto-locked the moment one is (services/devLogin.ts).
   ALLOW_DEV_LOGIN: z
     .string()
     .default('false')
@@ -71,11 +72,13 @@ export const env = schema.parse(process.env);
 
 export const isProd = env.NODE_ENV === 'production';
 
-// Refuse to boot a real production deployment on the well-known dev secrets:
+// Refuse to boot a production deployment on the well-known dev secrets:
 // a predictable SESSION_SECRET lets anyone forge sessions, and the all-zero
 // ENCRYPTION_KEY makes the "encrypted" QBO tokens readable by anyone with a
-// DB dump.
-if (isProd && !env.QBO_MOCK) {
+// DB dump. Enforced regardless of QBO_MOCK — any production instance can
+// connect real books at any time (demo is a per-connection choice now), so
+// real secrets are always required.
+if (isProd) {
   if (env.SESSION_SECRET === DEV_SESSION_SECRET) {
     throw new Error(
       'Refusing to start: SESSION_SECRET is the dev default. Set a random 32+ character SESSION_SECRET before running in production.',
@@ -88,12 +91,8 @@ if (isProd && !env.QBO_MOCK) {
   }
 }
 
-/**
- * Whether magic links may be returned in API responses (devLink). Demo/mock
- * mode is safe by construction; otherwise the deployer must opt in explicitly
- * with ALLOW_DEV_LOGIN=true — NODE_ENV alone is not enough of a signal.
- */
-export const devLoginAllowed = env.QBO_MOCK || env.ALLOW_DEV_LOGIN;
+// devLink policy lives in services/devLogin.ts (async — it depends on whether
+// a real company is connected, not on env alone).
 
 /** OAuth callback registered with Intuit — the wizard shows this exact URL. */
 export const redirectUri = `${env.APP_URL}/auth/qbo/callback`;

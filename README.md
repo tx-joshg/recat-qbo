@@ -11,7 +11,7 @@ The self-hosted alternative to per-client SaaS tools like Uncat. Your credential
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/recat-qbo)
 
-One click provisions the app + PostgreSQL with generated secrets, booting into **demo mode** — try the full loop against a built-in fake QuickBooks, then flip `QBO_MOCK` to `false` and connect your real books. Prefer your own server? See [Quick start](#quick-start).
+One click provisions the app + PostgreSQL with generated secrets. The setup wizard then asks how you want to start — **try the demo** (a built-in fake QuickBooks, nothing to configure) or **connect your real QuickBooks** with your own free Intuit keys. Demo and real companies can coexist; switch or add either at any time. Prefer your own server? See [Quick start](#quick-start).
 
 ![The categorization queue](docs/screenshots/queue.png)
 
@@ -104,13 +104,15 @@ docker compose up -d
 open http://localhost:3001  # first-run setup wizard takes it from here
 ```
 
-The wizard walks you through everything: admin account → Intuit keys → email (SMTP, skippable) → connect QuickBooks → pick holding accounts → first sync. You'll need free QuickBooks API credentials from the [Intuit Developer Portal](https://developer.intuit.com) — **[docs/intuit-setup.md](docs/intuit-setup.md) walks you through it step by step**, including the production-access questionnaire.
+The wizard walks you through everything: how you want to start (demo or real) → admin account → Intuit keys (real path only) → email (SMTP, skippable) → connect QuickBooks → pick holding accounts → first sync. For the real path you'll need free QuickBooks API credentials from the [Intuit Developer Portal](https://developer.intuit.com) — **[docs/intuit-setup.md](docs/intuit-setup.md) walks you through it step by step**, including the production-access questionnaire.
 
-### Try it without QuickBooks (demo mode)
+### Try it without QuickBooks (the demo)
 
-Set `QBO_MOCK=true` in `.env` and Recat runs against a built-in fake QuickBooks with two sample companies — the full loop works (sync, categorize, post, undo, splits, transfers, reports) without an Intuit account. Magic links appear as a one-click button when SMTP isn't configured.
+Pick **"Try the demo"** on the setup wizard's first step — on any deployment, no env var required. Recat connects a built-in fake QuickBooks with two sample companies and the full loop works (sync, categorize, post, undo, splits, transfers, reports, dashboard) without an Intuit account. Magic links appear as a one-click button while only demo companies are connected and SMTP isn't configured.
 
-**Switching to the real thing:** set `QBO_MOCK=false`, add your real Intuit credentials (via `.env` or the setup wizard), and restart. The demo companies are automatically disconnected — history preserved. For a completely fresh start, reset the database instead (`npx prisma migrate reset`).
+**Switching to the real thing:** enter your Intuit credentials (Settings → QuickBooks API access, or re-run the wizard's real path) and connect your real books — no restart, no flags. Demo and real companies coexist side by side (demo ones wear a small `demo` badge); disconnect the demo companies from Settings whenever you're done with them. The moment a real company is connected, magic links stop appearing in the UI and go through email (or the server log) only.
+
+`QBO_MOCK=true` remains for local development only — it gates the `npm run seed` demo seed.
 
 ### Local development
 
@@ -136,7 +138,7 @@ Everything can be configured in the UI (setup wizard / Settings). Env vars are o
 | `APP_URL` | Public URL of this deployment (used in links + OAuth redirect) |
 | `QBO_CLIENT_ID` / `QBO_CLIENT_SECRET` | Intuit app keys (or enter in the wizard) |
 | `QBO_ENVIRONMENT` | `sandbox` or `production` |
-| `QBO_MOCK` | `true` = built-in demo QuickBooks, no Intuit account needed |
+| `QBO_MOCK` | Local dev only: enables the demo seed. The wizard offers demo companies on every deployment without it |
 | `SMTP_HOST/PORT/USER/PASS/FROM` | Magic-link + digest email (or configure in the wizard/Settings) |
 | `SLACK_WEBHOOK_URL` | Optional digest notifications to Slack |
 | `DRY_RUN` | `true` = never write to QuickBooks, log payloads instead |
@@ -145,7 +147,7 @@ Full list with comments in [.env.example](.env.example).
 
 ## Architecture
 
-React (Vite) client · Express + TypeScript server · PostgreSQL via Prisma · one Docker image. The server owns all QuickBooks communication (tokens never reach the browser). Both real-QuickBooks and demo modes run the exact same sync/write-back code behind one client interface. Design decisions and their rationale are logged in [docs/decisions.md](docs/decisions.md).
+React (Vite) client · Express + TypeScript server · PostgreSQL via Prisma · one Docker image. The server owns all QuickBooks communication (tokens never reach the browser). Real and demo companies run the exact same sync/write-back code behind one client interface, chosen per company. Design decisions and their rationale are logged in [docs/decisions.md](docs/decisions.md).
 
 ## FAQ
 

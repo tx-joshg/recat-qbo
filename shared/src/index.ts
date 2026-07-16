@@ -3,6 +3,20 @@
 
 export type Role = 'admin' | 'categorizer' | 'viewer';
 
+/** How a QuickBooks connection is made: the real Intuit OAuth flow, or the
+ * built-in demo (mock QuickBooks with sample companies). A user choice made
+ * per connection — never a deployment-wide mode. */
+export type ConnectMode = 'real' | 'demo';
+
+/** Realm ids of the two built-in demo companies (Harbor & Main / Bluebird).
+ * A Company row with one of these realm ids IS a demo company — client and
+ * server both dispatch on this, independent of any env var. */
+export const MOCK_REALM_IDS = ['9341002287640001', '4471889011230002'] as const;
+
+export function isDemoRealmId(realmId: string): boolean {
+  return (MOCK_REALM_IDS as readonly string[]).includes(realmId);
+}
+
 export type TxnStatus =
   | 'PENDING'
   | 'POSTING'

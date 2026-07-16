@@ -7,8 +7,6 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import { env, isProd } from './env.js';
 import { errorMiddleware } from './lib/http.js';
-import { prisma } from './lib/prisma.js';
-import { MOCK_REALM_HARBOR, MOCK_REALM_BLUEBIRD } from './lib/qbo/mock.js';
 import { originCheck } from './middleware/auth.js';
 import { startJobs } from './jobs/scheduler.js';
 import { authRouter } from './routes/auth.js';
@@ -87,34 +85,13 @@ if (isProd) {
 
 app.use(errorMiddleware);
 
-/**
- * When demo mode is turned off, connected companies left over from QBO_MOCK
- * (recognizable by their mock realm ids) can't sync against real QuickBooks.
- * Disconnect them at startup — same semantics as a manual disconnect: syncing
- * stops, local history and the audit log are kept.
- */
-async function disconnectDemoCompanies(): Promise<void> {
-  if (env.QBO_MOCK) return;
-  const { count } = await prisma.company.updateMany({
-    where: {
-      realmId: { in: [MOCK_REALM_HARBOR, MOCK_REALM_BLUEBIRD] },
-      disconnectedAt: null,
-    },
-    data: { disconnectedAt: new Date() },
-  });
-  if (count > 0) {
-    console.log(
-      `[startup] demo mode is off — disconnected ${count} demo company(ies); connect real QuickBooks via Settings.`,
-    );
-  }
-}
+// Demo and real companies coexist: demo vs real is a per-connection choice
+// made in the UI, dispatched per company by realmId (lib/qbo/factory.ts).
+// Users disconnect demo companies from Settings when they're done with them.
 
 app.listen(env.PORT, () => {
-  const qboMode = env.QBO_MOCK ? 'mock QuickBooks (demo data)' : `real QuickBooks (${env.QBO_ENVIRONMENT})`;
   const dryRun = env.DRY_RUN ? ' · DRY RUN (no QBO writes)' : '';
-  console.log(`[recat] listening on http://localhost:${env.PORT} — ${qboMode}${dryRun}`);
+  console.log(`[recat] listening on http://localhost:${env.PORT}${dryRun}`);
   console.log(`[recat] app URL: ${env.APP_URL}`);
-  disconnectDemoCompanies()
-    .catch((err) => console.error('[startup] demo-company disconnect failed:', err))
-    .finally(() => startJobs());
+  startJobs();
 });

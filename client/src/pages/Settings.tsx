@@ -7,6 +7,7 @@ import type { InstanceSettingsDto, SyncLogDto } from '@recat/shared';
 import { api, companies as companiesApi, instanceSettings } from '../lib/api';
 import { ToggleSwitch } from '../components/ui';
 import { useApp } from '../state/AppContext';
+import ConfirmDialog from '../components/ConfirmDialog';
 import ApiAccessCard from './settings/ApiAccessCard';
 import ConnectionCard from './settings/ConnectionCard';
 import type { HoldingAccountOption } from './settings/ConnectionCard';
@@ -94,19 +95,23 @@ export default function Settings() {
       .catch((err) => toast(errMsg(err)));
   };
 
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+
   const disconnect = () => {
-    if (!activeCompany) return;
-    const ok = window.confirm(
-      `Disconnect ${activeCompany.nickname}? Syncing stops and QuickBooks tokens are revoked. Local history and the audit log are kept.`,
-    );
-    if (!ok) return;
+    if (!activeCompany || disconnecting) return;
+    setDisconnecting(true);
     companiesApi
       .disconnect(activeCompany.id)
       .then(async () => {
         await refreshCompanies();
         toast(`Disconnected ${activeCompany.nickname}`);
       })
-      .catch((err) => toast(errMsg(err)));
+      .catch((err) => toast(errMsg(err)))
+      .finally(() => {
+        setDisconnecting(false);
+        setConfirmDisconnect(false);
+      });
   };
 
   const lastWebhookEventAt = syncLog.find((s) => s.kind === 'webhook')?.at ?? null;
@@ -257,7 +262,7 @@ export default function Settings() {
               </div>
             </div>
             <HoverButton
-              onClick={disconnect}
+              onClick={() => setConfirmDisconnect(true)}
               style={{
                 border: '1px solid var(--erD)',
                 background: 'none',
@@ -274,6 +279,19 @@ export default function Settings() {
               Disconnect…
             </HoverButton>
           </div>
+
+          <ConfirmDialog
+            open={confirmDisconnect}
+            title={`Disconnect ${activeCompany.nickname}?`}
+            confirmLabel="Disconnect"
+            tone="danger"
+            busy={disconnecting}
+            onConfirm={disconnect}
+            onCancel={() => setConfirmDisconnect(false)}
+          >
+            Syncing stops and the QuickBooks tokens are revoked. Local history and the
+            audit log are kept — you can reconnect any time.
+          </ConfirmDialog>
         </>
       )}
     </div>

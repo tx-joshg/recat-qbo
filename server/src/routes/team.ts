@@ -12,12 +12,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { Company } from '@prisma/client';
 import type { TeamMemberDto } from '@recat/shared';
-import { devLoginAllowed } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { devLoginAllowed } from '../services/devLogin.js';
 import { issueMagicLink } from '../services/magicLink.js';
 
 const roleSchema = z.enum(['admin', 'categorizer', 'viewer']);
@@ -117,7 +117,7 @@ teamRouter.post(
     let devLink: string | undefined;
     if (isNew) {
       const { link } = await issueMagicLink(user, { invite: true });
-      if (devLoginAllowed && !(await isSmtpConfigured())) devLink = link;
+      if (!(await isSmtpConfigured()) && (await devLoginAllowed())) devLink = link;
     }
 
     const member = toMemberDto(user, role);

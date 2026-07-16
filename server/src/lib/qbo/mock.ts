@@ -1,4 +1,6 @@
-// MockQboClient — in-memory "Intuit" used when QBO_MOCK=true.
+// MockQboClient — the in-memory "Intuit" behind demo companies. Any Company
+// row whose realmId is one of the two mock realms routes here (see
+// lib/qbo/factory.ts) — demo is a per-connection user choice, not an env var.
 //
 // Two realms mirror the design prototype's demo data exactly
 // (design_handoff_recat/Recat.dc.html): Harbor & Main Coffee Co. and
@@ -20,8 +22,10 @@ import {
   type QboWriteResult,
 } from './types.js';
 
-export const MOCK_REALM_HARBOR = '9341002287640001';
-export const MOCK_REALM_BLUEBIRD = '4471889011230002';
+import { MOCK_REALM_IDS } from '@recat/shared';
+
+export const MOCK_REALM_HARBOR = MOCK_REALM_IDS[0];
+export const MOCK_REALM_BLUEBIRD = MOCK_REALM_IDS[1];
 
 // ---------------------------------------------------------------------------
 // Realm state

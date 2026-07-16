@@ -110,8 +110,11 @@ webhooksRouter.post(
 
     const settings = await getInstanceSettings();
     if (settings.webhookVerifierToken === '') {
-      // No verifier token = no way to authenticate the sender. Refuse (except
-      // in mock mode, where there is no Intuit and nothing real to protect).
+      // No verifier token = no way to authenticate the sender. Refuse.
+      // QBO_MOCK (local-dev-only flag) is the sole exception: there is no
+      // Intuit in local mock dev and nothing real to protect. Deployed
+      // instances always enforce the token — demo companies never receive
+      // webhooks anyway (no Intuit behind them).
       if (!env.QBO_MOCK) {
         console.warn('[webhooks] webhook rejected — no verifier token configured');
         res.status(401).json({ error: 'Webhook verifier token not configured' });
