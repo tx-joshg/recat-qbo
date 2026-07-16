@@ -21,6 +21,21 @@ e.g. https://recat.mydomain.com/auth/qbo/callback
 
 Intuit requires HTTPS for production redirect URIs (localhost is exempt for development).
 
+## 2b. EULA and Privacy Policy URLs
+
+Intuit's app form asks for an End User License Agreement URL and a Privacy
+Policy URL "hosted on your domain." **Your Recat deployment already serves
+both** — paste these (the setup wizard shows them with copy buttons):
+
+```
+https://YOUR-RECAT-DOMAIN/eula
+https://YOUR-RECAT-DOMAIN/privacy
+```
+
+They describe exactly what a self-hosted Recat instance stores and shares
+(nothing leaves your server except QuickBooks API calls and your own SMTP).
+They're templates — replace them if your jurisdiction needs specific language.
+
 ## 3. Grab your development (sandbox) keys
 
 Copy the **Client ID** and **Client Secret** from the Development tab into Recat's setup wizard (or `.env`). Set `QBO_ENVIRONMENT=sandbox`. Intuit gives every developer account a sandbox company with fake data — connect it and try the full loop safely.

@@ -460,12 +460,14 @@ export default function Setup() {
     }
   };
 
-  const copyUri = () => {
+  const copyText = (text: string) => {
     navigator.clipboard
-      .writeText(redirectUri)
+      .writeText(text)
       .then(() => toast('Copied to clipboard'))
       .catch(() => toast('Copy failed — select the text manually'));
   };
+
+  const copyUri = () => copyText(redirectUri);
 
   const finish = async () => {
     if (!companyId || syncing) return;
@@ -824,6 +826,50 @@ export default function Setup() {
                     Copy
                   </button>
                 </div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--mut)', marginTop: 16 }}>
+                  EULA &amp; Privacy Policy URLs — Intuit asks for these too; this deployment
+                  serves ready-made pages
+                </div>
+                {[`${window.location.origin}/eula`, `${window.location.origin}/privacy`].map((u) => (
+                  <div
+                    key={u}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, minWidth: 0 }}
+                  >
+                    <code
+                      style={{
+                        fontSize: 13,
+                        color: 'var(--ink)',
+                        background: 'var(--card)',
+                        border: '1px solid var(--bd2)',
+                        borderRadius: 6,
+                        padding: '7px 10px',
+                        flex: 1,
+                        minWidth: 0,
+                        overflowWrap: 'anywhere',
+                      }}
+                    >
+                      {u}
+                    </code>
+                    <button
+                      onClick={() => copyText(u)}
+                      className="sw-copy"
+                      style={{
+                        flex: 'none',
+                        border: '1px solid var(--bd)',
+                        background: 'var(--card)',
+                        color: 'var(--ink)',
+                        borderRadius: 6,
+                        padding: '7px 12px',
+                        fontSize: 13,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                ))}
               </div>
             </div>
           )}

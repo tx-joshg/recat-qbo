@@ -12,6 +12,7 @@ import { MOCK_REALM_HARBOR, MOCK_REALM_BLUEBIRD } from './lib/qbo/mock.js';
 import { originCheck } from './middleware/auth.js';
 import { startJobs } from './jobs/scheduler.js';
 import { authRouter } from './routes/auth.js';
+import { legalRouter } from './routes/legal.js';
 import { auditRouter } from './routes/audit.js';
 import { companiesRouter } from './routes/companies.js';
 import { dashboardRouter, meRouter } from './routes/dashboard.js';
@@ -42,6 +43,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(originCheck);
 
 // Root-mounted routers (absolute paths inside).
+app.use(legalRouter); // /eula, /privacy — public pages for Intuit's app requirements
 app.use(authRouter); // /auth/magic-link, /auth/callback, /auth/logout, /api/session
 app.use(qboOauthRouter); // /auth/qbo/callback, /auth/qbo/mock-consent
 
