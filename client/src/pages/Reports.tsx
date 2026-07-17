@@ -483,18 +483,18 @@ export default function Reports() {
                 needle === ''
                   ? log.rows
                   : log.rows.filter((r) =>
-                      [r.payee, r.memo ?? '', r.account, r.txnType, r.docNum ?? '']
+                      [r.payee, r.memo ?? '', r.account, r.category, r.txnType, r.docNum ?? '']
                         .join(' ')
                         .toLowerCase()
                         .includes(needle),
                     );
               const total = rows.reduce((a, r) => a + r.amount, 0);
               return (
-                <div style={{ minWidth: 640 }}>
+                <div style={{ minWidth: 760 }}>
                   <div
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: '86px 110px 1fr 220px 110px',
+                      gridTemplateColumns: '86px 92px 1fr 150px 200px 104px',
                       gap: '0 14px',
                       padding: '0 0 8px',
                       borderBottom: '1px solid var(--bd)',
@@ -508,6 +508,7 @@ export default function Reports() {
                     <span>Date</span>
                     <span>Type</span>
                     <span>Payee / memo</span>
+                    <span>Account</span>
                     <span>Category</span>
                     <span style={{ textAlign: 'right' }}>Amount</span>
                   </div>
@@ -521,7 +522,7 @@ export default function Reports() {
                       key={i}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: '86px 110px 1fr 220px 110px',
+                        gridTemplateColumns: '86px 92px 1fr 150px 200px 104px',
                         gap: '0 14px',
                         alignItems: 'baseline',
                         padding: '9px 0',
@@ -539,13 +540,23 @@ export default function Reports() {
                       </span>
                       <span
                         style={{
-                          color: 'var(--mut)',
+                          color: 'var(--fnt)',
+                          fontSize: 12.5,
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
                         }}
                       >
                         {r.account}
+                      </span>
+                      <span
+                        style={{
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {r.category || '—'}
                       </span>
                       <span
                         style={{
@@ -563,7 +574,7 @@ export default function Reports() {
                     <div
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: '1fr 110px',
+                        gridTemplateColumns: '1fr 104px',
                         gap: '0 14px',
                         padding: '10px 0 0',
                         fontSize: 13,

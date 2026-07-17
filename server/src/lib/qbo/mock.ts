@@ -471,15 +471,16 @@ export class MockQboClient implements QboClient {
     return this.realm.txns
       .filter((t) => !t.deleted && t.date >= params.startDate && t.date <= params.endDate)
       .map((t) => {
-        const accountIds = [...new Set(t.lines.map((l) => l.accountQboId))];
+        const categoryIds = [...new Set(t.lines.map((l) => l.accountQboId))];
         return {
           date: t.date,
           txnType: t.qboType,
           payee: t.payee,
           ...(t.memo !== undefined ? { memo: t.memo } : {}),
-          // Same convention as QBO's TransactionList: one row per entity, with
-          // multi-line entities reading '- Split -'.
-          account: accountIds.length === 1 ? nameOf(accountIds[0]!) : '- Split -',
+          account: nameOf(t.bankAccountQboId),
+          // Same convention as QBO's TransactionList Split column: one row per
+          // entity, with multi-line entities reading '- Split -'.
+          category: categoryIds.length === 1 ? nameOf(categoryIds[0]!) : '- Split -',
           amount: t.amount,
         };
       })

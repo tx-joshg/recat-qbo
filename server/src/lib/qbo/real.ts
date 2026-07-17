@@ -307,8 +307,10 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
   return out;
 }
 
-/** The whole-company transaction-log columns, in the order we ask for them. */
-const TXN_LOG_COLUMNS = 'tx_date,txn_type,doc_num,name,memo,account_name,subt_nat_amount';
+/** The whole-company transaction-log columns, in the order we ask for them.
+ * account_name = the bank/credit-card side; other_account = QBO's "Split"
+ * column, i.e. the categorization. */
+const TXN_LOG_COLUMNS = 'tx_date,txn_type,doc_num,name,memo,account_name,other_account,subt_nat_amount';
 
 /**
  * Parse a whole-company /reports/TransactionList body (the log view). Same
@@ -328,6 +330,7 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
   const iName = colIndex('name', 'name');
   const iMemo = colIndex('memo', 'memo');
   const iAccount = colIndex('account_name', 'account');
+  const iCategory = colIndex('other_account', 'split');
   const iAmount = colIndex('subt_nat_amount', 'amount');
   const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
     i >= 0 ? colData[i] : undefined;
@@ -349,6 +352,7 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
         payee: at(colData, iName)?.value ?? '',
         ...(memo !== undefined && memo !== '' ? { memo } : {}),
         account: at(colData, iAccount)?.value ?? '',
+        category: at(colData, iCategory)?.value ?? '',
         amount: reportNumber(at(colData, iAmount)?.value),
       });
     }

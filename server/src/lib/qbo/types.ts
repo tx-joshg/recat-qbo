@@ -93,8 +93,10 @@ export interface QboLogTxn {
   docNum?: string;
   payee: string;
   memo?: string;
-  /** posting account/category as QBO reports it; multi-line entities read '- Split -' */
+  /** the account the transaction is entered against (bank / credit card) */
   account: string;
+  /** QBO's Split column — the categorization; multi-line entities read '- Split -' */
+  category: string;
   /** signed; + = money in, per the report's natural amount */
   amount: number;
 }
