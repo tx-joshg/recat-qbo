@@ -99,6 +99,8 @@ export interface QboLogTxn {
   category: string;
   /** signed; + = money in, per the report's natural amount */
   amount: number;
+  /** QBO entity id when the report provides one — enables tagging */
+  qboId?: string;
 }
 
 export interface QboWriteResult {

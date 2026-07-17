@@ -23,6 +23,7 @@ import type {
   SavedReportConfig,
   SavedReportDto,
   SessionDto,
+  LogTagsBody,
   StatementDrilldownDto,
   TransactionLogDto,
   StatementDto,
@@ -316,6 +317,9 @@ export const reports = {
   /** Whole-company transaction log, straight from QuickBooks. start/end = YYYY-MM-DD. */
   transactionLog: (companyId: string, params: { start: string; end: string }) =>
     api.get<TransactionLogDto>(`/api/companies/${companyId}/reports/transaction-log${qs({ ...params })}`),
+  /** Replace the Recat tag set on one log row (categorizer+). */
+  setLogTags: (companyId: string, body: LogTagsBody) =>
+    api.put<{ ok: boolean }>(`/api/companies/${companyId}/reports/transaction-log/tags`, body),
 };
 
 export const dashboardLayout = {

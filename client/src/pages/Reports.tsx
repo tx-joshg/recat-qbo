@@ -18,9 +18,10 @@ import { useApp } from '../state/AppContext';
 import { reports, savedReports, transactions } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
+import TagPicker from '../components/TagPicker';
 
 type RptTab = 'pl' | 'bs' | 'custom' | 'txns';
-type LogRange = '30d' | '90d' | 'ytd' | '12m';
+type LogRange = '30d' | '90d' | 'ytd' | '12m' | 'all' | 'custom';
 type Compare = 'none' | 'prev' | 'py';
 type Basis = 'cash' | 'accrual';
 
@@ -178,9 +179,12 @@ export default function Reports() {
 
   // Transaction log
   const [logRange, setLogRange] = useState<LogRange>('90d');
+  const [logStart, setLogStart] = useState(''); // custom range, YYYY-MM-DD
+  const [logEnd, setLogEnd] = useState('');
   const [log, setLog] = useState<TransactionLogDto | null>(null);
   const [logLoading, setLogLoading] = useState(false);
   const [logFilter, setLogFilter] = useState('');
+  const [logTagPicker, setLogTagPicker] = useState<string | null>(null); // open picker's qboKey
 
   const plCmpShown = plCols === 'total' && plPeriod !== 'ytd';
 
@@ -217,23 +221,36 @@ export default function Reports() {
   }, [activeCompanyId, tab, plPeriod, plCols, plCmp, bsMonth, bsCmp, basis, toast]);
 
   // ---- transaction log fetch ----
+  const isYmd = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
   useEffect(() => {
     if (!activeCompanyId || tab !== 'txns') return;
-    let cancelled = false;
-    const end = new Date();
-    const start = new Date(end);
-    if (logRange === '30d') start.setDate(start.getDate() - 30);
-    else if (logRange === '90d') start.setDate(start.getDate() - 90);
-    else if (logRange === '12m') start.setFullYear(start.getFullYear() - 1);
-    else {
-      start.setMonth(0);
-      start.setDate(1);
-    }
     const ymd = (d: Date) =>
       `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    let startStr: string;
+    let endStr: string;
+    if (logRange === 'custom') {
+      // Wait until both dates are typed in full.
+      if (!isYmd(logStart) || !isYmd(logEnd) || logStart > logEnd) return;
+      startStr = logStart;
+      endStr = logEnd;
+    } else {
+      const end = new Date();
+      const start = new Date(end);
+      if (logRange === '30d') start.setDate(start.getDate() - 30);
+      else if (logRange === '90d') start.setDate(start.getDate() - 90);
+      else if (logRange === '12m') start.setFullYear(start.getFullYear() - 1);
+      else if (logRange === 'all') start.setTime(Date.UTC(1900, 0, 1));
+      else {
+        start.setMonth(0);
+        start.setDate(1);
+      }
+      startStr = logRange === 'all' ? '1900-01-01' : ymd(start);
+      endStr = ymd(end);
+    }
+    let cancelled = false;
     setLogLoading(true);
     reports
-      .transactionLog(activeCompanyId, { start: ymd(start), end: ymd(end) })
+      .transactionLog(activeCompanyId, { start: startStr, end: endStr })
       .then((r) => {
         if (!cancelled) setLog(r);
       })
@@ -246,7 +263,36 @@ export default function Reports() {
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, tab, logRange, toast]);
+  }, [activeCompanyId, tab, logRange, logStart, logEnd, toast]);
+
+  // ---- transaction log tag editing (optimistic; tags never touch QBO) ----
+  const toggleLogTag = (qboKey: string, tagId: string) => {
+    if (!activeCompanyId || !log) return;
+    const row = log.rows.find((r) => r.qboKey === qboKey);
+    if (!row) return;
+    const prev = row.tagIds;
+    const next = prev.includes(tagId) ? prev.filter((id) => id !== tagId) : [...prev, tagId];
+    setLog({
+      ...log,
+      rows: log.rows.map((r) => (r.qboKey === qboKey ? { ...r, tagIds: next } : r)),
+    });
+    reports.setLogTags(activeCompanyId, { qboKey, tagIds: next }).catch(() => {
+      setLog((cur) =>
+        cur === null
+          ? cur
+          : { ...cur, rows: cur.rows.map((r) => (r.qboKey === qboKey ? { ...r, tagIds: prev } : r)) },
+      );
+      toast('Could not save the tag — try again');
+    });
+  };
+
+  // Close the log tag picker on any outside click.
+  useEffect(() => {
+    if (logTagPicker === null) return;
+    const close = () => setLogTagPicker(null);
+    window.addEventListener('click', close);
+    return () => window.removeEventListener('click', close);
+  }, [logTagPicker]);
 
   // ---- custom report fetch ----
   useEffect(() => {
@@ -445,14 +491,38 @@ export default function Reports() {
             <option value="90d">Last 90 days</option>
             <option value="ytd">This year</option>
             <option value="12m">Last 12 months</option>
+            <option value="all">All time</option>
+            <option value="custom">Custom range…</option>
           </LabeledSelect>
+          {logRange === 'custom' && (
+            <>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--fnt)', marginBottom: 5 }}>From</div>
+                <input
+                  className="input"
+                  type="date"
+                  value={logStart}
+                  onChange={(e) => setLogStart(e.target.value)}
+                />
+              </div>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--fnt)', marginBottom: 5 }}>To</div>
+                <input
+                  className="input"
+                  type="date"
+                  value={logEnd}
+                  onChange={(e) => setLogEnd(e.target.value)}
+                />
+              </div>
+            </>
+          )}
           <div>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--fnt)', marginBottom: 5 }}>Filter</div>
             <input
               className="input"
               value={logFilter}
               onChange={(e) => setLogFilter(e.target.value)}
-              placeholder="Payee, memo, category, type…"
+              placeholder="Payee, memo, category, amount…"
               style={{ minWidth: 220 }}
             />
           </div>
@@ -479,11 +549,22 @@ export default function Reports() {
           ) : log ? (
             (() => {
               const needle = logFilter.trim().toLowerCase();
+              const tagName = (id: string) => tags.find((tg) => tg.id === id)?.name ?? '';
               const rows =
                 needle === ''
                   ? log.rows
                   : log.rows.filter((r) =>
-                      [r.payee, r.memo ?? '', r.account, r.category, r.txnType, r.docNum ?? '']
+                      [
+                        r.payee,
+                        r.memo ?? '',
+                        r.account,
+                        r.category,
+                        r.txnType,
+                        r.docNum ?? '',
+                        r.amount.toFixed(2),
+                        fmtMoney(r.amount),
+                        ...r.tagIds.map(tagName),
+                      ]
                         .join(' ')
                         .toLowerCase()
                         .includes(needle),
@@ -532,10 +613,90 @@ export default function Reports() {
                     >
                       <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{fmtDate(r.date)}</span>
                       <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{r.txnType}</span>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        <span style={{ fontWeight: 500 }}>{r.payee || '—'}</span>
-                        {r.memo !== undefined && (
-                          <span style={{ color: 'var(--fnt)', fontSize: 12.5 }}> · {r.memo}</span>
+                      <span style={{ minWidth: 0 }}>
+                        <span
+                          style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                        >
+                          <span style={{ fontWeight: 500 }}>{r.payee || '—'}</span>
+                          {r.memo !== undefined && (
+                            <span style={{ color: 'var(--fnt)', fontSize: 12.5 }}> · {r.memo}</span>
+                          )}
+                        </span>
+                        {(r.tagIds.length > 0 || (!isViewer && r.qboKey !== undefined)) && (
+                          <span
+                            style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: 5,
+                              marginTop: 4,
+                              alignItems: 'center',
+                              position: 'relative',
+                            }}
+                          >
+                            {r.tagIds
+                              .map((id) => tags.find((tg) => tg.id === id))
+                              .filter((tg): tg is NonNullable<typeof tg> => !!tg)
+                              .map((tg) => (
+                                <span
+                                  key={tg.id}
+                                  style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: 5,
+                                    fontSize: 11.5,
+                                    fontWeight: 600,
+                                    color: 'var(--mut)',
+                                    border: '1px solid var(--bd2)',
+                                    background: 'var(--hl)',
+                                    borderRadius: 99,
+                                    padding: '2px 8px',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      width: 7,
+                                      height: 7,
+                                      borderRadius: '50%',
+                                      background: tg.color,
+                                      display: 'inline-block',
+                                    }}
+                                  />
+                                  {tg.name}
+                                </span>
+                              ))}
+                            {!isViewer && r.qboKey !== undefined && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLogTagPicker(logTagPicker === r.qboKey ? null : r.qboKey!);
+                                }}
+                                data-tip="Tags live only in Recat — never written to QuickBooks"
+                                className="hov-dash"
+                                style={{
+                                  fontSize: 11.5,
+                                  fontWeight: 600,
+                                  color: 'var(--fnt)',
+                                  border: '1px dashed var(--bd)',
+                                  background: 'none',
+                                  borderRadius: 99,
+                                  padding: '2px 9px',
+                                  cursor: 'pointer',
+                                  fontFamily: 'inherit',
+                                }}
+                              >
+                                + tag
+                              </button>
+                            )}
+                            {logTagPicker !== null && logTagPicker === r.qboKey && (
+                              <TagPicker
+                                tags={tags}
+                                selectedIds={r.tagIds}
+                                onToggle={(tagId) => toggleLogTag(r.qboKey!, tagId)}
+                                width={230}
+                              />
+                            )}
+                          </span>
                         )}
                       </span>
                       <span

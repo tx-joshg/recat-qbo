@@ -9,7 +9,14 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
-import { balanceSheet, customReport, profitAndLoss, statementDrilldown, transactionLog } from '../services/reports.js';
+import {
+  balanceSheet,
+  customReport,
+  profitAndLoss,
+  setTransactionLogTags,
+  statementDrilldown,
+  transactionLog,
+} from '../services/reports.js';
 
 function scopedCompany(req: { company?: Company }): Company {
   if (!req.company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
@@ -44,6 +51,11 @@ const drilldownQuery = z.object({
 const txnLogQuery = z.object({
   start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
   end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
+});
+
+const logTagsBody = z.object({
+  qboKey: z.string().min(3).max(120),
+  tagIds: z.array(z.string().min(1)).max(50),
 });
 
 const customQuery = z.object({
@@ -117,6 +129,23 @@ reportsRouter.get(
     const company = scopedCompany(req);
     const q = validate(txnLogQuery)(req.query);
     res.json(await transactionLog(company.id, { start: q.start, end: q.end }));
+  }),
+);
+
+reportsRouter.put(
+  '/transaction-log/tags',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const company = scopedCompany(req);
+    const body = validate(logTagsBody)(req.body);
+    if (body.tagIds.length > 0) {
+      const owned = await prisma.tag.count({ where: { companyId: company.id, id: { in: body.tagIds } } });
+      if (owned !== new Set(body.tagIds).size) {
+        throw new HttpError(400, 'One or more tags do not belong to this company', 'BAD_REQUEST');
+      }
+    }
+    await setTransactionLogTags(company.id, body.qboKey, body.tagIds);
+    res.json({ ok: true });
   }),
 );
 

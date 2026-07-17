@@ -354,6 +354,10 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
         account: at(colData, iAccount)?.value ?? '',
         category: at(colData, iCategory)?.value ?? '',
         amount: reportNumber(at(colData, iAmount)?.value),
+        ...((): { qboId?: string } => {
+          const id = at(colData, iDate)?.id ?? colData[0]?.id;
+          return id !== undefined && id !== '' ? { qboId: id } : {};
+        })(),
       });
     }
   };

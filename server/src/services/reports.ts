@@ -443,17 +443,112 @@ export async function statementDrilldown(
 // ---------- Transaction log ----------
 
 /**
+ * Map a TransactionList "Transaction Type" onto the canonical entity type we
+ * sync (Purchase | Deposit | JournalEntry); other types pass through verbatim.
+ * The mock client already emits canonical types, so this is a no-op there.
+ */
+export function canonicalQboType(reportType: string): string {
+  const t = reportType.trim().toLowerCase();
+  if (t === 'deposit') return 'Deposit';
+  if (t === 'journal entry' || t === 'journalentry') return 'JournalEntry';
+  if (t === 'purchase' || t === 'check' || t.endsWith('expense')) return 'Purchase';
+  return reportType.trim();
+}
+
+/**
  * Whole-company transaction log, read straight from QuickBooks (TransactionList
  * report) so it can never drift from the books. Demo companies serve the same
- * shape from the mock realm store.
+ * shape from the mock realm store. Tags are Recat-local: rows Recat synced show
+ * their queue tags (txn + split-line union); anything else shows log tags.
  */
 export async function transactionLog(
   companyId: string,
   args: { start: string; end: string },
 ): Promise<TransactionLogDto> {
   const client = await qboFactory.forCompany(companyId);
-  const rows = await client.listTransactions({ startDate: args.start, endDate: args.end });
+  const raw = await client.listTransactions({ startDate: args.start, endDate: args.end });
+
+  const keyed = raw.map((r) => ({
+    row: r,
+    key: r.qboId !== undefined ? `${canonicalQboType(r.txnType)}:${r.qboId}` : null,
+  }));
+  const qboIds = [...new Set(raw.map((r) => r.qboId).filter((id): id is string => id !== undefined))];
+
+  // Queue tags: local Transaction rows for the same entities.
+  const local =
+    qboIds.length > 0
+      ? await prisma.transaction.findMany({
+          where: { companyId, qboId: { in: qboIds } },
+          select: {
+            qboId: true,
+            qboType: true,
+            txnTags: { select: { tagId: true } },
+            splitLines: { select: { tags: { select: { tagId: true } } } },
+          },
+        })
+      : [];
+  const queueTags = new Map<string, string[]>();
+  for (const t of local) {
+    const ids = new Set<string>(t.txnTags.map((x) => x.tagId));
+    for (const l of t.splitLines) for (const x of l.tags) ids.add(x.tagId);
+    queueTags.set(`${t.qboType}:${t.qboId}`, [...ids]);
+  }
+
+  // Log tags: transactions tagged directly from this screen.
+  const keys = keyed.map((k) => k.key).filter((k): k is string => k !== null);
+  const logTags =
+    keys.length > 0 ? await prisma.logTag.findMany({ where: { companyId, qboKey: { in: keys } } }) : [];
+  const logTagMap = new Map<string, string[]>();
+  for (const lt of logTags) {
+    const arr = logTagMap.get(lt.qboKey) ?? [];
+    arr.push(lt.tagId);
+    logTagMap.set(lt.qboKey, arr);
+  }
+
+  const rows = keyed.map(({ row, key }) => {
+    const { qboId: _qboId, ...rest } = row;
+    const tagIds = key === null ? [] : [...new Set([...(queueTags.get(key) ?? []), ...(logTagMap.get(key) ?? [])])];
+    return { ...rest, ...(key !== null ? { qboKey: key } : {}), tagIds };
+  });
   return { start: args.start, end: args.end, rows };
+}
+
+/**
+ * Replace the tag set on one log row. Routes to the local Transaction's queue
+ * tags when Recat synced this entity (so queue and log always agree), else to
+ * the LogTag store. tagIds must belong to the company (validated by caller).
+ */
+export async function setTransactionLogTags(
+  companyId: string,
+  qboKey: string,
+  tagIds: string[],
+): Promise<void> {
+  const sep = qboKey.indexOf(':');
+  const qboType = sep > 0 ? qboKey.slice(0, sep) : '';
+  const qboId = sep > 0 ? qboKey.slice(sep + 1) : '';
+  const localTxn =
+    qboType !== '' && qboId !== ''
+      ? await prisma.transaction.findUnique({
+          where: { companyId_qboType_qboId: { companyId, qboType, qboId } },
+          select: { id: true },
+        })
+      : null;
+
+  if (localTxn) {
+    await prisma.$transaction([
+      prisma.txnTag.deleteMany({ where: { txnId: localTxn.id } }),
+      ...(tagIds.length > 0
+        ? [prisma.txnTag.createMany({ data: tagIds.map((tagId) => ({ txnId: localTxn.id, tagId })) })]
+        : []),
+    ]);
+    return;
+  }
+  await prisma.$transaction([
+    prisma.logTag.deleteMany({ where: { companyId, qboKey } }),
+    ...(tagIds.length > 0
+      ? [prisma.logTag.createMany({ data: tagIds.map((tagId) => ({ companyId, qboKey, tagId })) })]
+      : []),
+  ]);
 }
 
 // ---------- Custom & tags ----------

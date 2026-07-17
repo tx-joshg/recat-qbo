@@ -103,6 +103,7 @@ model Company {
   qboAccounts       QboAccount[]
   syncLogs          SyncLog[]
   memberships       Membership[]
+  logTags           LogTag[]
 }
 
 model Transaction {
@@ -145,6 +146,24 @@ model Tag {
   txnTags       TxnTag[]
   ruleTags      RuleTag[]
   splitLineTags SplitLineTag[]
+  logTags       LogTag[]
+}
+
+/// Tag on a QuickBooks transaction that never passed through Recat's queue
+/// (tagged from the transaction log). Transactions Recat synced keep their
+/// tags on TxnTag — the log endpoint merges both, and tag edits route to
+/// TxnTag whenever a local Transaction row exists for the same entity.
+model LogTag {
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /// "<qboType>:<qboId>" — canonical entity type (Purchase | Deposit |
+  /// JournalEntry) where known, else the report's type string verbatim.
+  qboKey    String
+  tagId     String
+  tag       Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([companyId, qboKey, tagId])
+  @@index([companyId, qboKey])
 }
 
 /// One line of a split categorization. Reports attribute each line's amount to

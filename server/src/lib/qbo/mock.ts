@@ -482,6 +482,7 @@ export class MockQboClient implements QboClient {
           // entity, with multi-line entities reading '- Split -'.
           category: categoryIds.length === 1 ? nameOf(categoryIds[0]!) : '- Split -',
           amount: t.amount,
+          qboId: t.qboId,
         };
       })
       .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));

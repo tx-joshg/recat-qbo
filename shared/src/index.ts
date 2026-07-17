@@ -303,12 +303,22 @@ export interface TransactionLogRowDto {
   category: string;
   /** signed; + = money in */
   amount: number;
+  /** stable entity key ("<qboType>:<qboId>") — present when the row is taggable */
+  qboKey?: string;
+  /** Recat tags on this transaction (queue tags and log tags merged) */
+  tagIds: string[];
 }
 
 export interface TransactionLogDto {
   start: string;
   end: string;
   rows: TransactionLogRowDto[];
+}
+
+/** PUT /reports/transaction-log/tags */
+export interface LogTagsBody {
+  qboKey: string;
+  tagIds: string[];
 }
 
 export interface CustomReportRow {
