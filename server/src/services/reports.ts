@@ -21,6 +21,7 @@ import type {
   StatementRow,
   TransactionLogDto,
 } from '@recat/shared';
+import { createHash } from 'node:crypto';
 import { prisma } from '../lib/prisma.js';
 import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
 import type { QboStatement, QboStatementRow } from '../lib/qbo/types.js';
@@ -456,6 +457,23 @@ export function canonicalQboType(reportType: string): string {
 }
 
 /**
+ * Fallback tag key for report rows QBO returned without an entity id: a hash
+ * of the row's visible identity. Stable across fetches and date ranges;
+ * identical rows (same date/type/doc/payee/amount) share one key, so tagging
+ * one tags them all — the price of having no id to tell them apart.
+ */
+export function fallbackLogKey(r: {
+  date: string;
+  txnType: string;
+  docNum?: string;
+  payee: string;
+  amount: number;
+}): string {
+  const identity = [r.date, r.txnType, r.docNum ?? '', r.payee, r.amount.toFixed(2)].join('|');
+  return `row:${createHash('sha256').update(identity).digest('hex').slice(0, 40)}`;
+}
+
+/**
  * Whole-company transaction log, read straight from QuickBooks (TransactionList
  * report) so it can never drift from the books. Demo companies serve the same
  * shape from the mock realm store. Tags are Recat-local: rows Recat synced show
@@ -470,7 +488,7 @@ export async function transactionLog(
 
   const keyed = raw.map((r) => ({
     row: r,
-    key: r.qboId !== undefined ? `${canonicalQboType(r.txnType)}:${r.qboId}` : null,
+    key: r.qboId !== undefined ? `${canonicalQboType(r.txnType)}:${r.qboId}` : fallbackLogKey(r),
   }));
   const qboIds = [...new Set(raw.map((r) => r.qboId).filter((id): id is string => id !== undefined))];
 
@@ -495,7 +513,7 @@ export async function transactionLog(
   }
 
   // Log tags: transactions tagged directly from this screen.
-  const keys = keyed.map((k) => k.key).filter((k): k is string => k !== null);
+  const keys = keyed.map((k) => k.key);
   const logTags =
     keys.length > 0 ? await prisma.logTag.findMany({ where: { companyId, qboKey: { in: keys } } }) : [];
   const logTagMap = new Map<string, string[]>();
@@ -507,8 +525,8 @@ export async function transactionLog(
 
   const rows = keyed.map(({ row, key }) => {
     const { qboId: _qboId, ...rest } = row;
-    const tagIds = key === null ? [] : [...new Set([...(queueTags.get(key) ?? []), ...(logTagMap.get(key) ?? [])])];
-    return { ...rest, ...(key !== null ? { qboKey: key } : {}), tagIds };
+    const tagIds = [...new Set([...(queueTags.get(key) ?? []), ...(logTagMap.get(key) ?? [])])];
+    return { ...rest, qboKey: key, tagIds };
   });
   return { start: args.start, end: args.end, rows };
 }

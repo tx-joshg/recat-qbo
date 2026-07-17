@@ -10,11 +10,23 @@ export function fmtMoney(a: number): string {
   return (a > 0 ? '+$' : '−$') + s;
 }
 
-/** 'Jul 1' — short month + day, no year. UTC so date-only ISO strings never shift a day. */
+/**
+ * 'Jul 1' for current-year dates, 'Jul 1, 2024' otherwise — older rows always
+ * say how far back they are. UTC so date-only ISO strings never shift a day.
+ */
 export function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  const opts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', timeZone: 'UTC' };
+  if (d.getUTCFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString('en-US', opts);
+}
+
+/** 'Jul 1, 2026' — always includes the year (history views). */
+export function fmtDateY(iso: string): string {
   return new Date(iso).toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
+    year: 'numeric',
     timeZone: 'UTC',
   });
 }
