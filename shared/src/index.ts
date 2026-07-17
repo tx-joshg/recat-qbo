@@ -303,8 +303,9 @@ export interface TransactionLogRowDto {
   category: string;
   /** signed; + = money in */
   amount: number;
-  /** stable entity key ("<qboType>:<qboId>") — present when the row is taggable */
-  qboKey?: string;
+  /** stable tag key: "<qboType>:<qboId>" when QBO returned the entity id,
+   *  else "row:<hash>" derived from the row's visible identity */
+  qboKey: string;
   /** Recat tags on this transaction (queue tags and log tags merged) */
   tagIds: string[];
 }

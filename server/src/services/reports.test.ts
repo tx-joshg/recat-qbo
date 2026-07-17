@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SavedReportConfig } from '@recat/shared';
-import { computeCustomReport, type ReportTagInput, type ReportTxnInput } from './reports.js';
+import { computeCustomReport, fallbackLogKey, type ReportTagInput, type ReportTxnInput } from './reports.js';
 
 // ---------------------------------------------------------------------------
 // computeCustomReport — per-line split attribution
@@ -142,5 +142,33 @@ describe('computeCustomReport — account grouping and uncategorized', () => {
   it('labels txns with no category and no splits as Uncategorized', () => {
     const report = computeCustomReport(cfg({ groupBy: 'cat' }), [txn({ amount: -12 })], TAGS);
     expect(report.rows).toEqual([{ name: 'Uncategorized', color: null, count: 1, total: -12 }]);
+  });
+});
+
+describe('fallbackLogKey — tag keys for report rows QBO returned without an id', () => {
+  const row = { date: '2024-03-14', txnType: 'Expense', docNum: '42', payee: 'ACME CO', amount: -19.5 };
+
+  it('is stable for identical row content', () => {
+    expect(fallbackLogKey(row)).toBe(fallbackLogKey({ ...row }));
+  });
+
+  it('differs when any identity field differs', () => {
+    const base = fallbackLogKey(row);
+    expect(fallbackLogKey({ ...row, date: '2024-03-15' })).not.toBe(base);
+    expect(fallbackLogKey({ ...row, txnType: 'Deposit' })).not.toBe(base);
+    expect(fallbackLogKey({ ...row, docNum: '43' })).not.toBe(base);
+    expect(fallbackLogKey({ ...row, payee: 'ACME LLC' })).not.toBe(base);
+    expect(fallbackLogKey({ ...row, amount: -19.51 })).not.toBe(base);
+  });
+
+  it('treats a missing docNum the same as an empty one', () => {
+    const { docNum: _d, ...noDoc } = row;
+    expect(fallbackLogKey(noDoc)).toBe(fallbackLogKey({ ...row, docNum: '' }));
+  });
+
+  it('never collides with a real entity key and fits the API limit', () => {
+    const key = fallbackLogKey(row);
+    expect(key).toMatch(/^row:[0-9a-f]{40}$/);
+    expect(key.length).toBeLessThanOrEqual(120);
   });
 });

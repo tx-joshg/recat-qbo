@@ -16,7 +16,7 @@ import type {
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import { reports, savedReports, transactions } from '../lib/api';
-import { fmtDate, fmtMoney } from '../lib/format';
+import { fmtDate, fmtDateY, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import TagPicker from '../components/TagPicker';
 
@@ -571,11 +571,11 @@ export default function Reports() {
                     );
               const total = rows.reduce((a, r) => a + r.amount, 0);
               return (
-                <div style={{ minWidth: 760 }}>
+                <div style={{ minWidth: 774 }}>
                   <div
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: '86px 92px 1fr 150px 200px 104px',
+                      gridTemplateColumns: '100px 92px 1fr 150px 200px 104px',
                       gap: '0 14px',
                       padding: '0 0 8px',
                       borderBottom: '1px solid var(--bd)',
@@ -603,7 +603,7 @@ export default function Reports() {
                       key={i}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: '86px 92px 1fr 150px 200px 104px',
+                        gridTemplateColumns: '100px 92px 1fr 150px 200px 104px',
                         gap: '0 14px',
                         alignItems: 'baseline',
                         padding: '9px 0',
@@ -611,7 +611,7 @@ export default function Reports() {
                         fontSize: 13.5,
                       }}
                     >
-                      <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{fmtDate(r.date)}</span>
+                      <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{fmtDateY(r.date)}</span>
                       <span style={{ color: 'var(--mut)', fontSize: 12.5 }}>{r.txnType}</span>
                       <span style={{ minWidth: 0 }}>
                         <span
@@ -622,7 +622,7 @@ export default function Reports() {
                             <span style={{ color: 'var(--fnt)', fontSize: 12.5 }}> · {r.memo}</span>
                           )}
                         </span>
-                        {(r.tagIds.length > 0 || (!isViewer && r.qboKey !== undefined)) && (
+                        {(r.tagIds.length > 0 || !isViewer) && (
                           <span
                             style={{
                               display: 'flex',
@@ -665,11 +665,11 @@ export default function Reports() {
                                   {tg.name}
                                 </span>
                               ))}
-                            {!isViewer && r.qboKey !== undefined && (
+                            {!isViewer && (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  setLogTagPicker(logTagPicker === r.qboKey ? null : r.qboKey!);
+                                  setLogTagPicker(logTagPicker === r.qboKey ? null : r.qboKey);
                                 }}
                                 data-tip="Tags live only in Recat — never written to QuickBooks"
                                 className="hov-dash"
@@ -688,11 +688,11 @@ export default function Reports() {
                                 + tag
                               </button>
                             )}
-                            {logTagPicker !== null && logTagPicker === r.qboKey && (
+                            {logTagPicker === r.qboKey && (
                               <TagPicker
                                 tags={tags}
                                 selectedIds={r.tagIds}
-                                onToggle={(tagId) => toggleLogTag(r.qboKey!, tagId)}
+                                onToggle={(tagId) => toggleLogTag(r.qboKey, tagId)}
                                 width={230}
                               />
                             )}
