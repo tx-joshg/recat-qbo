@@ -28,6 +28,7 @@ import {
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
+import { classifyIntuitOAuthBody } from './diagnostics.js';
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -659,7 +660,7 @@ export function intuitAuthorizeUrl(args: { clientId: string; redirectUri: string
 }
 
 async function tokenRequest(clientId: string, clientSecret: string, body: URLSearchParams): Promise<QboTokenSet> {
-  const res = await fetch(OAUTH_TOKEN_URL, {
+  const request: RequestInit = {
     method: 'POST',
     headers: {
       Authorization: `Basic ${basicAuth(clientId, clientSecret)}`,
@@ -667,10 +668,17 @@ async function tokenRequest(clientId: string, clientSecret: string, body: URLSea
       Accept: 'application/json',
     },
     body: body.toString(),
-  });
+  };
+  let res: Response;
+  try {
+    res = await fetch(OAUTH_TOKEN_URL, request);
+  } catch {
+    throw new QboAuthError('Intuit token request was unavailable', 'INTUIT_UNAVAILABLE');
+  }
   if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new QboAuthError(`Intuit token request failed (${res.status}): ${detail.slice(0, 300)}`);
+    const detail = (await res.text().catch(() => '')).slice(0, 4096);
+    const reason = classifyIntuitOAuthBody(res.status, detail);
+    throw new QboAuthError(`Intuit token request failed (${res.status})`, reason);
   }
   const json = (await res.json()) as OAuthTokenResponse;
   return {

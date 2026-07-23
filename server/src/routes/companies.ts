@@ -6,11 +6,18 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { Company } from '@prisma/client';
-import type { CompanyDto, PollInterval, QboAccountDto, SyncLogDto } from '@recat/shared';
+import type {
+  CompanyDto,
+  PollInterval,
+  QboAccountDto,
+  QboDiagnosticCode,
+  SyncLogDto,
+} from '@recat/shared';
 import { parseConnectRequest } from '../lib/connectRequest.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
-import { hasIntuitCredentials, qboFactory } from '../lib/qbo/factory.js';
+import { classifyQboFailure } from '../lib/qbo/diagnostics.js';
+import { hasIntuitCredentials, qboFactory, testCompanyConnection } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { syncCompany } from '../services/sync.js';
@@ -106,6 +113,30 @@ const connectHandler = asyncHandler(async (req, res) => {
 });
 companiesRouter.get('/connect-url', requireInstanceAdmin, connectHandler);
 companiesRouter.post('/connect', requireInstanceAdmin, connectHandler);
+
+function qboDiagnosticStatus(code: QboDiagnosticCode): number {
+  return code === 'COMPANY_DISCONNECTED' ? 409 : 502;
+}
+
+function qboDiagnosticMessage(code: QboDiagnosticCode): string {
+  return code === 'COMPANY_DISCONNECTED'
+    ? 'This company is disconnected from QuickBooks.'
+    : 'QuickBooks connection test failed.';
+}
+
+companiesRouter.post(
+  '/:companyId/test-connection',
+  requireInstanceAdmin,
+  withCompany({ allowDisconnected: true }),
+  asyncHandler(async (req, res) => {
+    try {
+      res.json(await testCompanyConnection(scopedCompany(req).id));
+    } catch (error) {
+      const code = classifyQboFailure(error, 'company_info');
+      throw new HttpError(qboDiagnosticStatus(code), qboDiagnosticMessage(code), code);
+    }
+  }),
+);
 
 companiesRouter.patch(
   '/:companyId',

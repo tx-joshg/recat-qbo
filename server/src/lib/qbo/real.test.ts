@@ -2,8 +2,10 @@
 // with amount = the holding-line sum, and the write-side rebuild replaces only
 // those lines — everything else on the entity survives verbatim.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { QboAuthError } from './types.js';
 import {
+  exchangeAuthCode,
   mapDeposit,
   mapJournalEntry,
   mapPurchase,
@@ -18,6 +20,52 @@ import {
   type RawPurchase,
   type RawReport,
 } from './real.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('OAuth token errors', () => {
+  it('uses a typed reason and omits the upstream body from token endpoint errors', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'invalid_client',
+            error_description: 'bad secret SECRET_SENTINEL',
+          }),
+          { status: 401 },
+        ),
+      ),
+    );
+
+    const error = await exchangeAuthCode({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      redirectUri: 'https://recat.example/qbo/callback',
+      code: 'auth-code',
+    }).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(QboAuthError);
+    expect(error).toMatchObject({ reason: 'INVALID_CLIENT_CREDENTIALS' });
+    expect((error as Error).message).not.toContain('SECRET_SENTINEL');
+  });
+
+  it('maps fetch failures to Intuit unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+
+    const error = await exchangeAuthCode({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      redirectUri: 'https://recat.example/qbo/callback',
+      code: 'auth-code',
+    }).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(QboAuthError);
+    expect(error).toMatchObject({ reason: 'INTUIT_UNAVAILABLE' });
+  });
+});
 
 const HOLDING = new Set(['4']);
 

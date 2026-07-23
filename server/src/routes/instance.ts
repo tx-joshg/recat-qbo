@@ -8,6 +8,7 @@ import { redirectUri, webhookUrl } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import { getIntuitCredentialPreflight } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { devLoginAllowed } from '../services/devLogin.js';
 import {
@@ -39,6 +40,13 @@ const settingsPatchBody = z.object({
 
 export const instanceRouter = Router();
 instanceRouter.use(requireUser, requireInstanceAdmin);
+
+instanceRouter.post(
+  '/qbo/preflight',
+  asyncHandler(async (_req, res) => {
+    res.json(await getIntuitCredentialPreflight());
+  }),
+);
 
 instanceRouter.get(
   '/settings',
