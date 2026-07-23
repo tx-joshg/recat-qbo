@@ -28,6 +28,16 @@ export type TxnStatus =
 
 export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
+export type QboDiagnosticCode =
+  | 'INVALID_CLIENT_CREDENTIALS'
+  | 'REDIRECT_URI_MISMATCH'
+  | 'AUTHORIZATION_EXPIRED'
+  | 'ACCESS_DENIED'
+  | 'STATE_EXPIRED'
+  | 'INTUIT_UNAVAILABLE'
+  | 'COMPANY_INFO_FAILED'
+  | 'COMPANY_DISCONNECTED'
+  | 'QBO_CONNECTION_FAILED';
 export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
@@ -89,6 +99,24 @@ export interface CompanyDto {
   connectedAt: string;
   disconnectedAt: string | null;
   lastSyncedAt: string | null;
+}
+
+export interface QboPreflightDto {
+  ok: boolean;
+  clientIdConfigured: boolean;
+  clientSecretConfigured: boolean;
+  environment: QboEnv;
+  redirectUri: string;
+  requiresOAuth: true;
+}
+
+export interface QboConnectionTestDto {
+  ok: true;
+  companyId: string;
+  legalName: string;
+  environment: QboEnv;
+  mode: 'quickbooks' | 'demo';
+  checkedAt: string;
 }
 
 export interface SplitDto {

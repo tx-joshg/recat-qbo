@@ -5,6 +5,8 @@
 // the exact same sync/write-back paths as production. Which implementation a
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
+import type { QboDiagnosticCode } from '@recat/shared';
+
 export interface QboTokenSet {
   accessToken: string;
   refreshToken: string;
@@ -117,6 +119,13 @@ export class QboSyncTokenConflict extends Error {
 
 export class QboAuthError extends Error {
   code = 'QBO_AUTH' as const;
+  readonly reason: QboDiagnosticCode;
+
+  constructor(message: string, reason: QboDiagnosticCode = 'QBO_CONNECTION_FAILED') {
+    super(message);
+    this.name = 'QboAuthError';
+    this.reason = reason;
+  }
 }
 
 /**

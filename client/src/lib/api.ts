@@ -16,7 +16,9 @@ import type {
   InstanceSettingsDto,
   PollInterval,
   QboAccountDto,
+  QboConnectionTestDto,
   QboEnv,
+  QboPreflightDto,
   Role,
   RuleDto,
   RuleTestResult,
@@ -342,6 +344,12 @@ export const instanceSettings = {
   /** Send a test email via the current SMTP config; defaults to the caller's address. */
   testEmail: (to?: string) =>
     api.post<TestEmailResponse>('/api/instance/settings/test-email', to !== undefined ? { to } : {}),
+};
+
+export const qboDiagnostics = {
+  preflight: () => api.post<QboPreflightDto>('/api/instance/qbo/preflight'),
+  testConnection: (companyId: string) =>
+    api.post<QboConnectionTestDto>(`/api/companies/${companyId}/test-connection`),
 };
 
 /** Instance-level user management — instance admins only. */
