@@ -153,6 +153,7 @@ export interface InstanceSettingsPatchBody {
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
   suggestionSource?: SuggestionSetting;
+  suggestionModel?: string;
   aiEndpoint?: string | null;
   aiKey?: string;
   smtpHost?: string;

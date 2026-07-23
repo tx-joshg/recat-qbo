@@ -19,6 +19,7 @@ export default function SuggestionsCard({
 
   const [aiUrl, setAiUrl] = useState(settings.aiEndpoint ?? '');
   const [aiKey, setAiKey] = useState('');
+  const [aiModel, setAiModel] = useState(settings.suggestionModel);
 
   const setSource = (source: SuggestionSetting) => {
     instanceSettings
@@ -43,6 +44,18 @@ export default function SuggestionsCard({
       .then((updated) => {
         onSettings(updated);
         setAiKey('');
+      })
+      .catch((err) => toast(errMsg(err)));
+  };
+
+  const saveModel = () => {
+    const value = aiModel.trim();
+    if (value === '' || value === settings.suggestionModel) return;
+    instanceSettings
+      .patch({ suggestionModel: value })
+      .then((updated) => {
+        onSettings(updated);
+        setAiModel(updated.suggestionModel);
       })
       .catch((err) => toast(errMsg(err)));
   };
@@ -134,10 +147,25 @@ export default function SuggestionsCard({
                 style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}
               />
             </div>
+            <div>
+              <label
+                style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--mut)', marginBottom: 6 }}
+              >
+                Model
+              </label>
+              <input
+                className="input"
+                value={aiModel}
+                onChange={(e) => setAiModel(e.target.value)}
+                onBlur={saveModel}
+                placeholder="gpt-4o-mini"
+                style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}
+              />
+            </div>
           </div>
           <div style={{ fontSize: 12.5, color: 'var(--fnt)', marginTop: 10 }}>
-            Works with OpenAI, Anthropic, Mistral, or a local model via Ollama / LM Studio. Only the
-            payee, amount, and your category list are sent — never full books.
+            Use an OpenAI-compatible /v1 endpoint, such as OpenAI, Ollama, LM Studio, or a compatible gateway.
+            Only the payee, memo, amount, and your category list are sent — never full books.
           </div>
         </>
       )}

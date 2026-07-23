@@ -234,6 +234,7 @@ export interface InstanceSettingsDto {
   redirectUri: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
+  suggestionModel: string;
   aiEndpoint: string | null;
   aiKeySet: boolean;
   needsSetup: boolean; // true until an admin user exists

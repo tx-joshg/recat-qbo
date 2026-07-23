@@ -42,6 +42,7 @@ const schema = z.object({
   QBO_CLIENT_SECRET: z.string().optional().default(''),
   QBO_ENVIRONMENT: z.enum(['sandbox', 'production']).default('sandbox'),
   QBO_WEBHOOK_VERIFIER_TOKEN: z.string().optional().default(''),
+  SUGGESTION_MODEL: z.string().optional(),
   QBO_MOCK: z
     .string()
     .default('false')

@@ -108,6 +108,7 @@ export function pickSuggestion(
 
 interface SuggestionSettings {
   suggestionSource: SuggestionSetting;
+  suggestionModel: string;
   aiEndpoint: string | null;
   aiApiKey: string | null;
 }
@@ -120,6 +121,7 @@ async function loadSettings(): Promise<SuggestionSettings> {
     const s = await getInstanceSettings();
     return {
       suggestionSource: (s.suggestionSource || 'builtin') as SuggestionSetting,
+      suggestionModel: s.suggestionModel || 'gpt-4o-mini',
       aiEndpoint: s.aiEndpoint || null,
       aiApiKey: s.aiApiKey || null,
     };
@@ -128,15 +130,13 @@ async function loadSettings(): Promise<SuggestionSettings> {
       warnedSettingsUnavailable = true;
       console.warn('[suggestions] instance settings unavailable — defaulting to builtin suggestions');
     }
-    return { suggestionSource: 'builtin', aiEndpoint: null, aiApiKey: null };
+    return { suggestionSource: 'builtin', suggestionModel: 'gpt-4o-mini', aiEndpoint: null, aiApiKey: null };
   }
 }
 
 // ---------------------------------------------------------------------------
 // AI step
 // ---------------------------------------------------------------------------
-
-const AI_MODEL = 'gpt-4o-mini';
 
 // Cache per (companyId, normalized payee). Resolved answers (including a valid
 // "no idea") are cached; transport errors are not, so a flaky endpoint retries.
@@ -193,7 +193,7 @@ async function aiSuggestion(
         ...(settings.aiApiKey ? { Authorization: `Bearer ${settings.aiApiKey}` } : {}),
       },
       body: JSON.stringify({
-        model: AI_MODEL,
+        model: settings.suggestionModel,
         temperature: 0,
         messages: [{ role: 'user', content: prompt }],
       }),
