@@ -12,6 +12,7 @@ const SETTING_KEYS = [
   'intuitClientSecret',
   'webhookVerifierToken',
   'suggestionSource',
+  'suggestionModel',
   'aiEndpoint',
   'aiApiKey',
   'smtpHost',
@@ -36,6 +37,7 @@ export interface InstanceSettings {
   intuitClientSecret: string;
   webhookVerifierToken: string;
   suggestionSource: SuggestionSetting;
+  suggestionModel: string;
   aiEndpoint: string;
   aiApiKey: string;
   smtpHost: string;
@@ -52,6 +54,7 @@ export interface InstanceSettingsPatch {
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
   suggestionSource?: SuggestionSetting;
+  suggestionModel?: string;
   aiEndpoint?: string;
   aiApiKey?: string;
   smtpHost?: string;
@@ -99,6 +102,10 @@ export async function getInstanceSettings(): Promise<InstanceSettings> {
     webhookVerifierToken:
       env.QBO_WEBHOOK_VERIFIER_TOKEN !== '' ? env.QBO_WEBHOOK_VERIFIER_TOKEN : (stored.webhookVerifierToken ?? ''),
     suggestionSource: normalizeSuggestionSource(stored.suggestionSource),
+    suggestionModel:
+      env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
+        ? env.SUGGESTION_MODEL
+        : (stored.suggestionModel || 'gpt-4o-mini'),
     aiEndpoint: stored.aiEndpoint ?? '',
     aiApiKey: stored.aiApiKey ?? '',
     smtpHost: smtpFromEnv ? env.SMTP_HOST : (stored.smtpHost ?? ''),
@@ -128,6 +135,7 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
     redirectUri,
     webhookVerifierTokenSet: settings.webhookVerifierToken !== '',
     suggestionSource: settings.suggestionSource,
+    suggestionModel: settings.suggestionModel,
     aiEndpoint: settings.aiEndpoint !== '' ? settings.aiEndpoint : null,
     aiKeySet: settings.aiApiKey !== '',
     needsSetup: adminCount === 0,

@@ -26,6 +26,7 @@ const settingsPatchBody = z.object({
   intuitClientSecret: z.string().optional(),
   webhookVerifierToken: z.string().optional(),
   suggestionSource: z.enum(['builtin', 'ai', 'off']).optional(),
+  suggestionModel: z.string().trim().min(1).optional(),
   aiEndpoint: z.string().nullable().optional(),
   // The client contract (api.ts) sends `aiKey`; `aiApiKey` accepted too.
   aiKey: z.string().optional(),
@@ -57,6 +58,7 @@ instanceRouter.patch(
       ...(body.intuitClientSecret !== undefined ? { intuitClientSecret: body.intuitClientSecret } : {}),
       ...(body.webhookVerifierToken !== undefined ? { webhookVerifierToken: body.webhookVerifierToken } : {}),
       ...(body.suggestionSource !== undefined ? { suggestionSource: body.suggestionSource } : {}),
+      ...(body.suggestionModel !== undefined ? { suggestionModel: body.suggestionModel } : {}),
       ...(body.aiEndpoint !== undefined ? { aiEndpoint: body.aiEndpoint ?? '' } : {}),
       ...(aiApiKey !== undefined ? { aiApiKey } : {}),
       ...(body.smtpHost !== undefined ? { smtpHost: body.smtpHost } : {}),
