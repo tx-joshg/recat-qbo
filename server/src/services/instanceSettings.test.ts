@@ -124,3 +124,34 @@ describe('suggestion model setting precedence', () => {
     await expect(getInstanceSettings()).resolves.toMatchObject({ suggestionModel: 'gpt-4o-mini' });
   });
 });
+
+describe('Codex provider settings', () => {
+  it('accepts Codex as a provider and defaults its separate model exactly', async () => {
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionProvider', value: 'codex', encrypted: false },
+      { key: 'suggestionModel', value: 'custom-model', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionProvider: 'codex',
+      suggestionModel: 'custom-model',
+      codexModel: 'gpt-5.6-luna',
+    });
+  });
+
+  it('stores Codex model plaintext and returns it in the masked settings DTO', async () => {
+    await updateInstanceSettings({ codexModel: 'gpt-5.6-test' });
+
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { key: 'codexModel' },
+        create: expect.objectContaining({ value: 'gpt-5.6-test', encrypted: false }),
+      }),
+    );
+
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'codexModel', value: 'gpt-5.6-test', encrypted: false },
+    ]);
+    await expect(getInstanceSettingsDto()).resolves.toMatchObject({ codexModel: 'gpt-5.6-test' });
+  });
+});

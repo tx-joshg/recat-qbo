@@ -8,6 +8,9 @@ import type {
   AuditEntryDto,
   CategorizeBody,
   CompanyDto,
+  CodexDevicePollDto,
+  CodexDeviceStartDto,
+  CodexStatusDto,
   ConnectMode,
   CompanyPatchBody,
   CustomReportDto,
@@ -28,6 +31,7 @@ import type {
   TransactionLogDto,
   StatementDto,
   SuggestionSetting,
+  SuggestionProvider,
   SyncMode,
   TagDto,
   TeamMemberDto,
@@ -77,7 +81,7 @@ export const api = {
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
-  del: <T>(path: string) => request<T>('DELETE', path),
+  del: <T>(path: string, body?: unknown) => request<T>('DELETE', path, body),
 };
 
 type QueryValue = string | number | boolean | readonly string[] | undefined;
@@ -153,8 +157,9 @@ export interface InstanceSettingsPatchBody {
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
   suggestionSource?: SuggestionSetting;
-  suggestionProvider?: 'custom' | 'openrouter';
+  suggestionProvider?: SuggestionProvider;
   suggestionModel?: string;
+  codexModel?: string;
   aiEndpoint?: string | null;
   aiKey?: string;
   aiApiKey?: string;
@@ -348,6 +353,19 @@ export const instanceSettings = {
   /** Send a test email via the current SMTP config; defaults to the caller's address. */
   testEmail: (to?: string) =>
     api.post<TestEmailResponse>('/api/instance/settings/test-email', to !== undefined ? { to } : {}),
+};
+
+/** Instance-admin ChatGPT subscription/device authorization endpoints. */
+export const codex = {
+  start: () => api.post<CodexDeviceStartDto>('/api/instance/ai/codex/device'),
+  poll: (flowId: string) =>
+    api.post<CodexDevicePollDto>('/api/instance/ai/codex/device/poll', { flowId }),
+  cancel: (flowId: string) =>
+    api.del<CodexDevicePollDto>('/api/instance/ai/codex/device', { flowId }),
+  status: () => api.get<CodexStatusDto>('/api/instance/ai/codex/status'),
+  disconnect: () =>
+    api.del<{ status: 'disconnected' }>('/api/instance/ai/codex'),
+  test: () => api.post<{ ok: true }>('/api/instance/ai/codex/test'),
 };
 
 /** Instance-level user management — instance admins only. */

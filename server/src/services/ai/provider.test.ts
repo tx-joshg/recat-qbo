@@ -3,11 +3,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getInstanceSettings: vi.fn(),
   fetch: vi.fn(),
+  getCodexAccess: vi.fn(),
+  markCodexReconnectRequired: vi.fn(),
+  completeCodexText: vi.fn(),
 }));
 
 vi.mock('../instanceSettings.js', () => ({ getInstanceSettings: mocks.getInstanceSettings }));
+vi.mock('./codexAuth.js', () => ({
+  getCodexAccess: mocks.getCodexAccess,
+  markCodexReconnectRequired: mocks.markCodexReconnectRequired,
+}));
+vi.mock('./codexResponses.js', () => ({ completeCodexText: mocks.completeCodexText }));
 
-import { completeCategory } from './provider.js';
+import { completeCategory, testCodexConnection } from './provider.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -20,11 +28,15 @@ beforeEach(() => {
     openrouterApiKey: '',
     openrouterReferer: '',
     openrouterTitle: '',
+    codexModel: 'gpt-5.6-luna',
   });
   mocks.fetch.mockResolvedValue({
     ok: true,
     json: async () => ({ choices: [{ message: { content: '  Office supplies  ' } }] }),
   });
+  mocks.getCodexAccess.mockResolvedValue({ accessToken: 'codex-access', accountId: 'acct_123' });
+  mocks.completeCodexText.mockResolvedValue('  Office supplies  ');
+  mocks.markCodexReconnectRequired.mockResolvedValue(undefined);
 });
 
 describe('completeCategory', () => {
@@ -100,5 +112,99 @@ describe('completeCategory', () => {
     else mocks.fetch.mockResolvedValueOnce(value);
 
     await expect(completeCategory('choose one')).resolves.toBeNull();
+  });
+
+  it('dispatches Codex with its separate model and subscription credentials', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionProvider: 'codex',
+      suggestionModel: 'custom-model',
+      codexModel: 'gpt-5.6-luna',
+      aiEndpoint: 'https://ignored.example/v1',
+      aiApiKey: 'ignored-key',
+      openrouterApiKey: 'ignored-router-key',
+      openrouterReferer: '',
+      openrouterTitle: '',
+    });
+
+    await expect(completeCategory('choose one')).resolves.toBe('Office supplies');
+
+    expect(mocks.getCodexAccess).toHaveBeenCalledTimes(1);
+    expect(mocks.completeCodexText).toHaveBeenCalledWith({
+      accessToken: 'codex-access',
+      accountId: 'acct_123',
+      model: 'gpt-5.6-luna',
+      messages: [{ role: 'user', content: 'choose one' }],
+    });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('force-refreshes and retries Codex exactly once after an inference 401', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionProvider: 'codex',
+      codexModel: 'gpt-5.6-luna',
+    });
+    const unauthorized = Object.assign(new Error('rejected token'), { status: 401 });
+    mocks.getCodexAccess
+      .mockResolvedValueOnce({ accessToken: 'stale', accountId: 'acct_123' })
+      .mockResolvedValueOnce({ accessToken: 'fresh', accountId: 'acct_123' });
+    mocks.completeCodexText.mockRejectedValueOnce(unauthorized).mockResolvedValueOnce('Meals');
+
+    await expect(completeCategory('choose one')).resolves.toBe('Meals');
+
+    expect(mocks.getCodexAccess).toHaveBeenNthCalledWith(1);
+    expect(mocks.getCodexAccess).toHaveBeenNthCalledWith(2, {
+      forceRefresh: { failedAccessToken: 'stale' },
+    });
+    expect(mocks.completeCodexText).toHaveBeenCalledTimes(2);
+    expect(mocks.completeCodexText.mock.calls[1]?.[0]).toMatchObject({ accessToken: 'fresh' });
+    expect(mocks.markCodexReconnectRequired).not.toHaveBeenCalled();
+  });
+
+  it('marks reconnect required and returns null after a second Codex 401', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionProvider: 'codex',
+      codexModel: 'gpt-5.6-luna',
+    });
+    const unauthorized = Object.assign(new Error('rejected token'), { status: 401 });
+    mocks.completeCodexText.mockRejectedValue(unauthorized);
+
+    await expect(completeCategory('choose one')).resolves.toBeNull();
+
+    expect(mocks.completeCodexText).toHaveBeenCalledTimes(2);
+    expect(mocks.markCodexReconnectRequired).toHaveBeenCalledWith({
+      failedAccessToken: 'codex-access',
+      failureCode: 'inference_unauthorized',
+    });
+  });
+
+  it.each([
+    ['credential failure', () => mocks.getCodexAccess.mockRejectedValueOnce(new Error('not connected'))],
+    ['transport failure', () => mocks.completeCodexText.mockRejectedValueOnce(new Error('network'))],
+    ['empty result', () => mocks.completeCodexText.mockResolvedValueOnce('')],
+  ])('returns null without falling back when Codex has a %s', async (_label, arrange) => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionProvider: 'codex',
+      codexModel: 'gpt-5.6-luna',
+    });
+    arrange();
+
+    await expect(completeCategory('choose one')).resolves.toBeNull();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('tests Codex with a fixed non-financial prompt through the same credential path', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionProvider: 'codex',
+      codexModel: 'gpt-5.6-luna',
+    });
+    mocks.completeCodexText.mockResolvedValueOnce('ok');
+
+    await expect(testCodexConnection()).resolves.toEqual({ ok: true });
+    expect(mocks.completeCodexText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: 'gpt-5.6-luna',
+        messages: [{ role: 'user', content: 'Reply with only the word "ok".' }],
+      }),
+    );
   });
 });

@@ -1,13 +1,54 @@
 import { getInstanceSettings } from '../instanceSettings.js';
+import {
+  getCodexAccess,
+  markCodexReconnectRequired,
+} from './codexAuth.js';
+import { completeCodexText } from './codexResponses.js';
 
 interface ChatCompletionResponse {
   choices?: { message?: { content?: string } }[];
+}
+
+async function completeWithCodex(prompt: string, model: string): Promise<string> {
+  let credentials = await getCodexAccess();
+  try {
+    return await completeCodexText({
+      ...credentials,
+      model,
+      messages: [{ role: 'user', content: prompt }],
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || !('status' in error) || error.status !== 401) throw error;
+  }
+
+  credentials = await getCodexAccess({
+    forceRefresh: { failedAccessToken: credentials.accessToken },
+  });
+  try {
+    return await completeCodexText({
+      ...credentials,
+      model,
+      messages: [{ role: 'user', content: prompt }],
+    });
+  } catch (error) {
+    if (error instanceof Error && 'status' in error && error.status === 401) {
+      await markCodexReconnectRequired({
+        failedAccessToken: credentials.accessToken,
+        failureCode: 'inference_unauthorized',
+      });
+    }
+    throw error;
+  }
 }
 
 /** Complete the category-only prompt using the active configured provider. */
 export async function completeCategory(prompt: string): Promise<string | null> {
   try {
     const settings = await getInstanceSettings();
+    if (settings.suggestionProvider === 'codex') {
+      const content = await completeWithCodex(prompt, settings.codexModel);
+      return content.trim() || null;
+    }
     const openrouter = settings.suggestionProvider === 'openrouter';
     const baseUrl = openrouter ? 'https://openrouter.ai/api/v1' : settings.aiEndpoint;
     if (baseUrl === '') return null;
@@ -35,4 +76,11 @@ export async function completeCategory(prompt: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** Admin-only route helper: fixed prompt contains no company or transaction data. */
+export async function testCodexConnection(): Promise<{ ok: true }> {
+  const settings = await getInstanceSettings();
+  await completeWithCodex('Reply with only the word "ok".', settings.codexModel);
+  return { ok: true };
 }

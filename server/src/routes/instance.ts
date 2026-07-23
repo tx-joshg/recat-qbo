@@ -26,8 +26,9 @@ const settingsPatchBody = z.object({
   intuitClientSecret: z.string().optional(),
   webhookVerifierToken: z.string().optional(),
   suggestionSource: z.enum(['builtin', 'ai', 'off']).optional(),
-  suggestionProvider: z.enum(['custom', 'openrouter']).optional(),
+  suggestionProvider: z.enum(['custom', 'openrouter', 'codex']).optional(),
   suggestionModel: z.string().trim().min(1).optional(),
+  codexModel: z.string().trim().min(1).optional(),
   aiEndpoint: z.string().nullable().optional(),
   // The client contract (api.ts) sends `aiKey`; `aiApiKey` accepted too.
   aiKey: z.string().optional(),
@@ -64,6 +65,7 @@ instanceRouter.patch(
       ...(body.suggestionSource !== undefined ? { suggestionSource: body.suggestionSource } : {}),
       ...(body.suggestionProvider !== undefined ? { suggestionProvider: body.suggestionProvider } : {}),
       ...(body.suggestionModel !== undefined ? { suggestionModel: body.suggestionModel } : {}),
+      ...(body.codexModel !== undefined ? { codexModel: body.codexModel } : {}),
       ...(body.aiEndpoint !== undefined ? { aiEndpoint: body.aiEndpoint ?? '' } : {}),
       ...(aiApiKey !== undefined ? { aiApiKey } : {}),
       ...(body.openrouterApiKey !== undefined ? { openrouterApiKey: body.openrouterApiKey } : {}),

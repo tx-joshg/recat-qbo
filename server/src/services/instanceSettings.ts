@@ -14,6 +14,7 @@ const SETTING_KEYS = [
   'suggestionSource',
   'suggestionProvider',
   'suggestionModel',
+  'codexModel',
   'aiEndpoint',
   'aiApiKey',
   'openrouterApiKey',
@@ -44,6 +45,7 @@ export interface InstanceSettings {
   suggestionSource: SuggestionSetting;
   suggestionProvider: SuggestionProvider;
   suggestionModel: string;
+  codexModel: string;
   aiEndpoint: string;
   aiApiKey: string;
   openrouterApiKey: string;
@@ -65,6 +67,7 @@ export interface InstanceSettingsPatch {
   suggestionSource?: SuggestionSetting;
   suggestionProvider?: SuggestionProvider;
   suggestionModel?: string;
+  codexModel?: string;
   aiEndpoint?: string;
   aiApiKey?: string;
   openrouterApiKey?: string;
@@ -98,7 +101,7 @@ function normalizeSuggestionSource(v: string | undefined): SuggestionSetting {
 }
 
 function normalizeSuggestionProvider(v: string | undefined): SuggestionProvider {
-  return v === 'openrouter' ? 'openrouter' : 'custom';
+  return v === 'openrouter' || v === 'codex' ? v : 'custom';
 }
 
 function normalizeSmtpPort(v: string | undefined): number {
@@ -127,6 +130,7 @@ export async function getInstanceSettings(): Promise<InstanceSettings> {
       env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
         ? env.SUGGESTION_MODEL
         : (stored.suggestionModel || 'gpt-4o-mini'),
+    codexModel: stored.codexModel || 'gpt-5.6-luna',
     aiEndpoint: stored.aiEndpoint ?? '',
     aiApiKey: stored.aiApiKey ?? '',
     openrouterApiKey:
@@ -170,6 +174,7 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
     suggestionSource: settings.suggestionSource,
     suggestionProvider: settings.suggestionProvider,
     suggestionModel: settings.suggestionModel,
+    codexModel: settings.codexModel,
     aiEndpoint: settings.aiEndpoint !== '' ? settings.aiEndpoint : null,
     aiKeySet: settings.aiApiKey !== '',
     openrouterKeySet: settings.openrouterApiKey !== '',
