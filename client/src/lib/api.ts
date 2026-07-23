@@ -6,6 +6,7 @@
 
 import type {
   AuditEntryDto,
+  AuthMethodsDto,
   CategorizeBody,
   CompanyDto,
   ConnectMode,
@@ -206,8 +207,11 @@ export interface ConnectUrlParams {
 // ---------------------------------------------------------------------------
 
 export const auth = {
+  methods: () => api.get<AuthMethodsDto>('/auth/methods'),
   /** Always 200 — no user enumeration. */
   magicLink: (email: string) => api.post<void>('/auth/magic-link', { email }),
+  local: (email: string, password: string) =>
+    api.post<SessionDto>('/auth/local', { email, password }),
   logout: () => api.post<void>('/auth/logout'),
   /** 401 (→ ApiError) when signed out. */
   session: () => api.get<SessionDto>('/api/session'),

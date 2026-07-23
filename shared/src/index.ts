@@ -250,6 +250,10 @@ export interface SessionDto {
   user: UserDto;
 }
 
+export interface AuthMethodsDto {
+  localAdmin: boolean;
+}
+
 // ---- Report payloads ----
 
 export interface StatementCell {

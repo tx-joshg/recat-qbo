@@ -17,11 +17,13 @@ export function magicLinkUrl(token: string): string {
 export interface IssueMagicLinkOptions {
   /** Invite email wording instead of plain sign-in wording. */
   invite?: boolean;
+  /** Set false for trusted operator flows that must not depend on SMTP. */
+  deliver?: boolean;
 }
 
 /**
- * Create a single-use magic-link token for the user and email it.
- * Returns the link so dev mode (no SMTP) can hand it back to the UI.
+ * Create a single-use magic-link token and, by default, email it to the user.
+ * Trusted operator flows can disable delivery and print the returned link.
  */
 export async function issueMagicLink(
   user: Pick<User, 'id' | 'email'>,
@@ -40,11 +42,13 @@ export async function issueMagicLink(
   const intro = options.invite
     ? "You've been invited to Recat. Open this link to sign in:"
     : 'Open this link to sign in to Recat:';
-  await sendMail({
-    to: user.email,
-    subject,
-    text: `${intro}\n\n${link}\n\nThis link expires in 15 minutes. If you didn't request it, you can ignore this email.`,
-  });
+  if (options.deliver !== false) {
+    await sendMail({
+      to: user.email,
+      subject,
+      text: `${intro}\n\n${link}\n\nThis link expires in 15 minutes. If you didn't request it, you can ignore this email.`,
+    });
+  }
   return { link };
 }
 

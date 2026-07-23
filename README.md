@@ -65,7 +65,7 @@ One click provisions the app + PostgreSQL with generated secrets. The setup wiza
 - Any color, unlimited tags per transaction (or per split line), fully reportable
 
 **Team & roles**
-- Magic-link sign-in — no passwords stored, ever
+- Ordinary users sign in with passwordless magic links by default — optional local-admin access uses a deployment-managed credential that Recat never stores in its database
 - **Per-company roles**: a user can be admin of one company and viewer of another
   | Capability | Viewer | Categorizer | Admin |
   |---|:-:|:-:|:-:|
@@ -106,6 +106,46 @@ open http://localhost:3001  # first-run setup wizard takes it from here
 
 The wizard walks you through everything: how you want to start (demo or real) → admin account → Intuit keys (real path only) → email (SMTP, skippable) → connect QuickBooks → pick holding accounts → first sync. For the real path you'll need free QuickBooks API credentials from the [Intuit Developer Portal](https://developer.intuit.com) — **[docs/intuit-setup.md](docs/intuit-setup.md) walks you through it step by step**, including the production-access questionnaire.
 
+### Recover access without SMTP
+
+If email delivery is unavailable, an operator with shell access can print a
+fresh, single-use sign-in link for any existing Recat user:
+
+```bash
+docker compose exec app npm run login-link -- admin@example.com
+```
+
+The link expires in 15 minutes and can be used only once. It is created by the
+same token service as emailed links. For a container named
+`recat-qbo_web_1`, the equivalent command is:
+
+```bash
+sudo docker exec recat-qbo_web_1 npm run login-link -- vladimir@wanver.shop
+```
+
+For Umbrel and other LAN deployments, you can also enable a conventional local
+administrator login:
+
+```dotenv
+LOCAL_ADMIN_EMAIL=admin@example.com
+LOCAL_ADMIN_PASSWORD=a-long-random-password
+```
+
+Both values are required. The email must already be an instance administrator,
+and the password must contain at least 12 characters. Umbrel packages should
+use their generated `${APP_PASSWORD}` value. Recat does not store this password
+in its database.
+
+If Recat sits behind a reverse proxy, set `TRUSTED_PROXY_IPS` to a
+comma-separated list of the exact immediate proxy peer IPs. It defaults to
+empty, trusting none; direct or untrusted requests ignore `X-Forwarded-For`.
+An Umbrel or other reverse-proxy package should set its immediate app-proxy IP
+so forwarded clients retain separate local-admin rate-limit buckets.
+
+`ALLOW_DEV_LOGIN=true` remains available unchanged for development. It is not a
+recovery substitute: it returns magic links in API responses for every user,
+whereas local-admin login is limited to one configured instance administrator.
+
 ### Try it without QuickBooks (the demo)
 
 Pick **"Try the demo"** on the setup wizard's first step — on any deployment, no env var required. Recat connects a built-in fake QuickBooks with two sample companies and the full loop works (sync, categorize, post, undo, splits, transfers, reports, dashboard) without an Intuit account. Magic links appear as a one-click button while only demo companies are connected and SMTP isn't configured.
@@ -121,7 +161,7 @@ npm install
 createdb recat && npx prisma migrate dev
 npm run seed                # demo data (QBO_MOCK=true)
 npm run dev                 # server :3001 + client :5173
-npm test                    # server unit tests
+npm test                    # full server + client test suite
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules.
@@ -140,6 +180,8 @@ Everything can be configured in the UI (setup wizard / Settings). Env vars are o
 | `QBO_ENVIRONMENT` | `sandbox` or `production` |
 | `QBO_MOCK` | Local dev only: enables the demo seed. The wizard offers demo companies on every deployment without it |
 | `SMTP_HOST/PORT/USER/PASS/FROM` | Magic-link + digest email (or configure in the wizard/Settings) |
+| `LOCAL_ADMIN_EMAIL` / `LOCAL_ADMIN_PASSWORD` | Optional local login for one existing instance administrator; set both, with a random password of at least 12 characters. Umbrel maps its generated `${APP_PASSWORD}` to `LOCAL_ADMIN_PASSWORD` |
+| `TRUSTED_PROXY_IPS` | Optional comma-separated exact immediate reverse-proxy peer IPs. Empty (the default) trusts none and ignores `X-Forwarded-For` from direct or untrusted peers |
 | `SLACK_WEBHOOK_URL` | Optional digest notifications to Slack |
 | `DRY_RUN` | `true` = never write to QuickBooks, log payloads instead |
 

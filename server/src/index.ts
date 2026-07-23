@@ -9,7 +9,9 @@ import { env, isProd } from './env.js';
 import { errorMiddleware } from './lib/http.js';
 import { originCheck } from './middleware/auth.js';
 import { startJobs } from './jobs/scheduler.js';
+import { compileTrustedProxy } from './services/trustedProxy.js';
 import { authRouter } from './routes/auth.js';
+import { localAuthRouter } from './routes/localAuth.js';
 import { legalRouter } from './routes/legal.js';
 import { auditRouter } from './routes/audit.js';
 import { companiesRouter } from './routes/companies.js';
@@ -28,7 +30,7 @@ import { usersRouter } from './routes/users.js';
 import { webhooksRouter } from './routes/webhooks.js';
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', compileTrustedProxy(env.TRUSTED_PROXY_IPS));
 app.disable('x-powered-by');
 
 app.use(cookieParser());
@@ -42,6 +44,7 @@ app.use(originCheck);
 
 // Root-mounted routers (absolute paths inside).
 app.use(legalRouter); // /eula, /privacy — public pages for Intuit's app requirements
+app.use(localAuthRouter); // /auth/methods, /auth/local
 app.use(authRouter); // /auth/magic-link, /auth/callback, /auth/logout, /api/session
 app.use(qboOauthRouter); // /auth/qbo/callback, /auth/qbo/mock-consent
 

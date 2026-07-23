@@ -11,8 +11,9 @@
   ],
   "scripts": {
     "dev": "concurrently -n server,client -c green,blue \"npm run dev -w server\" \"npm run dev -w client\"",
+    "login-link": "node server/dist/cli/loginLink.js",
     "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
-    "test": "npm run test -w server",
+    "test": "npm run test -w server && npm run test -w client",
     "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
