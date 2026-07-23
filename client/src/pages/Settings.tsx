@@ -258,7 +258,7 @@ export default function Settings() {
 
           {/* suggestions */}
           {settings && (
-            <SuggestionsCard key={settings.suggestionSource} settings={settings} onSettings={setSettings} />
+            <SuggestionsCard key={`${settings.suggestionSource}-${settings.suggestionProvider}`} settings={settings} onSettings={setSettings} />
           )}
 
           {/* team (admin) */}

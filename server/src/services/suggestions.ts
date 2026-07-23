@@ -10,6 +10,7 @@
 import { Prisma } from '@prisma/client';
 import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
+import { completeCategory } from './ai/provider.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -108,9 +109,6 @@ export function pickSuggestion(
 
 interface SuggestionSettings {
   suggestionSource: SuggestionSetting;
-  suggestionModel: string;
-  aiEndpoint: string | null;
-  aiApiKey: string | null;
 }
 
 let warnedSettingsUnavailable = false;
@@ -121,16 +119,13 @@ async function loadSettings(): Promise<SuggestionSettings> {
     const s = await getInstanceSettings();
     return {
       suggestionSource: (s.suggestionSource || 'builtin') as SuggestionSetting,
-      suggestionModel: s.suggestionModel || 'gpt-4o-mini',
-      aiEndpoint: s.aiEndpoint || null,
-      aiApiKey: s.aiApiKey || null,
     };
   } catch {
     if (!warnedSettingsUnavailable) {
       warnedSettingsUnavailable = true;
       console.warn('[suggestions] instance settings unavailable — defaulting to builtin suggestions');
     }
-    return { suggestionSource: 'builtin', suggestionModel: 'gpt-4o-mini', aiEndpoint: null, aiApiKey: null };
+    return { suggestionSource: 'builtin' };
   }
 }
 
@@ -141,10 +136,6 @@ async function loadSettings(): Promise<SuggestionSettings> {
 // Cache per (companyId, normalized payee). Resolved answers (including a valid
 // "no idea") are cached; transport errors are not, so a flaky endpoint retries.
 const aiCache = new Map<string, SuggestionDto | null>();
-
-interface ChatCompletionResponse {
-  choices?: { message?: { content?: string } }[];
-}
 
 interface CategoryOption {
   qboId: string;
@@ -164,9 +155,7 @@ async function categoryOptions(companyId: string): Promise<CategoryOption[]> {
 async function aiSuggestion(
   companyId: string,
   txn: { payee: string; memo?: string | null; amount: number },
-  settings: SuggestionSettings,
 ): Promise<SuggestionDto | null> {
-  if (!settings.aiEndpoint) return null;
   const cacheKey = `${companyId}|${normalizePayee(txn.payee)}`;
   if (aiCache.has(cacheKey)) return aiCache.get(cacheKey) ?? null;
 
@@ -185,33 +174,15 @@ async function aiSuggestion(
     ...options.map((o) => `- ${o.name}`),
   ].join('\n');
 
-  try {
-    const res = await fetch(`${settings.aiEndpoint.replace(/\/+$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(settings.aiApiKey ? { Authorization: `Bearer ${settings.aiApiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: settings.suggestionModel,
-        temperature: 0,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as ChatCompletionResponse;
-    const answer = body.choices?.[0]?.message?.content?.trim() ?? '';
-    // Only accept an exact (case-insensitive) category name — anything else is
-    // a hallucination and must not reach the queue.
-    const hit = options.find((o) => o.name.toLowerCase() === answer.toLowerCase());
-    const result: SuggestionDto | null = hit
-      ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
-      : null;
-    aiCache.set(cacheKey, result);
-    return result;
-  } catch {
-    return null; // endpoint unreachable — no suggestion, no cache
-  }
+  const answer = await completeCategory(prompt);
+  // Only accept an exact (case-insensitive) category name — anything else is
+  // a hallucination and must not reach the queue.
+  const hit = options.find((o) => o.name.toLowerCase() === answer?.toLowerCase());
+  const result: SuggestionDto | null = hit
+    ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
+    : null;
+  if (answer !== null) aiCache.set(cacheKey, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +219,7 @@ export async function suggestFor(
   const history = historyEnabled ? await loadHistory(companyId) : [];
   const picked = pickSuggestion(txn.payee, rules, history, historyEnabled);
   if (picked) return picked;
-  if (settings.suggestionSource === 'ai') return aiSuggestion(companyId, txn, settings);
+  if (settings.suggestionSource === 'ai') return aiSuggestion(companyId, txn);
   return null;
 }
 
@@ -283,7 +254,7 @@ export async function refreshSuggestions(companyId: string): Promise<void> {
     const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
     let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
     if (!suggestion && settings.suggestionSource === 'ai') {
-      suggestion = await aiSuggestion(companyId, input, settings);
+      suggestion = await aiSuggestion(companyId, input);
     }
     const current = JSON.stringify(t.suggestion ?? null);
     const next = JSON.stringify(suggestion);

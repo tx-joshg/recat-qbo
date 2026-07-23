@@ -2,13 +2,30 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   suggestionModel: '',
-  appConfig: { findMany: vi.fn() },
+  suggestionProvider: '',
+  openrouterApiKey: '',
+  openrouterReferer: '',
+  openrouterTitle: '',
+  appConfig: { findMany: vi.fn(), upsert: vi.fn() },
+  user: { count: vi.fn() },
 }));
 
 vi.mock('../env.js', () => ({
   env: {
     get SUGGESTION_MODEL() {
       return mocks.suggestionModel;
+    },
+    get SUGGESTION_PROVIDER() {
+      return mocks.suggestionProvider;
+    },
+    get OPENROUTER_API_KEY() {
+      return mocks.openrouterApiKey;
+    },
+    get OPENROUTER_REFERER() {
+      return mocks.openrouterReferer;
+    },
+    get OPENROUTER_TITLE() {
+      return mocks.openrouterTitle;
     },
     QBO_CLIENT_ID: '',
     QBO_CLIENT_SECRET: '',
@@ -23,14 +40,66 @@ vi.mock('../env.js', () => ({
   redirectUri: 'http://localhost:5173/auth/qbo/callback',
 }));
 
-vi.mock('../lib/prisma.js', () => ({ prisma: { appConfig: mocks.appConfig } }));
+vi.mock('../lib/prisma.js', () => ({ prisma: { appConfig: mocks.appConfig, user: mocks.user } }));
 
-import { getInstanceSettings } from './instanceSettings.js';
+import { getInstanceSettings, getInstanceSettingsDto, updateInstanceSettings } from './instanceSettings.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.suggestionModel = '';
+  mocks.suggestionProvider = '';
+  mocks.openrouterApiKey = '';
+  mocks.openrouterReferer = '';
+  mocks.openrouterTitle = '';
   mocks.appConfig.findMany.mockResolvedValue([]);
+  mocks.appConfig.upsert.mockResolvedValue({});
+  mocks.user.count.mockResolvedValue(1);
+});
+
+describe('OpenRouter provider settings', () => {
+  it('uses the OpenRouter environment overrides and normalizes an invalid provider to custom', async () => {
+    mocks.suggestionProvider = 'not-a-provider';
+    mocks.openrouterApiKey = 'environment-router-key';
+    mocks.openrouterReferer = 'https://recat.example';
+    mocks.openrouterTitle = 'Recat QBO';
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionProvider: 'custom',
+      openrouterApiKey: 'environment-router-key',
+      openrouterReferer: 'https://recat.example',
+      openrouterTitle: 'Recat QBO',
+    });
+  });
+
+  it('stores OpenRouter secrets encrypted, masks them in the DTO, and leaves custom keys untouched on provider switches', async () => {
+    await updateInstanceSettings({
+      aiApiKey: 'custom-secret',
+      openrouterApiKey: 'openrouter-secret',
+    });
+
+    const keyWrites = mocks.appConfig.upsert.mock.calls.map(([args]) => args);
+    expect(keyWrites).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ where: { key: 'aiApiKey' }, create: expect.objectContaining({ encrypted: true }) }),
+        expect.objectContaining({
+          where: { key: 'openrouterApiKey' },
+          create: expect.objectContaining({ encrypted: true, value: expect.not.stringContaining('openrouter-secret') }),
+        }),
+      ]),
+    );
+
+    mocks.appConfig.upsert.mockClear();
+    await updateInstanceSettings({ suggestionProvider: 'openrouter' });
+    expect(mocks.appConfig.upsert).toHaveBeenCalledTimes(1);
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith(expect.objectContaining({ where: { key: 'suggestionProvider' } }));
+
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'openrouterApiKey', value: 'plain-test-secret', encrypted: false },
+    ]);
+    await expect(getInstanceSettingsDto()).resolves.toMatchObject({ openrouterKeySet: true });
+    const dto = await getInstanceSettingsDto();
+    expect(dto).not.toHaveProperty('openrouterApiKey');
+  });
 });
 
 describe('suggestion model setting precedence', () => {

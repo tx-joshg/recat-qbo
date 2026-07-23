@@ -153,9 +153,14 @@ export interface InstanceSettingsPatchBody {
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
   suggestionSource?: SuggestionSetting;
+  suggestionProvider?: 'custom' | 'openrouter';
   suggestionModel?: string;
   aiEndpoint?: string | null;
   aiKey?: string;
+  aiApiKey?: string;
+  openrouterApiKey?: string;
+  openrouterReferer?: string;
+  openrouterTitle?: string;
   smtpHost?: string;
   smtpPort?: number;
   smtpUser?: string;

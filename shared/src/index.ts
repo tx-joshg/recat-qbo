@@ -31,6 +31,7 @@ export type QboEnv = 'sandbox' | 'production';
 export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
+export type SuggestionProvider = 'custom' | 'openrouter';
 export type AuditAction =
   | 'posted'
   | 'dry-run'
@@ -234,9 +235,13 @@ export interface InstanceSettingsDto {
   redirectUri: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
+  suggestionProvider: SuggestionProvider;
   suggestionModel: string;
   aiEndpoint: string | null;
   aiKeySet: boolean;
+  openrouterKeySet: boolean;
+  openrouterReferer: string;
+  openrouterTitle: string;
   needsSetup: boolean; // true until an admin user exists
   smtpHost: string;
   smtpPort: number;

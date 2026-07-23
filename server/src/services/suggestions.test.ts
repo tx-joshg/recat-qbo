@@ -170,7 +170,7 @@ describe('pickSuggestion precedence', () => {
 
 describe('AI suggestion model', () => {
   it('sends the configured model in the existing chat completion request', async () => {
-    mocks.getInstanceSettings.mockResolvedValueOnce({
+    mocks.getInstanceSettings.mockResolvedValue({
       suggestionSource: 'ai',
       aiEndpoint: 'https://models.example/v1',
       aiApiKey: 'test-key',
@@ -192,5 +192,47 @@ describe('AI suggestion model', () => {
     });
 
     expect(JSON.parse(mocks.fetch.mock.calls[0]?.[1]?.body as string)).toMatchObject({ model: 'gpt-4o-mini' });
+  });
+
+  it('uses the pinned OpenRouter endpoint and passes a vendor-qualified model through', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionSource: 'ai',
+      suggestionProvider: 'openrouter',
+      aiEndpoint: 'https://custom.example/v1',
+      aiApiKey: 'custom-key',
+      openrouterApiKey: 'openrouter-key',
+      openrouterReferer: 'https://recat.example',
+      openrouterTitle: 'Recat QBO',
+      suggestionModel: 'openai/gpt-4o-mini',
+    });
+
+    await expect(suggestFor('company-1', { payee: 'OPENROUTER DISPATCH', amount: -12.34 })).resolves.toMatchObject({
+      category: 'Office supplies',
+      source: 'ai',
+    });
+
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      'https://openrouter.ai/api/v1/chat/completions',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer openrouter-key',
+          'HTTP-Referer': 'https://recat.example',
+          'X-Title': 'Recat QBO',
+        }),
+        body: expect.stringContaining('openai/gpt-4o-mini'),
+      }),
+    );
+  });
+
+  it('caches a valid blank model answer as no suggestion', async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '   ' } }] }),
+    });
+
+    await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
+    await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
+
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
   });
 });
