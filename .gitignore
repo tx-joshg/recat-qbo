@@ -5,6 +5,7 @@ build/
 .env.local
 *.log
 .DS_Store
+.vscode/
 coverage/
 prisma/migrations/**/migration_lock.toml.bak
 
