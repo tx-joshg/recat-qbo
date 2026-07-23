@@ -6,6 +6,9 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getMockRealm, MockQboClient, MOCK_REALM_HARBOR, resetMockRealms } from './mock.js';
+import type { RawPurchase } from './real.js';
+import { canonicalHash, canonicalPurchaseAccountingState } from './purchaseTax.js';
+import { verifyPurchaseRestore, verifyPurchaseResult } from '../../services/tax/verify.js';
 
 const HOLDING_IDS = ['4', '5']; // Harbor: Ask My Accountant + Uncategorized Expense
 
@@ -27,6 +30,23 @@ beforeEach(() => {
 });
 
 describe('MockQboClient multi-line entity safety', () => {
+  it('provides purchase tax reference fixtures', async () => {
+    const c = client();
+    const [profile, codes, rates] = await Promise.all([c.getTaxProfile(), c.listTaxCodes(), c.listTaxRates()]);
+    expect(profile.usingSalesTax).toBe(true);
+    expect(codes.find((code) => code.name === 'Out of Scope')).toMatchObject({
+      active: true,
+      taxable: false,
+    });
+    expect(codes.find((code) => code.qboId === 'tax-sales-only')?.purchaseTaxRateList).toEqual([]);
+    expect(rates.find((rate) => rate.qboId === 'tax-rate-hst-13')?.rateValue).toBe(13);
+  });
+
+  it('provides a sales-tax-disabled demo company for needs_setup coverage', async () => {
+    const bluebird = new MockQboClient('4471889011230002', ['3']);
+    expect((await bluebird.getTaxProfile()).usingSalesTax).toBe(false);
+  });
+
   it('fetchTxn exposes only holding lines with amount = holding sum', async () => {
     addCategorizedLine();
     const txn = await client().fetchTxn('Purchase', '2');
@@ -92,5 +112,53 @@ describe('MockQboClient multi-line entity safety', () => {
     expect(sysco?.lines).toHaveLength(1);
     expect(sysco?.lines[0]?.accountQboId).toBe('10');
     expect(sysco?.amount).toBe(-50);
+  });
+
+  it('round-trips category and tax through a verified post and exact undo', async () => {
+    const c = client();
+    const realm = getMockRealm(MOCK_REALM_HARBOR);
+    const entity = realm.txns.find((txn) => txn.qboId === '2' && txn.qboType === 'Purchase');
+    if (!entity) throw new Error('seed txn missing');
+    entity.lines[0]!.taxCodeQboId = 'tax-out-of-scope';
+    entity.taxCalculation = 'NotApplicable';
+    entity.totalTax = 0;
+
+    const original = await c.fetchTxn('Purchase', '2');
+    if (!original) throw new Error('missing original');
+    const originalRaw = structuredClone(original.raw as RawPurchase);
+    const post = await c.prepareRecategorization(
+      original,
+      {
+        qboType: 'Purchase',
+        signedTransactionAmount: -486.12,
+        taxCalculation: 'TaxInclusive',
+        lines: [
+          {
+            grossAmount: -400,
+            accountQboId: '10',
+            tax: { taxCodeQboId: 'tax-gst-5', taxCodeName: 'GST 5%' },
+          },
+          {
+            grossAmount: -86.12,
+            accountQboId: '12',
+            tax: { taxCodeQboId: 'tax-out-of-scope', taxCodeName: 'Out of Scope' },
+          },
+        ],
+      },
+      'post-request',
+    );
+    await c.executePreparedWrite(post);
+    const posted = await c.fetchTxn('Purchase', '2');
+    if (!posted || post.operation !== 'recategorize') throw new Error('missing post');
+    expect(verifyPurchaseResult(post.expected, posted).ok).toBe(true);
+
+    const undo = await c.preparePurchaseRestore(posted, originalRaw, 'undo-request');
+    await c.executePreparedWrite(undo);
+    const restored = await c.fetchTxn('Purchase', '2');
+    if (!restored || undo.operation !== 'restore') throw new Error('missing restore');
+    expect(verifyPurchaseRestore(undo.expected, restored).ok).toBe(true);
+    expect(canonicalHash(canonicalPurchaseAccountingState(restored.raw as RawPurchase))).toBe(
+      canonicalHash(canonicalPurchaseAccountingState(originalRaw)),
+    );
   });
 });

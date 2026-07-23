@@ -56,6 +56,14 @@ export default function EmailCard({
   const [pass, setPass] = useState('');
   const [from, setFrom] = useState(settings.smtpHost !== '' ? settings.smtpFrom : '');
   const [busy, setBusy] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionState, setConnectionState] = useState<
+    'connected' | 'untested' | 'failed' | 'not-configured'
+  >(settings.smtpHost !== '' || envManaged ? 'untested' : 'not-configured');
+
+  const markUntested = (nextHost = host) => {
+    setConnectionState(nextHost.trim() === '' && !envManaged ? 'not-configured' : 'untested');
+  };
 
   // Fill host/port (and username only when the provider fixes it); never touch
   // the password or from address.
@@ -63,6 +71,7 @@ export default function EmailCard({
     setHost(p.host);
     setPort(String(p.port));
     if (p.username !== null) setUser(p.username);
+    markUntested(p.host);
   };
 
   const patchBody = (): Parameters<typeof instanceSettings.patch>[0] => {
@@ -92,6 +101,7 @@ export default function EmailCard({
         setUser(updated.smtpUser);
         setPass('');
         setFrom(updated.smtpHost !== '' ? updated.smtpFrom : '');
+        setConnectionState(updated.smtpHost !== '' || updated.smtpFromEnv ? 'untested' : 'not-configured');
         toast('Email settings saved');
       })
       .catch((err) => toast(errMsg(err)))
@@ -102,6 +112,7 @@ export default function EmailCard({
   const sendTest = () => {
     if (busy) return;
     setBusy(true);
+    setTestingConnection(true);
     const body = patchBody();
     const saved =
       envManaged || Object.keys(body).length === 0
@@ -113,16 +124,32 @@ export default function EmailCard({
           });
     saved
       .then(() => instanceSettings.testEmail())
-      .then((res) =>
+      .then((res) => {
+        setConnectionState(res.delivered ? 'connected' : 'not-configured');
         toast(
           res.delivered
             ? `Test email sent to ${res.to} — check the inbox`
             : 'SMTP not configured — the email was printed to the server log',
-        ),
-      )
-      .catch((err) => toast(errMsg(err)))
-      .finally(() => setBusy(false));
+        );
+      })
+      .catch((err) => {
+        setConnectionState('failed');
+        toast(errMsg(err));
+      })
+      .finally(() => {
+        setTestingConnection(false);
+        setBusy(false);
+      });
   };
+
+  const connectionStatus =
+    connectionState === 'connected'
+      ? { text: '✓ Connected', color: 'var(--okT)' }
+      : connectionState === 'failed'
+        ? { text: 'Connection failed', color: 'var(--erT)' }
+        : connectionState === 'untested'
+          ? { text: 'Not tested', color: 'var(--amT)' }
+          : { text: 'Not configured', color: 'var(--fnt)' };
 
   return (
     <div
@@ -158,51 +185,71 @@ export default function EmailCard({
             }}
           >
           <div>
-            <label style={fieldLabel}>SMTP host</label>
+            <label htmlFor="smtp-host" style={fieldLabel}>SMTP host</label>
             <input
+              id="smtp-host"
               className="input"
               value={host}
-              onChange={(e) => setHost(e.target.value)}
+              onChange={(e) => {
+                setHost(e.target.value);
+                markUntested(e.target.value);
+              }}
               placeholder="smtp.example.com"
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Port</label>
+            <label htmlFor="smtp-port" style={fieldLabel}>Port</label>
             <input
+              id="smtp-port"
               className="input"
               type="number"
               value={port}
-              onChange={(e) => setPort(e.target.value)}
+              onChange={(e) => {
+                setPort(e.target.value);
+                markUntested();
+              }}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Username</label>
+            <label htmlFor="smtp-user" style={fieldLabel}>Username</label>
             <input
+              id="smtp-user"
               className="input"
               value={user}
-              onChange={(e) => setUser(e.target.value)}
+              onChange={(e) => {
+                setUser(e.target.value);
+                markUntested();
+              }}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Password</label>
+            <label htmlFor="smtp-password" style={fieldLabel}>Password</label>
             <input
+              id="smtp-password"
               className="input"
               type="password"
               value={pass}
-              onChange={(e) => setPass(e.target.value)}
+              onChange={(e) => {
+                setPass(e.target.value);
+                markUntested();
+              }}
               placeholder={settings.smtpPassSet ? '••••••••' : ''}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>From address</label>
+            <label htmlFor="smtp-from" style={fieldLabel}>From address</label>
             <input
+              id="smtp-from"
               className="input"
               value={from}
-              onChange={(e) => setFrom(e.target.value)}
+              onChange={(e) => {
+                setFrom(e.target.value);
+                markUntested();
+              }}
               placeholder="Recat <noreply@yourdomain.com>"
               style={{ ...inputStyle, fontFamily: 'inherit' }}
             />
@@ -211,15 +258,43 @@ export default function EmailCard({
         </>
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
-        <HoverButton onClick={sendTest} style={ghostBtn} hoverStyle={{ background: 'var(--hl)' }}>
-          Send test email
-        </HoverButton>
-        {!envManaged && (
-          <HoverButton onClick={save} style={ghostBtn} hoverStyle={{ background: 'var(--hl)' }}>
-            Save changes
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 12,
+          marginTop: 16,
+        }}
+      >
+        <span
+          role="status"
+          aria-live="polite"
+          style={{ fontSize: 13.5, fontWeight: 600, color: connectionStatus.color }}
+        >
+          {testingConnection ? 'Testing connection…' : connectionStatus.text}
+        </span>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+          <HoverButton
+            onClick={sendTest}
+            disabled={busy}
+            style={{ ...ghostBtn, cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.65 : 1 }}
+            hoverStyle={{ background: 'var(--hl)' }}
+          >
+            {testingConnection ? 'Sending…' : 'Send test email'}
           </HoverButton>
-        )}
+          {!envManaged && (
+            <HoverButton
+              onClick={save}
+              disabled={busy}
+              style={{ ...ghostBtn, cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.65 : 1 }}
+              hoverStyle={{ background: 'var(--hl)' }}
+            >
+              Save changes
+            </HoverButton>
+          )}
+        </div>
       </div>
     </div>
   );

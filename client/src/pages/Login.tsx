@@ -7,9 +7,10 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { api } from '../lib/api';
+import { auth, api } from '../lib/api';
 import type { SetupStatus } from '../lib/api';
 import { useApp } from '../state/AppContext';
+import LocalAdminLogin from './login/LocalAdminLogin';
 
 /** Actual /auth/magic-link response (lib/api.ts types it void — see server routes/auth.ts). */
 interface MagicLinkResponse {
@@ -20,7 +21,7 @@ interface MagicLinkResponse {
 }
 
 export default function Login() {
-  const { session, sessionLoading, toast } = useApp();
+  const { session, sessionLoading, setSession, toast } = useApp();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
@@ -28,6 +29,23 @@ export default function Login() {
   const [devLink, setDevLink] = useState<string | null>(null);
   const [delivered, setDelivered] = useState(true);
   const [sending, setSending] = useState(false);
+  const [localAdminEnabled, setLocalAdminEnabled] = useState(false);
+  const [loginMode, setLoginMode] = useState<'magic' | 'local'>('magic');
+
+  useEffect(() => {
+    let cancelled = false;
+    auth
+      .methods()
+      .then((methods) => {
+        if (!cancelled) setLocalAdminEnabled(methods.localAdmin);
+      })
+      .catch(() => {
+        if (!cancelled) setLocalAdminEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Already signed in → the app. First boot (no admin user yet) → the wizard.
   useEffect(() => {
@@ -111,7 +129,18 @@ export default function Login() {
             boxShadow: '0 2px 12px rgba(60,55,45,.06)',
           }}
         >
-          {!sent ? (
+          {loginMode === 'local' ? (
+            <LocalAdminLogin
+              email={email}
+              setEmail={setEmail}
+              onSuccess={(user) => {
+                setSession(user);
+                navigate('/', { replace: true });
+              }}
+              onError={toast}
+              onBack={() => setLoginMode('magic')}
+            />
+          ) : !sent ? (
             <form onSubmit={sendLink}>
               <div style={{ fontFamily: "'Spectral',serif", fontSize: 21, fontWeight: 500 }}>
                 Sign in
@@ -157,6 +186,27 @@ export default function Login() {
               >
                 Email me a magic link
               </button>
+              {localAdminEnabled && (
+                <button
+                  type="button"
+                  className="lg-dashed"
+                  onClick={() => setLoginMode('local')}
+                  style={{
+                    width: '100%',
+                    marginTop: 10,
+                    border: '1px dashed var(--bd)',
+                    background: 'var(--hl)',
+                    color: 'var(--mut)',
+                    borderRadius: 8,
+                    padding: 10,
+                    fontSize: 13.5,
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  Local admin access
+                </button>
+              )}
             </form>
           ) : (
             <div>

@@ -69,6 +69,7 @@ input, select, button { font-family:inherit; }
 /* compact input (queue/audit search boxes, rule inputs) */
 .rr .input { border:1px solid var(--bd); border-radius:7px; padding:8px 13px; font-size:14px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }
 .rr .input:focus { border-color:var(--acc); }
+.rr .secret-stored::placeholder { color:var(--ink); opacity:1; }
 
 /* large input (login + wizard forms) */
 .rr .input-lg { width:100%; box-sizing:border-box; border:1px solid var(--bd); border-radius:8px; padding:11px 14px; font-size:15px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }

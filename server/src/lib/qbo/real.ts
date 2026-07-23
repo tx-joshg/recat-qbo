@@ -23,11 +23,18 @@ import {
   type QboCompanyInfo,
   type QboStatement,
   type QboStatementRow,
+  type QboTaxCodeInfo,
+  type QboTaxProfile,
+  type QboTaxRateDetail,
+  type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
+import { buildPurchaseRecategorization, buildPurchaseRestore, type QboPreparedWrite } from './purchaseTax.js';
+import type { QboRecategorizationPlan } from '../../services/tax/model.js';
+import { classifyIntuitOAuthBody } from './diagnostics.js';
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -36,6 +43,8 @@ const OAUTH_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revo
 const OAUTH_SCOPE = 'com.intuit.quickbooks.accounting';
 const MINOR_VERSION = '75';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+const QBO_REQUEST_TIMEOUT_MS = 30_000;
+const QBO_REVOKE_TIMEOUT_MS = 15_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
 
@@ -70,12 +79,45 @@ interface RawAccount {
   Active?: boolean;
 }
 
+export interface RawTaxRateDetail {
+  TaxRateRef?: QboRef;
+  TaxTypeApplicable?: string;
+  TaxOrder?: number;
+  TaxOnTaxOrder?: number;
+}
+
+export interface RawTaxCode {
+  Id: string;
+  Name: string;
+  Description?: string;
+  Active?: boolean;
+  Taxable?: boolean;
+  PurchaseTaxRateList?: { TaxRateDetail?: RawTaxRateDetail[] };
+  SalesTaxRateList?: { TaxRateDetail?: RawTaxRateDetail[] };
+}
+
+export interface RawTaxRate {
+  Id: string;
+  Name: string;
+  Description?: string;
+  Active?: boolean;
+  RateValue?: number;
+}
+
 export interface RawPurchaseLine {
   Id?: string;
   Amount?: number;
   Description?: string;
   DetailType?: string;
-  AccountBasedExpenseLineDetail?: { AccountRef?: QboRef };
+  AccountBasedExpenseLineDetail?: {
+    AccountRef?: QboRef;
+    TaxCodeRef?: QboRef;
+    TaxInclusiveAmt?: number;
+    TaxAmount?: number;
+    BillableStatus?: string;
+    CustomerRef?: QboRef;
+    ClassRef?: QboRef;
+  };
 }
 
 export interface RawPurchase {
@@ -91,6 +133,14 @@ export interface RawPurchase {
   EntityRef?: QboRef;
   /** the bank / credit-card account the purchase was paid from */
   AccountRef?: QboRef;
+  CurrencyRef?: QboRef;
+  DepartmentRef?: QboRef;
+  GlobalTaxCalculation?: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+  TxnTaxDetail?: {
+    TotalTax?: number;
+    TxnTaxCodeRef?: QboRef;
+    TaxLine?: unknown[];
+  };
   Line?: RawPurchaseLine[];
   status?: string; // CDC: 'Deleted'
 }
@@ -146,6 +196,8 @@ interface OAuthTokenResponse {
 interface QueryBody {
   QueryResponse?: {
     Account?: RawAccount[];
+    TaxCode?: RawTaxCode[];
+    TaxRate?: RawTaxRate[];
     Purchase?: RawPurchase[];
     Deposit?: RawDeposit[];
     JournalEntry?: RawJournalEntry[];
@@ -164,6 +216,17 @@ interface CdcBody {
 
 interface CompanyInfoBody {
   CompanyInfo?: { CompanyName?: string; LegalName?: string };
+}
+
+export interface RawPreferences {
+  TaxPrefs?: {
+    UsingSalesTax?: boolean;
+    PartnerTaxEnabled?: boolean;
+  };
+}
+
+interface PreferencesBody {
+  Preferences?: RawPreferences;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +479,53 @@ function mapAccount(raw: RawAccount): QboAccountInfo {
   };
 }
 
+function mapTaxRateDetails(list: { TaxRateDetail?: RawTaxRateDetail[] } | undefined): QboTaxRateDetail[] {
+  return (list?.TaxRateDetail ?? []).flatMap((detail) => {
+    const taxRateQboId = detail.TaxRateRef?.value;
+    if (!taxRateQboId) return [];
+    return [
+      {
+        taxRateQboId,
+        ...(detail.TaxTypeApplicable !== undefined ? { taxTypeApplicable: detail.TaxTypeApplicable } : {}),
+        ...(detail.TaxOrder !== undefined ? { taxOrder: detail.TaxOrder } : {}),
+        ...(detail.TaxOnTaxOrder !== undefined ? { taxOnTaxOrder: detail.TaxOnTaxOrder } : {}),
+      },
+    ];
+  });
+}
+
+export function mapTaxCode(raw: RawTaxCode): QboTaxCodeInfo {
+  return {
+    qboId: String(raw.Id),
+    name: raw.Name,
+    ...(raw.Description !== undefined ? { description: raw.Description } : {}),
+    active: raw.Active !== false,
+    taxable: raw.Taxable ?? null,
+    purchaseTaxRateList: mapTaxRateDetails(raw.PurchaseTaxRateList),
+    salesTaxRateList: mapTaxRateDetails(raw.SalesTaxRateList),
+    raw,
+  };
+}
+
+export function mapTaxRate(raw: RawTaxRate): QboTaxRateInfo {
+  return {
+    qboId: String(raw.Id),
+    name: raw.Name,
+    ...(raw.Description !== undefined ? { description: raw.Description } : {}),
+    active: raw.Active !== false,
+    rateValue: typeof raw.RateValue === 'number' && Number.isFinite(raw.RateValue) ? raw.RateValue : null,
+    raw,
+  };
+}
+
+export function mapTaxProfile(raw: RawPreferences): QboTaxProfile {
+  return {
+    usingSalesTax: raw.TaxPrefs?.UsingSalesTax === true,
+    partnerTaxEnabled: raw.TaxPrefs?.PartnerTaxEnabled ?? null,
+    raw,
+  };
+}
+
 function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
   for (const v of vals) if (v && v.trim().length > 0) return v.trim();
   return undefined;
@@ -659,7 +769,7 @@ export function intuitAuthorizeUrl(args: { clientId: string; redirectUri: string
 }
 
 async function tokenRequest(clientId: string, clientSecret: string, body: URLSearchParams): Promise<QboTokenSet> {
-  const res = await fetch(OAUTH_TOKEN_URL, {
+  const request: RequestInit = {
     method: 'POST',
     headers: {
       Authorization: `Basic ${basicAuth(clientId, clientSecret)}`,
@@ -667,10 +777,18 @@ async function tokenRequest(clientId: string, clientSecret: string, body: URLSea
       Accept: 'application/json',
     },
     body: body.toString(),
-  });
+    signal: AbortSignal.timeout(QBO_REQUEST_TIMEOUT_MS),
+  };
+  let res: Response;
+  try {
+    res = await fetch(OAUTH_TOKEN_URL, request);
+  } catch {
+    throw new QboAuthError('Intuit token request was unavailable', 'INTUIT_UNAVAILABLE');
+  }
   if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new QboAuthError(`Intuit token request failed (${res.status}): ${detail.slice(0, 300)}`);
+    const detail = (await res.text().catch(() => '')).slice(0, 4096);
+    const reason = classifyIntuitOAuthBody(res.status, detail);
+    throw new QboAuthError(`Intuit token request failed (${res.status})`, reason);
   }
   const json = (await res.json()) as OAuthTokenResponse;
   return {
@@ -716,6 +834,7 @@ export async function revokeIntuitToken(args: { clientId: string; clientSecret: 
         Accept: 'application/json',
       },
       body: JSON.stringify({ token: args.token }),
+      signal: AbortSignal.timeout(QBO_REVOKE_TIMEOUT_MS),
     });
   } catch {
     // best effort — a failed revoke must not block disconnect
@@ -799,6 +918,7 @@ export class RealQboClient implements QboClient {
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(QBO_REQUEST_TIMEOUT_MS),
     });
     if (res.status === 401 && !retried) {
       // Access token invalidated server-side: refresh once and retry.
@@ -868,9 +988,35 @@ export class RealQboClient implements QboClient {
     };
   }
 
+  /**
+   * Verify the complete stored connection, not only the current access token.
+   * The forced refresh validates the client ID, client secret, and refresh
+   * token, persists Intuit's rotated tokens, then Company Info validates the
+   * resulting bearer token and realm.
+   */
+  async verifyConnection(): Promise<QboCompanyInfo> {
+    await this.refresh();
+    return this.getCompanyInfo();
+  }
+
   async listAccounts(): Promise<QboAccountInfo[]> {
     const rows = await this.queryAll('select * from Account', 'Account');
     return rows.map(mapAccount);
+  }
+
+  async getTaxProfile(): Promise<QboTaxProfile> {
+    const body = await this.request<PreferencesBody>('GET', '/preferences');
+    return mapTaxProfile(body.Preferences ?? {});
+  }
+
+  async listTaxCodes(): Promise<QboTaxCodeInfo[]> {
+    const rows = await this.queryAll('select * from TaxCode', 'TaxCode');
+    return rows.map(mapTaxCode);
+  }
+
+  async listTaxRates(): Promise<QboTaxRateInfo[]> {
+    const rows = await this.queryAll('select * from TaxRate', 'TaxRate');
+    return rows.map(mapTaxRate);
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {
@@ -950,6 +1096,40 @@ export class RealQboClient implements QboClient {
     // must sum to it, so the entity's total never changes; QBO line amounts are
     // always positive.
     return this.replaceLines(txn, this.holdingIds, splits);
+  }
+
+  async prepareRecategorization(
+    txn: QboTxn,
+    plan: QboRecategorizationPlan,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    const [taxCodes, taxRates] = await Promise.all([this.listTaxCodes(), this.listTaxRates()]);
+    return buildPurchaseRecategorization(
+      txn,
+      this.holdingIds,
+      plan,
+      { taxCodes, taxRates },
+      requestId,
+    );
+  }
+
+  async executePreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
+    const path = `${prepared.path}?requestid=${encodeURIComponent(prepared.requestId)}`;
+    const response = await this.request<{ Purchase?: RawPurchase }>('POST', path, prepared.body);
+    const updated = response.Purchase;
+    return {
+      ok: true,
+      newSyncToken: updated?.SyncToken ?? prepared.body.SyncToken,
+      rawResponse: response,
+    };
+  }
+
+  async preparePurchaseRestore(
+    txn: QboTxn,
+    before: RawPurchase,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    return buildPurchaseRestore(txn, before, requestId);
   }
 
   async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {

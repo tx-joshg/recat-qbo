@@ -27,6 +27,9 @@ function chipColors(action: AuditAction): [string, string, string] {
   }
   if (action === 'error') return ['var(--erT)', 'var(--erB)', 'var(--erD)'];
   if (action === 'dry-run') return ['var(--amT)', 'var(--amB)', 'var(--amD)'];
+  if (action === 'autopilot') {
+    return ['var(--amT)', 'var(--amB)', 'var(--amD)'];
+  }
   return ['var(--fnt)', 'var(--hl)', 'var(--bd2)'];
 }
 
@@ -38,6 +41,28 @@ function fmtWhen(iso: string): string {
     hour: 'numeric',
     minute: '2-digit',
   });
+}
+
+function taxSummary(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  const expected = record.expected;
+  if (!expected || typeof expected !== 'object') return null;
+  const lines = (expected as { targetLines?: unknown }).targetLines;
+  if (!Array.isArray(lines)) return null;
+  const totals = lines.reduce(
+    (sum, line) => {
+      if (!line || typeof line !== 'object') return sum;
+      const row = line as Record<string, unknown>;
+      sum.gross += typeof row.grossCents === 'number' ? row.grossCents : 0;
+      sum.net += typeof row.netCents === 'number' ? row.netCents : 0;
+      sum.tax += typeof row.taxCents === 'number' ? row.taxCents : 0;
+      return sum;
+    },
+    { gross: 0, net: 0, tax: 0 },
+  );
+  const verification = record.verification as { ok?: unknown } | undefined;
+  return `Gross $${(totals.gross / 100).toFixed(2)} · Net $${(totals.net / 100).toFixed(2)} · Tax $${(totals.tax / 100).toFixed(2)}${verification?.ok === true ? ' · verified' : ''}`;
 }
 
 const SEARCH_DEBOUNCE_MS = 300;
@@ -120,7 +145,7 @@ export default function Audit() {
         <div>
           <div className="page-title">Audit log</div>
           <div className="page-sub">
-            Every write to QuickBooks, recorded before it happens. Append-only — nothing here can be
+            Every QuickBooks result and autopilot mode change. Append-only — nothing here can be
             edited or deleted.
           </div>
         </div>
@@ -154,6 +179,7 @@ export default function Audit() {
         </div>
         {entries.map((e) => {
           const [chipC, chipB, chipD] = chipColors(e.action);
+          const tax = taxSummary(e.payload);
           return (
             <div key={e.id} className="audit-row">
               <span style={{ color: 'var(--mut)', fontSize: 13 }}>{fmtWhen(e.at)}</span>
@@ -180,6 +206,11 @@ export default function Audit() {
               <span style={{ fontSize: 13, color: 'var(--mut)' }}>
                 {e.before} <span style={{ color: 'var(--fnt)' }}>→</span>{' '}
                 <b style={{ color: 'var(--ink)', fontWeight: 600 }}>{e.after}</b>
+                {tax && (
+                  <span style={{ display: 'block', marginTop: 3, fontSize: 11.5, color: 'var(--fnt)' }}>
+                    {tax}
+                  </span>
+                )}
               </span>
             </div>
           );

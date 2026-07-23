@@ -2,7 +2,7 @@
 // Instance-wide Intuit credentials, redirect URI, and (webhook mode only) the
 // webhook endpoint + verifier token. Only changed fields are PATCHed.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { InstanceSettingsDto, SyncMode } from '@recat/shared';
 import { instanceSettings } from '../../lib/api';
 import { InfoDot } from '../../components/ui';
@@ -54,11 +54,15 @@ const copyBtn = {
 export default function ApiAccessCard({
   settings,
   onSettings,
+  companyId,
+  companyConnected,
   syncMode,
   lastWebhookEventAt,
 }: {
   settings: InstanceSettingsDto;
   onSettings: (next: InstanceSettingsDto) => void;
+  companyId: string;
+  companyConnected: boolean;
   syncMode: SyncMode;
   lastWebhookEventAt: string | null;
 }) {
@@ -67,6 +71,14 @@ export default function ApiAccessCard({
   const [clientId, setClientId] = useState(settings.intuitClientId);
   const [clientSecret, setClientSecret] = useState('');
   const [whToken, setWhToken] = useState('');
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionState, setConnectionState] = useState<
+    'connected' | 'disconnected' | 'untested' | 'failed'
+  >(companyConnected ? 'untested' : 'disconnected');
+
+  useEffect(() => {
+    setConnectionState(companyConnected ? 'untested' : 'disconnected');
+  }, [companyConnected, companyId]);
 
   const copy = (text: string) => {
     navigator.clipboard
@@ -76,6 +88,10 @@ export default function ApiAccessCard({
   };
 
   const save = () => {
+    if (settings.intuitClientId !== '' && clientId.trim() === '') {
+      toast('Client ID cannot be empty');
+      return;
+    }
     const body: Parameters<typeof instanceSettings.patch>[0] = {};
     if (clientId.trim() !== settings.intuitClientId && clientId.trim() !== '') {
       body.intuitClientId = clientId.trim();
@@ -87,16 +103,44 @@ export default function ApiAccessCard({
     instanceSettings
       .patch(body)
       .then((updated) => {
+        const qboCredentialsChanged =
+          body.intuitClientId !== undefined || body.intuitClientSecret !== undefined;
         onSettings(updated);
         setClientId(updated.intuitClientId);
         setClientSecret('');
         setWhToken('');
+        if (qboCredentialsChanged) setConnectionState('untested');
         toast('API credentials saved');
       })
       .catch((err) => toast(errMsg(err)));
   };
 
+  const testConnection = async () => {
+    if (testingConnection) return;
+    setTestingConnection(true);
+    try {
+      await instanceSettings.testQbo(companyId);
+      setConnectionState('connected');
+      toast('QuickBooks connection verified');
+    } catch (err) {
+      setConnectionState('failed');
+      toast(errMsg(err));
+    } finally {
+      setTestingConnection(false);
+    }
+  };
+
   const webhookEndpoint = `${window.location.origin}/webhooks/qbo`;
+  const qboCredentialsDirty =
+    clientId.trim() !== settings.intuitClientId || clientSecret !== '';
+  const connectionStatus =
+    connectionState === 'connected'
+      ? { text: '✓ Connected', color: 'var(--okT)' }
+      : connectionState === 'failed'
+        ? { text: 'Connection failed', color: 'var(--erT)' }
+        : connectionState === 'untested'
+          ? { text: 'Not tested', color: 'var(--amT)' }
+          : { text: 'Disconnected', color: 'var(--fnt)' };
 
   return (
     <div
@@ -130,9 +174,26 @@ export default function ApiAccessCard({
           />
         </div>
         <div>
-          <label style={fieldLabel}>Client secret</label>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+              marginBottom: 6,
+            }}
+          >
+            <label style={{ ...fieldLabel, marginBottom: 0 }}>Client secret</label>
+            {settings.intuitClientSecretSet && clientSecret === '' && (
+              <span style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--okT)' }}>
+                Stored
+              </span>
+            )}
+          </div>
           <input
-            className="input"
+            className={`input ${
+              settings.intuitClientSecretSet && clientSecret === '' ? 'secret-stored' : ''
+            }`}
             type="password"
             value={clientSecret}
             onChange={(e) => setClientSecret(e.target.value)}
@@ -207,24 +268,66 @@ export default function ApiAccessCard({
         </div>
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
-        <HoverButton
-          onClick={save}
-          style={{
-            border: '1px solid var(--bd)',
-            background: 'var(--card)',
-            color: 'var(--ink)',
-            borderRadius: 7,
-            padding: '8px 16px',
-            fontSize: 13.5,
-            fontWeight: 600,
-            cursor: 'pointer',
-            font: 'inherit',
-          }}
-          hoverStyle={{ background: 'var(--hl)' }}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 12,
+          marginTop: 16,
+        }}
+      >
+        <span
+          role="status"
+          aria-live="polite"
+          style={{ fontSize: 13.5, fontWeight: 600, color: connectionStatus.color }}
         >
-          Save changes
-        </HoverButton>
+          {testingConnection
+            ? 'Testing connection…'
+            : qboCredentialsDirty
+              ? 'Save changes before testing'
+              : connectionStatus.text}
+        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <HoverButton
+            onClick={() => void testConnection()}
+            disabled={testingConnection || qboCredentialsDirty}
+            title={qboCredentialsDirty ? 'Save credential changes before testing' : undefined}
+            style={{
+              border: '1px solid var(--bd)',
+              background: 'var(--card)',
+              color: 'var(--ink)',
+              borderRadius: 7,
+              padding: '8px 16px',
+              fontSize: 13.5,
+              fontWeight: 600,
+              cursor: testingConnection ? 'wait' : qboCredentialsDirty ? 'not-allowed' : 'pointer',
+              font: 'inherit',
+              opacity: testingConnection || qboCredentialsDirty ? 0.65 : 1,
+            }}
+            hoverStyle={{ background: 'var(--hl)' }}
+          >
+            {testingConnection ? 'Testing…' : 'Test connection'}
+          </HoverButton>
+          <HoverButton
+            onClick={save}
+            style={{
+              border: '1px solid var(--bd)',
+              background: 'var(--card)',
+              color: 'var(--ink)',
+              borderRadius: 7,
+              padding: '8px 16px',
+              fontSize: 13.5,
+              fontWeight: 600,
+              cursor: 'pointer',
+              font: 'inherit',
+            }}
+            hoverStyle={{ background: 'var(--hl)' }}
+          >
+            Save changes
+          </HoverButton>
+        </div>
       </div>
     </div>
   );

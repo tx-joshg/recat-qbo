@@ -81,7 +81,7 @@ authRouter.get(
       return;
     }
     const session = await createSession(user.id);
-    res.cookie(SESSION_COOKIE, session.token, sessionCookieOptions);
+    res.cookie(SESSION_COOKIE, session.token, sessionCookieOptions());
     res.redirect(`${env.APP_URL}/`);
   }),
 );
@@ -91,7 +91,7 @@ authRouter.post(
   asyncHandler(async (req, res) => {
     const token = sessionTokenFromRequest(req.cookies);
     if (token) await destroySession(token);
-    res.clearCookie(SESSION_COOKIE, clearCookieOptions);
+    res.clearCookie(SESSION_COOKIE, clearCookieOptions(req.headers.origin));
     res.json({ ok: true });
   }),
 );

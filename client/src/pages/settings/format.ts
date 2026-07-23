@@ -6,6 +6,18 @@ export function fmtLongDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/** Stable local timestamp: '2026-04-03 at 10:33 AM'. */
+export function fmtFullDateTime(iso: string): string {
+  const d = new Date(iso);
+  const date = [
+    String(d.getFullYear()).padStart(4, '0'),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0'),
+  ].join('-');
+  const time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return `${date} at ${time}`;
+}
+
 /** Relative-or-clock timestamp: 'just now' / '4 min ago' / 'Today, 8:14 AM' / 'Yesterday, 6:40 PM' / 'Mar 3, 8:14 AM'. */
 export function fmtWhen(iso: string): string {
   const d = new Date(iso);

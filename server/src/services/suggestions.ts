@@ -8,25 +8,38 @@
 //                name list, NEVER the books. Cached per (companyId, payee).
 
 import { Prisma } from '@prisma/client';
-import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
+import type { SuggestionDto, SuggestionSetting, TaxCalculation } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
+import { completeCategory } from './ai/provider.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
 // ---------------------------------------------------------------------------
 
 /**
- * Normalize a bank-feed payee for matching: uppercase, treat '#', '*' and '·'
- * as separators, and drop any token containing a digit (store numbers, refs).
+ * Normalize a bank-feed payee for matching: uppercase, treat punctuation and
+ * symbols as separators, and drop any token containing a digit (store numbers,
+ * refs).
  * 'SYSCO FOODS #212' → 'SYSCO FOODS'; 'AMZN MKTP US*2K4' → 'AMZN MKTP US'.
  */
 export function normalizePayee(payee: string): string {
   return payee
+    .normalize('NFKC')
     .toUpperCase()
-    .replace(/[#*·]/g, ' ')
+    .replace(/[\p{P}\p{S}]+/gu, ' ')
     .split(/\s+/)
     .filter((tok) => tok.length > 0 && !/\d/.test(tok))
     .join(' ');
+}
+
+/** Normalize separators for rule matching without dropping meaningful digits. */
+export function normalizeRulePayee(payee: string): string {
+  return payee
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 
 export interface RuleLike {
@@ -37,12 +50,35 @@ export interface RuleLike {
   /** Match order — lowest number wins when several rules match. */
   priority: number;
   createdAt: Date;
+  taxCalculation?: string | null;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
 }
 
 export interface HistoryTxnLike {
   payee: string;
   category: string;
   categoryQboId: string | null;
+  taxCalculation?: string | null;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
+}
+
+export function ruleMatchesPayee(payee: string, matchText: string): boolean {
+  const needle = payee.toLowerCase();
+  const normalizedNeedle = normalizeRulePayee(payee);
+  const match = matchText.trim().toLowerCase();
+  const normalizedMatch = normalizeRulePayee(matchText);
+  const normalizedSpecific =
+    normalizedMatch.length >= 3 &&
+    /\p{L}/u.test(normalizedMatch) &&
+    normalizedMatch.split(' ').some((token) => token.length >= 3);
+  return (
+    match.length > 0 &&
+    (needle.includes(match) ||
+      (normalizedSpecific &&
+        ` ${normalizedNeedle} `.includes(` ${normalizedMatch} `)))
+  );
 }
 
 /**
@@ -51,14 +87,10 @@ export interface HistoryTxnLike {
  * matchText (winnerMatchText) so the queue can surface multi-rule overlaps.
  */
 export function ruleSuggestion(payee: string, rules: RuleLike[]): SuggestionDto | null {
-  const needle = payee.toLowerCase();
   const sorted = [...rules].sort(
     (a, b) => a.priority - b.priority || b.createdAt.getTime() - a.createdAt.getTime(),
   );
-  const matching = sorted.filter((rule) => {
-    const match = rule.matchText.trim().toLowerCase();
-    return match.length > 0 && needle.includes(match);
-  });
+  const matching = sorted.filter((rule) => ruleMatchesPayee(payee, rule.matchText));
   const winner = matching[0];
   if (!winner) return null;
   return {
@@ -68,6 +100,13 @@ export function ruleSuggestion(payee: string, rules: RuleLike[]): SuggestionDto 
     ruleId: winner.id,
     matchedRules: matching.length,
     winnerMatchText: winner.matchText,
+    ...(winner.taxCalculation && winner.taxCode && winner.taxCodeQboId
+      ? {
+          taxCalculation: winner.taxCalculation as TaxCalculation,
+          taxCode: winner.taxCode,
+          taxCodeQboId: winner.taxCodeQboId,
+        }
+      : {}),
   };
 }
 
@@ -75,20 +114,49 @@ export function ruleSuggestion(payee: string, rules: RuleLike[]): SuggestionDto 
 export function historySuggestion(payee: string, history: HistoryTxnLike[]): SuggestionDto | null {
   const norm = normalizePayee(payee);
   if (norm.length === 0) return null;
-  const counts = new Map<string, { count: number; categoryQboId: string | null }>();
+  const counts = new Map<
+    string,
+    {
+      count: number;
+      category: string;
+      categoryQboId: string | null;
+      taxCalculation?: string | null;
+      taxCode?: string | null;
+      taxCodeQboId?: string | null;
+    }
+  >();
   for (const h of history) {
     if (normalizePayee(h.payee) !== norm) continue;
-    const entry = counts.get(h.category) ?? { count: 0, categoryQboId: h.categoryQboId };
+    const key = [h.categoryQboId ?? h.category, h.taxCalculation ?? '', h.taxCodeQboId ?? ''].join('|');
+    const entry = counts.get(key) ?? {
+      count: 0,
+      category: h.category,
+      categoryQboId: h.categoryQboId,
+      taxCalculation: h.taxCalculation,
+      taxCode: h.taxCode,
+      taxCodeQboId: h.taxCodeQboId,
+    };
     entry.count += 1;
     entry.categoryQboId ??= h.categoryQboId;
-    counts.set(h.category, entry);
+    counts.set(key, entry);
   }
-  let best: { category: string; count: number; categoryQboId: string | null } | null = null;
-  for (const [category, { count, categoryQboId }] of counts) {
-    if (!best || count > best.count) best = { category, count, categoryQboId };
+  let best: (typeof counts extends Map<string, infer V> ? V : never) | null = null;
+  for (const entry of counts.values()) {
+    if (!best || entry.count > best.count) best = entry;
   }
   if (!best) return null;
-  return { category: best.category, categoryQboId: best.categoryQboId ?? undefined, source: 'history' };
+  return {
+    category: best.category,
+    categoryQboId: best.categoryQboId ?? undefined,
+    source: 'history',
+    ...(best.taxCalculation && best.taxCode && best.taxCodeQboId
+      ? {
+          taxCalculation: best.taxCalculation as TaxCalculation,
+          taxCode: best.taxCode,
+          taxCodeQboId: best.taxCodeQboId,
+        }
+      : {}),
+  };
 }
 
 /** Rule beats history; history only when enabled. (AI is layered on in suggestFor.) */
@@ -108,8 +176,7 @@ export function pickSuggestion(
 
 interface SuggestionSettings {
   suggestionSource: SuggestionSetting;
-  aiEndpoint: string | null;
-  aiApiKey: string | null;
+  aiCacheIdentity: string;
 }
 
 let warnedSettingsUnavailable = false;
@@ -120,15 +187,24 @@ async function loadSettings(): Promise<SuggestionSettings> {
     const s = await getInstanceSettings();
     return {
       suggestionSource: (s.suggestionSource || 'builtin') as SuggestionSetting,
-      aiEndpoint: s.aiEndpoint || null,
-      aiApiKey: s.aiApiKey || null,
+      aiCacheIdentity: JSON.stringify({
+        provider: s.suggestionProvider ?? 'openai',
+        model:
+          s.suggestionProvider === 'codex'
+            ? s.codexModel
+            : s.suggestionModel,
+        endpoint:
+          s.suggestionProvider === 'openrouter'
+            ? 'https://openrouter.ai/api/v1'
+            : s.aiEndpoint,
+      }),
     };
   } catch {
     if (!warnedSettingsUnavailable) {
       warnedSettingsUnavailable = true;
       console.warn('[suggestions] instance settings unavailable — defaulting to builtin suggestions');
     }
-    return { suggestionSource: 'builtin', aiEndpoint: null, aiApiKey: null };
+    return { suggestionSource: 'builtin', aiCacheIdentity: 'builtin' };
   }
 }
 
@@ -136,15 +212,9 @@ async function loadSettings(): Promise<SuggestionSettings> {
 // AI step
 // ---------------------------------------------------------------------------
 
-const AI_MODEL = 'gpt-4o-mini';
-
 // Cache per (companyId, normalized payee). Resolved answers (including a valid
 // "no idea") are cached; transport errors are not, so a flaky endpoint retries.
 const aiCache = new Map<string, SuggestionDto | null>();
-
-interface ChatCompletionResponse {
-  choices?: { message?: { content?: string } }[];
-}
 
 interface CategoryOption {
   qboId: string;
@@ -166,12 +236,19 @@ async function aiSuggestion(
   txn: { payee: string; memo?: string | null; amount: number },
   settings: SuggestionSettings,
 ): Promise<SuggestionDto | null> {
-  if (!settings.aiEndpoint) return null;
-  const cacheKey = `${companyId}|${normalizePayee(txn.payee)}`;
-  if (aiCache.has(cacheKey)) return aiCache.get(cacheKey) ?? null;
-
   const options = await categoryOptions(companyId);
   if (options.length === 0) return null;
+  const categoryIdentity = options
+    .map((option) => `${option.qboId}\u0000${option.name}`)
+    .sort()
+    .join('\u0001');
+  const cacheKey = JSON.stringify([
+    companyId,
+    normalizePayee(txn.payee),
+    settings.aiCacheIdentity,
+    categoryIdentity,
+  ]);
+  if (aiCache.has(cacheKey)) return aiCache.get(cacheKey) ?? null;
 
   // Minimal context only: one transaction + the category name list. Never the
   // full books.
@@ -185,33 +262,15 @@ async function aiSuggestion(
     ...options.map((o) => `- ${o.name}`),
   ].join('\n');
 
-  try {
-    const res = await fetch(`${settings.aiEndpoint.replace(/\/+$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(settings.aiApiKey ? { Authorization: `Bearer ${settings.aiApiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: AI_MODEL,
-        temperature: 0,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as ChatCompletionResponse;
-    const answer = body.choices?.[0]?.message?.content?.trim() ?? '';
-    // Only accept an exact (case-insensitive) category name — anything else is
-    // a hallucination and must not reach the queue.
-    const hit = options.find((o) => o.name.toLowerCase() === answer.toLowerCase());
-    const result: SuggestionDto | null = hit
-      ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
-      : null;
-    aiCache.set(cacheKey, result);
-    return result;
-  } catch {
-    return null; // endpoint unreachable — no suggestion, no cache
-  }
+  const answer = await completeCategory(prompt);
+  // Only accept an exact (case-insensitive) category name — anything else is
+  // a hallucination and must not reach the queue.
+  const hit = options.find((o) => o.name.toLowerCase() === answer?.toLowerCase());
+  const result: SuggestionDto | null = hit
+    ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
+    : null;
+  if (answer !== null) aiCache.set(cacheKey, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +284,17 @@ function jsonStringArray(v: unknown): string[] {
 async function loadRules(companyId: string): Promise<RuleLike[]> {
   return prisma.rule.findMany({
     where: { companyId },
-    select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
+    select: {
+      id: true,
+      matchText: true,
+      category: true,
+      categoryQboId: true,
+      taxCalculation: true,
+      taxCode: true,
+      taxCodeQboId: true,
+      priority: true,
+      createdAt: true,
+    },
     orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
   });
 }
@@ -233,9 +302,24 @@ async function loadRules(companyId: string): Promise<RuleLike[]> {
 async function loadHistory(companyId: string): Promise<HistoryTxnLike[]> {
   const rows = await prisma.transaction.findMany({
     where: { companyId, status: { in: ['POSTED', 'DRY_RUN'] }, category: { not: null } },
-    select: { payee: true, category: true, categoryQboId: true },
+    select: {
+      payee: true,
+      category: true,
+      categoryQboId: true,
+      taxCalculation: true,
+      taxCode: true,
+      taxCodeQboId: true,
+      status: true,
+    },
   });
-  return rows.map((r) => ({ payee: r.payee, category: r.category ?? '', categoryQboId: r.categoryQboId }));
+  return rows.map((r) => ({
+    payee: r.payee,
+    category: r.category ?? '',
+    categoryQboId: r.categoryQboId,
+    taxCalculation: r.status === 'POSTED' ? r.taxCalculation : null,
+    taxCode: r.status === 'POSTED' ? r.taxCode : null,
+    taxCodeQboId: r.status === 'POSTED' ? r.taxCodeQboId : null,
+  }));
 }
 
 export async function suggestFor(

@@ -5,17 +5,24 @@
 // Action routes load the txn by id and scope everything through its companyId.
 // Paths and shapes mirror client/src/lib/api.ts exactly (THE contract).
 
+import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import type { User } from '@prisma/client';
-import type { SuggestionDto, TransactionDto, TxnStatus } from '@recat/shared';
+import type { SuggestionDto, TaxCalculation, TransactionDto, TxnStatus } from '@recat/shared';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
+import { stageCategorization, StagingError } from '../services/categorization.js';
+import {
+  CompanyWriteLeaseBusyError,
+  type CompanyWriteLeaseGuard,
+  withCompanyWriteLeases,
+} from '../services/agent/jobs.js';
 import {
   bulkPost,
   postTransaction,
@@ -31,9 +38,47 @@ import {
 const txnInclude = {
   txnTags: true,
   splitLines: { include: { tags: true }, orderBy: { idx: 'asc' as const } },
+  agentRuns: {
+    where: { mode: 'shadow' as const, completedAt: { not: null } },
+    orderBy: [{ startedAt: 'desc' as const }, { id: 'desc' as const }],
+    take: 1,
+  },
+  agentJobs: { select: { inputHash: true }, take: 1 },
 } satisfies Prisma.TransactionInclude;
 
 type TxnRow = Prisma.TransactionGetPayload<{ include: typeof txnInclude }>;
+
+export function currentShadowDecision(
+  row: {
+    agentRuns: {
+      id: string;
+      inputHash: string;
+      completedAt: Date | null;
+      decision: unknown;
+      validation: unknown;
+      verifier: unknown;
+    }[];
+    agentJobs: { inputHash: string }[];
+  },
+): TransactionDto['shadowDecision'] | null {
+  const run = row.agentRuns[0];
+  if (
+    run?.decision === null ||
+    run?.decision === undefined ||
+    !run.verifier ||
+    typeof run.verifier !== 'object' ||
+    (run.verifier as { verdict?: unknown }).verdict !== 'agree' ||
+    run.inputHash !== row.agentJobs[0]?.inputHash
+  ) {
+    return null;
+  }
+  return {
+    runId: run.id,
+    completedAt: run.completedAt!.toISOString(),
+    decision: run.decision,
+    validation: run.validation,
+  };
+}
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -65,6 +110,29 @@ async function assertCategorizerFor(user: User, companyId: string): Promise<void
   const role = await effectiveRole(user, companyId);
   if (role === null || roleRank(role) < roleRank('categorizer')) {
     throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
+  }
+}
+
+async function withinAccountingWriteBoundary<T>(
+  companyIds: readonly string[],
+  actor: User,
+  action: (guard: CompanyWriteLeaseGuard) => Promise<T>,
+): Promise<T> {
+  try {
+    return await withCompanyWriteLeases(
+      companyIds,
+      `human:${actor.id}:${randomUUID()}`,
+      action,
+    );
+  } catch (error) {
+    if (error instanceof CompanyWriteLeaseBusyError) {
+      throw new HttpError(
+        409,
+        'Another accounting write is active for this company. Try again shortly.',
+        'ACCOUNTING_WRITE_BUSY',
+      );
+    }
+    throw error;
   }
 }
 
@@ -117,6 +185,9 @@ export async function transactionDtos(
       status: r.status,
       category: r.category,
       categoryQboId: r.categoryQboId,
+      taxCalculation: r.taxCalculation as TaxCalculation | null,
+      taxCode: r.taxCode,
+      taxCodeQboId: r.taxCodeQboId,
       splits: splitLineDtos(r.splitLines),
       tagIds: r.txnTags.map((t) => t.tagId),
       suggestion,
@@ -127,6 +198,7 @@ export async function transactionDtos(
       postedAt: r.postedAt?.toISOString() ?? null,
       postedBy: r.postedByUserId !== null ? (posterLabel.get(r.postedByUserId) ?? null) : null,
       transferCandidateId: candidates.get(r.id) ?? null,
+      shadowDecision: currentShadowDecision(r),
     });
   }
   return out;
@@ -311,6 +383,8 @@ const splitSchema = z.object({
   categoryQboId: z.string().min(1).optional(),
   tagIds: z.array(z.string().min(1)).default([]),
   memo: z.string().optional(),
+  taxCode: z.string().min(1).nullish(),
+  taxCodeQboId: z.string().min(1).nullish(),
 });
 
 const categorizeBody = z.object({
@@ -318,39 +392,29 @@ const categorizeBody = z.object({
   categoryQboId: z.string().min(1).nullish(),
   splits: z.array(splitSchema).nullish(),
   tagIds: z.array(z.string().min(1)).optional(),
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']).nullish(),
+  taxCode: z.string().min(1).nullish(),
+  taxCodeQboId: z.string().min(1).nullish(),
 });
 
 const transferBody = z.object({ counterpartTxnId: z.string().min(1) });
 
 const bulkPostBody = z.object({ ids: z.array(z.string().min(1)).min(1).max(500) });
 
-async function resolveCategoryQboId(
-  companyId: string,
-  name: string,
-  given: string | null | undefined,
-): Promise<string | null> {
-  // Never trust a client-supplied account id verbatim: it must be an active
-  // account in THIS company's chart of accounts (defense in depth — a stray
-  // id would otherwise be written straight to QBO on post).
-  if (given) {
-    const byId = await prisma.qboAccount.findFirst({ where: { companyId, qboId: given, active: true } });
-    if (!byId) {
-      throw new HttpError(
-        400,
-        `Category account '${given}' is not an active account for this company`,
-        'BAD_CATEGORY_ACCOUNT',
-      );
-    }
-    return given;
-  }
-  const acct = await prisma.qboAccount.findFirst({ where: { companyId, name, active: true } });
-  return acct?.qboId ?? null;
-}
-
 async function loadRuleLikes(companyId: string): Promise<RuleLike[]> {
   return prisma.rule.findMany({
     where: { companyId },
-    select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
+    select: {
+      id: true,
+      matchText: true,
+      category: true,
+      categoryQboId: true,
+      taxCalculation: true,
+      taxCode: true,
+      taxCodeQboId: true,
+      priority: true,
+      createdAt: true,
+    },
   });
 }
 
@@ -369,84 +433,16 @@ transactionActionsRouter.post(
     if (txn.status !== 'PENDING' && txn.status !== 'ERROR') {
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
-    const companyId = txn.companyId;
-    const amount = Number(txn.amount);
-    const data: Prisma.TransactionUpdateInput = {};
-    let stagedCategory: string | null = null;
-
-    if (body.splits && body.splits.length > 0) {
-      const splitCheck = validateSplits(amount, body.splits);
-      if (!splitCheck.ok) {
-        throw new HttpError(400, splitCheck.message ?? 'Split amounts must add up to the transaction amount.', 'BAD_SPLITS');
-      }
-      // Every split-line tag must belong to this company (same gate as txn tags).
-      const splitTagIds = [...new Set(body.splits.flatMap((s) => s.tagIds))];
-      if (splitTagIds.length > 0) {
-        const owned = await prisma.tag.findMany({ where: { companyId, id: { in: splitTagIds } } });
-        if (owned.length !== splitTagIds.length) {
-          throw new HttpError(400, 'One or more tags do not belong to this company', 'BAD_TAGS');
-        }
-      }
-      const lines: Prisma.SplitLineCreateWithoutTxnInput[] = [];
-      for (const [i, s] of body.splits.entries()) {
-        const qboId = await resolveCategoryQboId(companyId, s.category, s.categoryQboId);
-        lines.push({
-          idx: i, // array order IS the line order
-          amount: s.amount,
-          category: s.category,
-          categoryQboId: qboId,
-          memo: s.memo ?? null,
-          tags: { create: [...new Set(s.tagIds)].map((tagId) => ({ tagId })) },
-        });
-      }
-      // Replace the txn's split set: delete the existing lines (SplitLineTag
-      // rows cascade), then create the new ones — one nested atomic update.
-      data.splitLines = { deleteMany: {}, create: lines };
-      data.category = null;
-      data.categoryQboId = null;
-    } else {
-      if (body.splits === null) data.splitLines = { deleteMany: {} };
-      if (body.category !== undefined) {
-        if (body.category === null) {
-          data.category = null;
-          data.categoryQboId = null;
-        } else {
-          stagedCategory = body.category;
-          data.category = body.category;
-          data.categoryQboId = await resolveCategoryQboId(companyId, body.category, body.categoryQboId);
-          data.splitLines = { deleteMany: {} }; // single category replaces any staged splits
-        }
-      }
-    }
-
-    await prisma.transaction.update({ where: { id }, data });
-
-    if (body.tagIds !== undefined) {
-      const owned = await prisma.tag.findMany({ where: { companyId, id: { in: body.tagIds } } });
-      if (owned.length !== new Set(body.tagIds).size) {
-        throw new HttpError(400, 'One or more tags do not belong to this company', 'BAD_TAGS');
-      }
-      await prisma.txnTag.deleteMany({ where: { txnId: id } });
-      for (const tagId of new Set(body.tagIds)) {
-        await prisma.txnTag.create({ data: { txnId: id, tagId } });
-      }
-    }
-
-    // Prototype behavior: accepting a rule's suggested category also applies
-    // the rule's tags (merged into whatever is already staged).
-    if (stagedCategory !== null) {
-      const rules = await loadRuleLikes(companyId);
-      const match = ruleSuggestion(txn.payee, rules);
-      if (match?.ruleId !== undefined && match.category === stagedCategory) {
-        const ruleTags = await prisma.ruleTag.findMany({ where: { ruleId: match.ruleId } });
-        for (const rt of ruleTags) {
-          await prisma.txnTag.upsert({
-            where: { txnId_tagId: { txnId: id, tagId: rt.tagId } },
-            create: { txnId: id, tagId: rt.tagId },
-            update: {},
-          });
-        }
-      }
+    const user = requestUser(req);
+    try {
+      await stageCategorization(prisma, id, body, {
+        actor: actorFor(user),
+        source: 'human',
+        applyMatchingRuleTags: true,
+      });
+    } catch (err) {
+      if (err instanceof StagingError) throw new HttpError(400, err.message, err.code);
+      throw err;
     }
 
     res.json(await dtoById(id));
@@ -464,12 +460,13 @@ transactionActionsRouter.post(
     const txn = await loadTxn(id); // 404 before the write-back service's plain Errors
     await assertCategorizerFor(user, txn.companyId);
 
-    let result;
-    try {
-      result = await postTransaction(id, actorFor(user));
-    } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err), 'POST_FAILED');
-    }
+    const result = await withinAccountingWriteBoundary([txn.companyId], user, async (guard) => {
+      try {
+        return await postTransaction(id, actorFor(user), { canWrite: guard.canContinue });
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : String(err), 'POST_FAILED');
+      }
+    });
 
     const dto = await dtoById(id);
 
@@ -498,11 +495,13 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
-    try {
-      await undoPost(id, actorFor(user));
-    } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
-    }
+    await withinAccountingWriteBoundary([txn.companyId], user, async (guard) => {
+      try {
+        await undoPost(id, actorFor(user), undefined, guard.canContinue);
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
+      }
+    });
     res.json(await dtoById(id));
   }),
 );
@@ -513,12 +512,15 @@ transactionActionsRouter.post(
     const id = req.params.id;
     if (!id) throw new HttpError(400, 'Missing transaction id', 'BAD_REQUEST');
     const txn = await loadTxn(id);
-    await assertCategorizerFor(requestUser(req), txn.companyId);
-    try {
-      await retryError(id);
-    } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err), 'RETRY_FAILED');
-    }
+    const user = requestUser(req);
+    await assertCategorizerFor(user, txn.companyId);
+    await withinAccountingWriteBoundary([txn.companyId], user, async () => {
+      try {
+        await retryError(id);
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : String(err), 'RETRY_FAILED');
+      }
+    });
     res.json(await dtoById(id));
   }),
 );
@@ -532,11 +534,13 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
-    try {
-      await recordTransfer(id, counterpartTxnId, actorFor(user));
-    } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err), 'TRANSFER_FAILED');
-    }
+    await withinAccountingWriteBoundary([txn.companyId], user, async (guard) => {
+      try {
+        await recordTransfer(id, counterpartTxnId, actorFor(user), guard.canContinue);
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : String(err), 'TRANSFER_FAILED');
+      }
+    });
     res.json([await dtoById(id), await dtoById(counterpartTxnId)]);
   }),
 );
@@ -557,7 +561,11 @@ transactionActionsRouter.post(
       await assertCategorizerFor(user, companyId);
     }
 
-    const results = await bulkPost(ids, actorFor(user));
+    const results = await withinAccountingWriteBoundary(
+      companyIds.map(({ companyId }) => companyId),
+      user,
+      (guard) => bulkPost(ids, actorFor(user), undefined, guard.canContinue),
+    );
 
     const rows = await prisma.transaction.findMany({ where: { id: { in: ids } }, include: txnInclude });
     const byCompany = new Map<string, TxnRow[]>();

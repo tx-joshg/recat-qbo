@@ -4,12 +4,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
-import type { RuleDto, RuleTestResult } from '@recat/shared';
-import { rules as rulesApi } from '../lib/api';
+import type { RuleCandidateDto, RuleDto, RuleTestResult, TaxCalculation } from '@recat/shared';
+import { autopilot as autopilotApi, rules as rulesApi } from '../lib/api';
 import type { RuleBody } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { useApp } from '../state/AppContext';
 import { InfoDot } from '../components/ui';
+import TaxCodePicker from '../components/TaxCodePicker';
 
 const RULES_TIP =
   'Rules run on every sync. A match shows as a suggestion — nothing posts without you unless you turn on auto-post for that rule (auto-post still respects dry-run). Recat also offers to create a rule right after you categorize a new payee. When several rules match, the topmost one wins — drag to reorder.';
@@ -85,17 +86,22 @@ const delStyle: CSSProperties = {
 };
 
 const MATCH_DEBOUNCE_MS = 500;
+const NEW_RULE_TAG_MENU = '__new-rule-tags__';
 
 export default function Rules() {
-  const { activeCompanyId, accounts, tags, toast } = useApp();
+  const { activeCompanyId, accounts, tags, taxCodes, taxProfile, role, toast } = useApp();
 
   const [ruleList, setRuleList] = useState<RuleDto[]>([]);
+  const [candidates, setCandidates] = useState<RuleCandidateDto[]>([]);
   // Bumped per rule when a matchText PATCH fails, so the (uncontrolled) input
   // re-mounts and shows the server's value again.
   const [matchResets, setMatchResets] = useState<Record<string, number>>({});
   const [openTagMenu, setOpenTagMenu] = useState<string | null>(null);
   const [newMatch, setNewMatch] = useState('');
   const [newCat, setNewCat] = useState('');
+  const [newTagIds, setNewTagIds] = useState<string[]>([]);
+  const [newTaxMode, setNewTaxMode] = useState<TaxCalculation>('TaxInclusive');
+  const [newTaxCodeId, setNewTaxCodeId] = useState<string | null>(null);
   // Draft-rule test results ({text} is the tested matchText). Dismissed via the
   // panel's × or automatically on a successful Add rule.
   const [testRes, setTestRes] = useState<{ text: string; result: RuleTestResult } | null>(null);
@@ -127,11 +133,21 @@ export default function Rules() {
   );
 
   const tagById = useMemo(() => new Map(tags.map((t) => [t.id, t])), [tags]);
+  const newTagNames = useMemo(
+    () =>
+      newTagIds
+        .map((id) => tagById.get(id)?.name)
+        .filter((name): name is string => Boolean(name)),
+    [newTagIds, tagById],
+  );
 
   // ---- load rules (server returns match order: priority asc — render as-is) ----
   useEffect(() => {
     setRuleList([]);
+    setCandidates([]);
     setTestRes(null);
+    setNewTagIds([]);
+    setOpenTagMenu(null);
     if (!activeCompanyId) return;
     let cancelled = false;
     rulesApi
@@ -143,10 +159,54 @@ export default function Rules() {
       .catch((err: Error) => {
         if (!cancelled) toast(err.message);
       });
+    autopilotApi
+      .ruleCandidates(activeCompanyId)
+      .then((list) => {
+        if (!cancelled) setCandidates(list);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) toast(err.message);
+      });
     return () => {
       cancelled = true;
     };
   }, [activeCompanyId, toast]);
+
+  const activateCandidate = useCallback(
+    (candidate: RuleCandidateDto) => {
+      if (!activeCompanyId) return;
+      autopilotApi
+        .activateRuleCandidate(activeCompanyId, candidate.id)
+        .then(async () => {
+          const [rules, nextCandidates] = await Promise.all([
+            rulesApi.list(activeCompanyId),
+            autopilotApi.ruleCandidates(activeCompanyId),
+          ]);
+          setRuleList(rules);
+          setCandidates(nextCandidates);
+          toast('Rule candidate activated with auto-post off');
+        })
+        .catch((err: Error) => toast(err.message));
+    },
+    [activeCompanyId, toast],
+  );
+
+  const dismissCandidate = useCallback(
+    (candidate: RuleCandidateDto) => {
+      if (!activeCompanyId) return;
+      autopilotApi
+        .dismissRuleCandidate(activeCompanyId, candidate.id)
+        .then(() =>
+          setCandidates((current) =>
+            current.map((value) =>
+              value.id === candidate.id ? { ...value, status: 'dismissed' } : value,
+            ),
+          ),
+        )
+        .catch((err: Error) => toast(err.message));
+    },
+    [activeCompanyId, toast],
+  );
 
   // Close the tags dropdown on any outside click (prototype closes menus on root click).
   useEffect(() => {
@@ -235,12 +295,28 @@ export default function Rules() {
 
   const toggleAuto = useCallback(
     (rule: RuleDto) => {
+      if (taxProfile?.status === 'ready' && (!rule.taxCalculation || !rule.taxCodeQboId)) {
+        toast('Choose a tax mode and TaxCode before enabling Purchase auto-post');
+        return;
+      }
       setRuleList((prev) => prev.map((r) => (r.id === rule.id ? { ...r, autoPost: !r.autoPost } : r)));
       patchRule(rule.id, { autoPost: !rule.autoPost }, () =>
         setRuleList((prev) => prev.map((r) => (r.id === rule.id ? { ...r, autoPost: rule.autoPost } : r))),
       );
     },
-    [patchRule],
+    [patchRule, taxProfile, toast],
+  );
+
+  const setRuleTax = useCallback(
+    (rule: RuleDto, taxCalculation: TaxCalculation, taxCodeQboId: string | null) => {
+      const code = taxCodes.find((candidate) => candidate.qboId === taxCodeQboId) ?? null;
+      patchRule(rule.id, {
+        taxCalculation,
+        taxCode: code?.name ?? null,
+        taxCodeQboId: code?.qboId ?? null,
+      });
+    },
+    [patchRule, taxCodes],
   );
 
   const deleteRule = useCallback(
@@ -333,13 +409,24 @@ export default function Rules() {
       toast('Enter a payee match and pick a category');
       return;
     }
+    if (taxProfile?.status === 'ready' && !newTaxCodeId) {
+      toast('Pick a TaxCode for this Purchase rule');
+      return;
+    }
     const opt = catOpts.find((c) => c.v === newCat);
     const body: RuleBody = {
       matchText: newMatch.trim(),
       category: newCat,
       categoryQboId: opt ? opt.qboId : null,
-      tagIds: [],
+      tagIds: newTagIds,
       autoPost: false,
+      ...(taxProfile?.status === 'ready'
+        ? {
+            taxCalculation: newTaxMode,
+            taxCode: taxCodes.find((code) => code.qboId === newTaxCodeId)?.name ?? null,
+            taxCodeQboId: newTaxCodeId,
+          }
+        : {}),
     };
     rulesApi
       .create(activeCompanyId, body)
@@ -347,11 +434,24 @@ export default function Rules() {
         setRuleList((prev) => [created, ...prev]);
         setNewMatch('');
         setNewCat('');
+        setNewTagIds([]);
+        setNewTaxCodeId(null);
         setTestRes(null);
         toast('Rule created');
       })
       .catch((err: Error) => toast(err.message));
-  }, [activeCompanyId, newMatch, newCat, catOpts, toast]);
+  }, [
+    activeCompanyId,
+    newMatch,
+    newCat,
+    newTagIds,
+    newTaxMode,
+    newTaxCodeId,
+    taxCodes,
+    taxProfile,
+    catOpts,
+    toast,
+  ]);
 
   // Dry-run the draft rule against recent transactions — nothing is saved.
   const testRule = useCallback(() => {
@@ -383,6 +483,63 @@ export default function Rules() {
           <InfoDot tip={RULES_TIP} />
         </div>
       </div>
+      {candidates.length > 0 && (
+        <div
+          className="card"
+          style={{ marginBottom: 18, padding: 20, display: 'grid', gap: 10 }}
+        >
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 600 }}>Autopilot rule candidates</div>
+            <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 3 }}>
+              Repeated verifier-agreed decisions. Activation creates a normal rule with auto-post
+              off.
+            </div>
+          </div>
+          {candidates.map((candidate) => {
+            const blocked = candidate.conflicts.length > 0;
+            return (
+              <div
+                key={candidate.id}
+                style={{
+                  borderTop: '1px solid var(--rowbd)',
+                  paddingTop: 10,
+                  display: 'flex',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 10,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 220 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                    {candidate.matchText} → {candidate.category}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: blocked ? 'var(--erT)' : 'var(--fnt)' }}>
+                    {candidate.evidenceCount} matching runs · {candidate.taxCalculation} ·{' '}
+                    {candidate.taxCode}
+                    {blocked ? ` · ${candidate.conflicts.length} conflict(s)` : ''}
+                    {candidate.status !== 'pending' ? ` · ${candidate.status}` : ''}
+                  </div>
+                </div>
+                {role === 'admin' && candidate.status === 'pending' && (
+                  <>
+                    <button
+                      className="btn-ghost"
+                      disabled={blocked}
+                      onClick={() => activateCandidate(candidate)}
+                      data-tip={blocked ? 'Resolve conflicting evidence first' : 'Create rule'}
+                    >
+                      Activate
+                    </button>
+                    <button className="btn-ghost" onClick={() => dismissCandidate(candidate)}>
+                      Dismiss
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       <div className="card">
         <div className="rules-head">
           <span></span>
@@ -420,20 +577,60 @@ export default function Rules() {
                 onBlur={() => commitMatch(rule)}
                 className="rules-inline-input"
               />
-              <select
-                value={rule.category}
-                onChange={(e) => setRuleCat(rule, e.target.value)}
-                style={rowSelectStyle}
-              >
-                {rule.category && !catOpts.some((c) => c.v === rule.category) && (
-                  <option value={rule.category}>{rule.category}</option>
+              <span style={{ display: 'grid', gap: 5 }}>
+                <select
+                  value={rule.category}
+                  onChange={(e) => setRuleCat(rule, e.target.value)}
+                  style={rowSelectStyle}
+                >
+                  {rule.category && !catOpts.some((c) => c.v === rule.category) && (
+                    <option value={rule.category}>{rule.category}</option>
+                  )}
+                  {catOpts.map((c) => (
+                    <option key={c.v} value={c.v}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+                {taxProfile?.status === 'ready' && (
+                  <span style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+                    <select
+                      aria-label={`Tax mode for ${rule.matchText}`}
+                      value={rule.taxCalculation ?? 'TaxInclusive'}
+                      onChange={(event) => {
+                        const mode = event.target.value as TaxCalculation;
+                        const codeId =
+                          mode === 'NotApplicable'
+                            ? taxCodes.find((code) => code.taxable === false)?.qboId ?? null
+                            : rule.taxCodeQboId;
+                        setRuleTax(rule, mode, codeId);
+                      }}
+                      style={{ ...rowSelectStyle, padding: '6px 7px', fontSize: 11.5 }}
+                    >
+                      <option value="TaxInclusive">Inclusive</option>
+                      <option value="TaxExcluded">Excluded</option>
+                      <option value="NotApplicable">N/A</option>
+                    </select>
+                    <TaxCodePicker
+                      value={rule.taxCodeQboId}
+                      codes={
+                        rule.taxCalculation === 'NotApplicable'
+                          ? taxCodes.filter((code) => code.taxable === false)
+                          : taxCodes
+                      }
+                      onPick={(code) =>
+                        setRuleTax(
+                          rule,
+                          (rule.taxCalculation as TaxCalculation | null) ?? 'TaxInclusive',
+                          code?.qboId ?? null,
+                        )
+                      }
+                      style={{ width: '100%', padding: '6px 7px', fontSize: 11.5 }}
+                      label={`Tax code for ${rule.matchText}`}
+                    />
+                  </span>
                 )}
-                {catOpts.map((c) => (
-                  <option key={c.v} value={c.v}>
-                    {c.label}
-                  </option>
-                ))}
-              </select>
+              </span>
               <span style={{ position: 'relative', display: 'block' }}>
                 <button
                   onClick={(e) => {
@@ -533,7 +730,20 @@ export default function Rules() {
                     type="checkbox"
                     checked={rule.autoPost}
                     onChange={() => toggleAuto(rule)}
-                    style={{ width: 15, height: 15, accentColor: 'var(--acc)', cursor: 'pointer' }}
+                    disabled={
+                      taxProfile?.status === 'ready' &&
+                      (!rule.taxCalculation || !rule.taxCodeQboId)
+                    }
+                    style={{
+                      width: 15,
+                      height: 15,
+                      accentColor: 'var(--acc)',
+                      cursor:
+                        taxProfile?.status === 'ready' &&
+                        (!rule.taxCalculation || !rule.taxCodeQboId)
+                          ? 'not-allowed'
+                          : 'pointer',
+                    }}
                   />
                 </span>
                 <button className="rules-del" onClick={() => deleteRule(rule)} data-tip="Delete rule" style={delStyle}>
@@ -550,15 +760,164 @@ export default function Rules() {
             placeholder="Payee contains…"
             className="rules-add-input"
           />
-          <select value={newCat} onChange={(e) => setNewCat(e.target.value)} style={addSelectStyle}>
-            <option value="">Category…</option>
-            {catOpts.map((c) => (
-              <option key={c.v} value={c.v}>
-                {c.label}
-              </option>
-            ))}
-          </select>
-          <span></span>
+          <span style={{ display: 'grid', gap: 5 }}>
+            <select value={newCat} onChange={(e) => setNewCat(e.target.value)} style={addSelectStyle}>
+              <option value="">Category…</option>
+              {catOpts.map((c) => (
+                <option key={c.v} value={c.v}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+            {taxProfile?.status === 'ready' && (
+              <span style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+                <select
+                  aria-label="New rule tax mode"
+                  value={newTaxMode}
+                  onChange={(event) => {
+                    const mode = event.target.value as TaxCalculation;
+                    setNewTaxMode(mode);
+                    if (mode === 'NotApplicable') {
+                      setNewTaxCodeId(
+                        taxCodes.find((code) => code.taxable === false)?.qboId ?? null,
+                      );
+                    }
+                  }}
+                  style={addSelectStyle}
+                >
+                  <option value="TaxInclusive">Tax inclusive</option>
+                  <option value="TaxExcluded">Tax excluded</option>
+                  <option value="NotApplicable">Not applicable</option>
+                </select>
+                <TaxCodePicker
+                  value={newTaxCodeId}
+                  codes={
+                    newTaxMode === 'NotApplicable'
+                      ? taxCodes.filter((code) => code.taxable === false)
+                      : taxCodes
+                  }
+                  onPick={(code) => setNewTaxCodeId(code?.qboId ?? null)}
+                  style={{ width: '100%', padding: '8px 10px' }}
+                  label="New rule tax code"
+                />
+              </span>
+            )}
+          </span>
+          <span style={{ position: 'relative', display: 'block' }}>
+            <button
+              type="button"
+              aria-label="Tags for new rule"
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpenTagMenu((current) =>
+                  current === NEW_RULE_TAG_MENU ? null : NEW_RULE_TAG_MENU,
+                );
+              }}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                textAlign: 'left',
+                border: '1px solid var(--bd)',
+                borderRadius: 7,
+                padding: '8px 10px',
+                fontSize: 13.5,
+                background: 'var(--card)',
+                color: newTagNames.length ? 'var(--ink)' : 'var(--fnt)',
+                cursor: 'pointer',
+                font: 'inherit',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {newTagNames.length ? newTagNames.join(', ') : 'No tags'}{' '}
+              <span style={{ color: 'var(--fnt)', fontSize: 10 }}>▾</span>
+            </button>
+            {openTagMenu === NEW_RULE_TAG_MENU && (
+              <span
+                onClick={(event) => event.stopPropagation()}
+                style={{
+                  position: 'absolute',
+                  zIndex: 18,
+                  top: 'calc(100% + 6px)',
+                  left: 0,
+                  width: 'min(240px,86vw)',
+                  maxHeight: 240,
+                  overflow: 'auto',
+                  background: 'var(--card)',
+                  border: '1px solid var(--bd)',
+                  borderRadius: 9,
+                  boxShadow: 'var(--sh)',
+                  display: 'block',
+                }}
+              >
+                {tags.length === 0 ? (
+                  <span
+                    style={{
+                      display: 'block',
+                      padding: '10px 13px',
+                      color: 'var(--fnt)',
+                      fontSize: 13,
+                    }}
+                  >
+                    No tags created yet
+                  </span>
+                ) : (
+                  tags.map((tag) => (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      className="rules-tagopt"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setNewTagIds((current) =>
+                          current.includes(tag.id)
+                            ? current.filter((id) => id !== tag.id)
+                            : [...current, tag.id],
+                        );
+                      }}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 9,
+                        width: '100%',
+                        border: 'none',
+                        background: 'none',
+                        cursor: 'pointer',
+                        padding: '9px 13px',
+                        font: 'inherit',
+                        fontSize: 13.5,
+                        color: 'var(--ink)',
+                        textAlign: 'left',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={newTagIds.includes(tag.id)}
+                        readOnly
+                        style={{
+                          width: 14,
+                          height: 14,
+                          accentColor: 'var(--acc)',
+                          pointerEvents: 'none',
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          background: tag.color,
+                          display: 'inline-block',
+                        }}
+                      />
+                      {tag.name}
+                    </button>
+                  ))
+                )}
+              </span>
+            )}
+          </span>
           <span className="rules-add-actions">
             <button
               className="btn-ghost"

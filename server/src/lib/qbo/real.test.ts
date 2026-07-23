@@ -2,11 +2,17 @@
 // with amount = the holding-line sum, and the write-side rebuild replaces only
 // those lines — everything else on the entity survives verbatim.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { QboAuthError } from './types.js';
 import {
+  RealQboClient,
+  exchangeAuthCode,
   mapDeposit,
   mapJournalEntry,
   mapPurchase,
+  mapTaxCode,
+  mapTaxProfile,
+  mapTaxRate,
   parseStatementReport,
   parseTransactionListReport,
   rebuildDepositLines,
@@ -17,9 +23,175 @@ import {
   type RawJournalEntry,
   type RawPurchase,
   type RawReport,
+  type RawTaxCode,
 } from './real.js';
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('OAuth token errors', () => {
+  it('uses a typed reason and omits the upstream body from token endpoint errors', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'invalid_client',
+            error_description: 'bad secret SECRET_SENTINEL',
+          }),
+          { status: 401 },
+        ),
+      ),
+    );
+
+    const error = await exchangeAuthCode({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      redirectUri: 'https://recat.example/qbo/callback',
+      code: 'auth-code',
+    }).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(QboAuthError);
+    expect(error).toMatchObject({ reason: 'INVALID_CLIENT_CREDENTIALS' });
+    expect((error as Error).message).not.toContain('SECRET_SENTINEL');
+  });
+
+  it('maps fetch failures to Intuit unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+
+    const error = await exchangeAuthCode({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      redirectUri: 'https://recat.example/qbo/callback',
+      code: 'auth-code',
+    }).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(QboAuthError);
+    expect(error).toMatchObject({ reason: 'INTUIT_UNAVAILABLE' });
+  });
+});
+
 const HOLDING = new Set(['4']);
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('RealQboClient.verifyConnection', () => {
+  it('forces token refresh, persists rotated credentials, then reads Company Info', async () => {
+    const events: string[] = [];
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(async (input: string | URL | Request) => {
+        events.push('refresh');
+        expect(String(input)).toContain('/tokens/bearer');
+        return new Response(
+          JSON.stringify({
+            access_token: 'rotated-access',
+            refresh_token: 'rotated-refresh',
+            expires_in: 3600,
+          }),
+          { status: 200 },
+        );
+      })
+      .mockImplementationOnce(async (input: string | URL | Request) => {
+        events.push('company-info');
+        expect(String(input)).toContain('/companyinfo/realm-1');
+        return new Response(
+          JSON.stringify({ CompanyInfo: { LegalName: 'Example Company' } }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const persist = vi.fn(async () => {
+      events.push('persist');
+    });
+    const client = new RealQboClient({
+      realmId: 'realm-1',
+      environment: 'sandbox',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      holdingAccountQboIds: [],
+      // A fresh access token proves verification refreshes intentionally.
+      tokens: {
+        accessToken: 'still-fresh',
+        refreshToken: 'stored-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      },
+      onTokensRefreshed: persist,
+    });
+
+    await expect(client.verifyConnection()).resolves.toEqual({
+      realmId: 'realm-1',
+      legalName: 'Example Company',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(persist).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accessToken: 'rotated-access',
+        refreshToken: 'rotated-refresh',
+      }),
+    );
+    expect(events).toEqual(['refresh', 'persist', 'company-info']);
+  });
+});
+
+describe('tax reference mapping', () => {
+  it('preserves company-scoped string IDs and ordered purchase rate references', () => {
+    const raw: RawTaxCode = {
+      Id: 'GST-HST-ON',
+      Name: 'HST ON',
+      Active: true,
+      Taxable: true,
+      PurchaseTaxRateList: {
+        TaxRateDetail: [
+          { TaxRateRef: { value: 'rate-1' }, TaxTypeApplicable: 'TaxOnAmount', TaxOrder: 1 },
+          { TaxRateRef: { value: 'rate-2' }, TaxTypeApplicable: 'TaxOnTax', TaxOrder: 2, TaxOnTaxOrder: 1 },
+        ],
+      },
+    };
+    expect(mapTaxCode(raw)).toMatchObject({
+      qboId: 'GST-HST-ON',
+      active: true,
+      purchaseTaxRateList: [
+        { taxRateQboId: 'rate-1', taxOrder: 1 },
+        { taxRateQboId: 'rate-2', taxOrder: 2, taxOnTaxOrder: 1 },
+      ],
+      salesTaxRateList: [],
+    });
+  });
+
+  it('distinguishes sales-only, inactive, and out-of-scope codes', () => {
+    const salesOnly = mapTaxCode({
+      Id: 'sales',
+      Name: 'Sales only',
+      SalesTaxRateList: { TaxRateDetail: [{ TaxRateRef: { value: 'r1' } }] },
+    });
+    const inactive = mapTaxCode({ Id: 'old', Name: 'Old', Active: false });
+    const outOfScope = mapTaxCode({ Id: 'oos', Name: 'Out of Scope', Taxable: false });
+    expect(salesOnly.purchaseTaxRateList).toEqual([]);
+    expect(salesOnly.salesTaxRateList).toHaveLength(1);
+    expect(inactive.active).toBe(false);
+    expect(outOfScope.taxable).toBe(false);
+  });
+
+  it('maps active and inactive rates plus tax preferences', () => {
+    expect(mapTaxRate({ Id: 'r1', Name: 'GST', RateValue: 5 })).toMatchObject({
+      qboId: 'r1',
+      active: true,
+      rateValue: 5,
+    });
+    expect(mapTaxRate({ Id: 'r2', Name: 'Old', Active: false })).toMatchObject({
+      active: false,
+      rateValue: null,
+    });
+    expect(mapTaxProfile({ TaxPrefs: { UsingSalesTax: true, PartnerTaxEnabled: false } })).toMatchObject({
+      usingSalesTax: true,
+      partnerTaxEnabled: false,
+    });
+  });
+});
 
 /** Two-line purchase: $100 parked in holding + $50 already categorized. */
 function twoLinePurchase(): RawPurchase {

@@ -28,9 +28,23 @@ export type TxnStatus =
 
 export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
+export type QboDiagnosticCode =
+  | 'INVALID_CLIENT_CREDENTIALS'
+  | 'REDIRECT_URI_MISMATCH'
+  | 'AUTHORIZATION_EXPIRED'
+  | 'ACCESS_DENIED'
+  | 'STATE_EXPIRED'
+  | 'INTUIT_UNAVAILABLE'
+  | 'COMPANY_INFO_FAILED'
+  | 'COMPANY_DISCONNECTED'
+  | 'QBO_CONNECTION_FAILED';
 export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
+export type TaxCalculation = 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+export type SuggestionProvider = 'custom' | 'openrouter' | 'codex';
+export type AutopilotMode = 'off' | 'shadow' | 'live';
+export type AgentJobStatus = 'queued' | 'running' | 'retry' | 'completed' | 'failed' | 'cancelled';
 export type AuditAction =
   | 'posted'
   | 'dry-run'
@@ -38,7 +52,8 @@ export type AuditAction =
   | 'reverted'
   | 'superseded'
   | 'transfer'
-  | 'auto-posted';
+  | 'auto-posted'
+  | 'autopilot';
 
 export interface MembershipDto {
   companyId: string;
@@ -89,6 +104,102 @@ export interface CompanyDto {
   connectedAt: string;
   disconnectedAt: string | null;
   lastSyncedAt: string | null;
+  taxReferenceRefreshedAt: string | null;
+  autopilotMode: AutopilotMode;
+}
+
+export interface AgentJobDto {
+  id: string;
+  transactionId: string;
+  companyId: string;
+  status: AgentJobStatus;
+  inputHash: string;
+  attempt: number;
+  nextAttemptAt: string;
+  lockedAt: string | null;
+  leaseExpiresAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentRunDto {
+  id: string;
+  jobId: string;
+  transactionId: string;
+  companyId: string;
+  provider: string;
+  model: string;
+  promptVersion: string;
+  toolSchemaVersion: string;
+  inputHash: string;
+  mode: AutopilotMode;
+  startedAt: string;
+  completedAt: string | null;
+  decision?: unknown;
+  toolTrace?: unknown;
+  validation?: unknown;
+  verification?: unknown;
+  verifier?: unknown;
+  turnCount: number;
+  toolCallCount: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface RuleCandidateDto {
+  id: string;
+  companyId: string;
+  matchText: string;
+  category: string;
+  categoryQboId: string;
+  taxCalculation: TaxCalculation;
+  taxCode: string;
+  taxCodeQboId: string;
+  evidenceCount: number;
+  evidenceRunIds: string[];
+  conflicts: unknown[];
+  status: 'pending' | 'activated' | 'dismissed';
+  createdRuleId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutopilotSummaryDto {
+  mode: AutopilotMode;
+  readiness: {
+    providerConnected: boolean;
+    taxReady: boolean;
+    deploymentWritesEnabled: boolean;
+    companyWritesEnabled: boolean;
+    shadowValidated: number;
+    shadowRequired: number;
+    openUncertainWrites: number;
+    shadowReady: boolean;
+    liveReady: boolean;
+    fatalGate: string | null;
+  };
+  counts: Record<AgentJobStatus, number>;
+  lastRun: AgentRunDto | null;
+}
+
+export interface QboPreflightDto {
+  ok: boolean;
+  clientIdConfigured: boolean;
+  clientSecretConfigured: boolean;
+  environment: QboEnv;
+  redirectUri: string;
+  requiresOAuth: true;
+}
+
+export interface QboConnectionTestDto {
+  ok: true;
+  companyId: string;
+  legalName: string;
+  environment: QboEnv;
+  mode: 'quickbooks' | 'demo';
+  checkedAt: string;
 }
 
 export interface SplitDto {
@@ -97,6 +208,8 @@ export interface SplitDto {
   categoryQboId?: string;
   tagIds: string[];
   memo?: string;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
 }
 
 export interface SuggestionDto {
@@ -108,6 +221,9 @@ export interface SuggestionDto {
   matchedRules?: number;
   /** matchText of the winning (topmost) rule (set when source = 'rule'). */
   winnerMatchText?: string;
+  taxCalculation?: TaxCalculation;
+  taxCode?: string;
+  taxCodeQboId?: string;
 }
 
 export interface TransactionDto {
@@ -123,6 +239,9 @@ export interface TransactionDto {
   status: TxnStatus;
   category: string | null;
   categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
   splits: SplitDto[] | null;
   tagIds: string[];
   suggestion: SuggestionDto | null;
@@ -131,6 +250,13 @@ export interface TransactionDto {
   postedBy: string | null;
   /** id of a detected transfer counterpart (equal |amount|, opposite sign, different account, ≤3 days) */
   transferCandidateId?: string | null;
+  /** Latest completed shadow-mode decision. Evidence only; never staged automatically. */
+  shadowDecision?: {
+    runId: string;
+    completedAt: string;
+    decision: unknown;
+    validation: unknown;
+  } | null;
 }
 
 export interface TagDto {
@@ -178,6 +304,9 @@ export interface RuleDto {
   matchText: string;
   category: string;
   categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
   tagIds: string[];
   autoPost: boolean;
   createdAt: string;
@@ -220,6 +349,22 @@ export interface QboAccountDto {
   active: boolean;
 }
 
+export interface QboTaxCodeDto {
+  qboId: string;
+  name: string;
+  description: string | null;
+  active: boolean;
+  taxable: boolean | null;
+  purchaseApplicable: boolean;
+}
+
+export interface QboTaxProfileDto {
+  status: 'unsupported' | 'needs_setup' | 'ready';
+  usingSalesTax: boolean;
+  lastRefreshedAt: string | null;
+  reason: string | null;
+}
+
 export interface SyncLogDto {
   id: string;
   kind: 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
@@ -234,8 +379,15 @@ export interface InstanceSettingsDto {
   redirectUri: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
+  suggestionProvider: SuggestionProvider;
+  suggestionModel: string;
+  /** ChatGPT subscription model; intentionally independent of custom/OpenRouter. */
+  codexModel: string;
   aiEndpoint: string | null;
   aiKeySet: boolean;
+  openrouterKeySet: boolean;
+  openrouterReferer: string;
+  openrouterTitle: string;
   needsSetup: boolean; // true until an admin user exists
   smtpHost: string;
   smtpPort: number;
@@ -246,8 +398,49 @@ export interface InstanceSettingsDto {
   smtpFromEnv: boolean; // true → SMTP managed by env vars; DB values ignored
 }
 
+export type CodexConnectionState =
+  | 'connected'
+  | 'disconnected'
+  | 'reconnect_required'
+  | 'pending';
+
+/** Public device-flow fields. Upstream device ids and exchange codes never cross the API. */
+export interface CodexDeviceDto {
+  flowId: string;
+  userCode: string;
+  verificationUrl: string;
+  expiresAt: number;
+  intervalMs: number;
+}
+
+export interface CodexDeviceStartDto extends CodexDeviceDto {
+  status: 'pending';
+}
+
+export interface CodexDevicePollDto {
+  status: 'pending' | 'connected' | 'cancelled' | 'expired' | 'failed';
+  retryAfterMs?: number;
+  reconnectRequired?: boolean;
+  reason?: string;
+}
+
+/** Masked connection status safe for the admin client. */
+export interface CodexStatusDto {
+  connected: boolean;
+  state: CodexConnectionState;
+  accountLabel?: string;
+  expiresAt?: number;
+  reconnectRequired?: boolean;
+  reason?: string;
+  device?: CodexDeviceDto;
+}
+
 export interface SessionDto {
   user: UserDto;
+}
+
+export interface AuthMethodsDto {
+  localAdmin: boolean;
 }
 
 // ---- Report payloads ----
@@ -360,6 +553,9 @@ export interface CategorizeBody {
   categoryQboId?: string | null;
   splits?: SplitDto[] | null;
   tagIds?: string[];
+  taxCalculation?: TaxCalculation | null;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
 }
 
 export interface CompanyPatchBody {

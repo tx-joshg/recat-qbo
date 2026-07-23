@@ -16,12 +16,20 @@ import type {
   CompanyDto,
   CompanyPatchBody,
   QboAccountDto,
+  QboTaxCodeDto,
+  QboTaxProfileDto,
   Role,
   TagDto,
   UserDto,
 } from '@recat/shared';
 import { roleFor } from '@recat/shared';
-import { auth, companies as companiesApi, tags as tagsApi, transactions as txnApi } from '../lib/api';
+import {
+  auth,
+  companies as companiesApi,
+  tags as tagsApi,
+  tax as taxApi,
+  transactions as txnApi,
+} from '../lib/api';
 
 export type Theme = 'light' | 'dark';
 
@@ -59,6 +67,9 @@ export interface AppContextValue {
   tags: TagDto[];
   refreshAccounts: () => Promise<void>;
   refreshTags: () => Promise<void>;
+  taxProfile: QboTaxProfileDto | null;
+  taxCodes: QboTaxCodeDto[];
+  refreshTax: () => Promise<void>;
 
   /** PENDING txn count for the active company — the Queue tab badge. */
   pendingCount: number;
@@ -97,6 +108,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const [accounts, setAccounts] = useState<QboAccountDto[]>([]);
   const [tags, setTags] = useState<TagDto[]>([]);
+  const [taxProfile, setTaxProfile] = useState<QboTaxProfileDto | null>(null);
+  const [taxCodes, setTaxCodes] = useState<QboTaxCodeDto[]>([]);
   const [pendingCount, setPendingCount] = useState(0);
 
   const [theme, setTheme] = useState<Theme>(() =>
@@ -199,6 +212,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (refDataCompanyRef.current === cid) setTags(list);
   }, [activeCompanyId]);
 
+  const refreshTax = useCallback(async () => {
+    const cid = activeCompanyId;
+    if (!cid) return;
+    const [profile, codes] = await Promise.all([taxApi.profile(cid), taxApi.codes(cid)]);
+    if (refDataCompanyRef.current === cid) {
+      setTaxProfile(profile);
+      setTaxCodes(codes);
+    }
+  }, [activeCompanyId]);
+
   const refreshPendingCount = useCallback(async () => {
     const cid = activeCompanyId;
     if (!cid) return;
@@ -211,19 +234,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refDataCompanyRef.current = null;
       setAccounts([]);
       setTags([]);
+      setTaxProfile(null);
+      setTaxCodes([]);
       setPendingCount(0);
       return;
     }
     refDataCompanyRef.current = activeCompanyId;
     setAccounts([]);
     setTags([]);
+    setTaxProfile(null);
+    setTaxCodes([]);
     const swallow = () => {
       // screens surface their own errors; the shell just stays empty
     };
     refreshAccounts().catch(swallow);
     refreshTags().catch(swallow);
+    refreshTax().catch(swallow);
     refreshPendingCount().catch(swallow);
-  }, [session, activeCompanyId, refreshAccounts, refreshTags, refreshPendingCount]);
+  }, [session, activeCompanyId, refreshAccounts, refreshTags, refreshTax, refreshPendingCount]);
 
   // ---- theme ----
   const toggleTheme = useCallback(() => {
@@ -263,6 +291,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setCompanies([]);
     setAccounts([]);
     setTags([]);
+    setTaxProfile(null);
+    setTaxCodes([]);
     setPendingCount(0);
   }, []);
 
@@ -285,6 +315,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tags,
       refreshAccounts,
       refreshTags,
+      taxProfile,
+      taxCodes,
+      refreshTax,
       pendingCount,
       setPendingCount,
       refreshPendingCount,
@@ -310,6 +343,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tags,
       refreshAccounts,
       refreshTags,
+      taxProfile,
+      taxCodes,
+      refreshTax,
       pendingCount,
       refreshPendingCount,
       theme,

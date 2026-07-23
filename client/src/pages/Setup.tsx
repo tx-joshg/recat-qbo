@@ -19,13 +19,14 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import type { QboEnv, SyncMode } from '@recat/shared';
+import type { QboEnv, QboPreflightDto, SyncMode } from '@recat/shared';
 import {
   api,
   ApiError,
   auth,
   companies as companiesApi,
   instanceSettings,
+  qboDiagnostics,
   setup,
   transactions,
 } from '../lib/api';
@@ -35,6 +36,12 @@ import { useApp } from '../state/AppContext';
 import type { SmtpProvider } from '../lib/smtpProviders';
 import SmtpPresets from '../components/SmtpPresets';
 import { Spinner } from '../components/ui';
+import {
+  qboCallbackProgress,
+  qboCallbackToastMessage,
+  qboConnectFailureForRender,
+  readQboCallbackFailure,
+} from './qboDiagnostics';
 
 type StepId = 'start' | 'admin' | 'credentials' | 'email' | 'connect' | 'accounts' | 'sync';
 type StartMode = 'demo' | 'real' | null;
@@ -133,14 +140,12 @@ function readSavedProgress(): WizardProgress | null {
   }
 }
 
-/** Saved progress, overridden by ?connected=<companyId> / ?error / ?step=connect. */
+/** Saved progress, overridden by ?connected=<companyId> / callback failure / ?step=connect. */
 function initialProgress(): WizardProgress {
   const params = new URLSearchParams(window.location.search);
   const base = readSavedProgress() ?? DEFAULT_PROGRESS;
-  const connected = params.get('connected');
-  if (connected) return { ...base, stepId: 'connect', companyId: connected, adminSent: false };
-  // OAuth callback failure — stay on the Connect step so the user can retry.
-  if (params.get('error') === 'connect_failed') return { ...base, stepId: 'connect', adminSent: false };
+  const callbackProgress = qboCallbackProgress(window.location.search, base);
+  if (callbackProgress) return callbackProgress;
   if (params.get('step') === 'connect') {
     // /connect re-entry — fresh connection. ?mode=real skips the chooser
     // (Settings upgrade card); otherwise the demo-vs-real chooser shows.
@@ -242,9 +247,10 @@ export default function Setup() {
 
   const [initial] = useState(initialProgress);
   // Captured before the query-consuming effect below strips the search string.
-  const [connectFailed, setConnectFailed] = useState(
-    () => new URLSearchParams(window.location.search).get('error') === 'connect_failed',
+  const [connectFailure, setConnectFailure] = useState(() =>
+    readQboCallbackFailure(window.location.search),
   );
+  const connectFailureToasted = useRef(false);
   // /connect entry — the wizard was re-entered just to add a connection; the
   // demo-vs-real chooser shows (unless ?mode=real pre-picked the real path),
   // and the real path detours through Credentials when the instance has none.
@@ -262,6 +268,7 @@ export default function Setup() {
   const [linkDelivered, setLinkDelivered] = useState(true);
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
+  const [preflight, setPreflight] = useState<QboPreflightDto | null>(null);
   const [smtpHost, setSmtpHost] = useState('');
   const [smtpPort, setSmtpPort] = useState('587');
   const [smtpUser, setSmtpUser] = useState('');
@@ -285,6 +292,7 @@ export default function Setup() {
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
   const [busy, setBusy] = useState(false);
+  const [checkingConfiguration, setCheckingConfiguration] = useState(false);
   // Sync step, webhook path: the Intuit verifier token (saved on finish).
   const [verifierToken, setVerifierToken] = useState('');
 
@@ -301,6 +309,13 @@ export default function Setup() {
   const stepIdx = Math.max(0, steps.indexOf(stepId));
   const goNext = () => setStepId(steps[Math.min(stepIdx + 1, steps.length - 1)] ?? 'sync');
   const goBack = () => setStepId(steps[Math.max(stepIdx - 1, 0)] ?? 'start');
+  const visibleConnectFailure = qboConnectFailureForRender({
+    failure: connectFailure,
+    stepId,
+    syncing,
+    companyId,
+    mode,
+  });
 
   // Consume the query string once (its values are already in initial state).
   useEffect(() => {
@@ -310,7 +325,10 @@ export default function Setup() {
 
   // Surface the OAuth-callback failure once, on arrival.
   useEffect(() => {
-    if (connectFailed) toast('QuickBooks connection failed — try again.');
+    const message = qboCallbackToastMessage(connectFailure, connectFailureToasted.current);
+    if (!message) return;
+    connectFailureToasted.current = true;
+    toast(message);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -522,9 +540,40 @@ export default function Setup() {
       await setup.credentials({ clientId: id, clientSecret: secret, env });
       setStatus((s) => (s ? { ...s, credentialsSet: true } : s));
       afterCredentials();
-    } catch (err) {
-      toast(err instanceof Error ? err.message : 'Could not save the credentials');
+    } catch {
+      toast('Could not save the Intuit credentials. Check the entries and try again.');
     } finally {
+      setBusy(false);
+    }
+  };
+
+  // Save any credentials entered on screen before inspecting the effective
+  // server configuration. The preflight reports presence only, never values.
+  const checkConfiguration = async () => {
+    if (busy) return;
+    const id = clientId.trim();
+    const secret = clientSecret.trim();
+    if ((id === '') !== (secret === '')) {
+      toast('Enter both the Intuit app client ID and secret');
+      return;
+    }
+    if (id === '' && !status?.credentialsSet) {
+      toast('Enter your Intuit app client ID and secret');
+      return;
+    }
+    setBusy(true);
+    setCheckingConfiguration(true);
+    setPreflight(null);
+    try {
+      if (id !== '' && secret !== '') {
+        await setup.credentials({ clientId: id, clientSecret: secret, env });
+        setStatus((s) => (s ? { ...s, credentialsSet: true } : s));
+      }
+      setPreflight(await qboDiagnostics.preflight());
+    } catch {
+      toast('Could not check the QuickBooks configuration. Try again.');
+    } finally {
+      setCheckingConfiguration(false);
       setBusy(false);
     }
   };
@@ -600,7 +649,7 @@ export default function Setup() {
 
   const connectQbo = async () => {
     if (connecting || mode === null) return;
-    setConnectFailed(false);
+    setConnectFailure(undefined);
     setMissingCreds(null);
     setConnecting(true);
     try {
@@ -623,10 +672,10 @@ export default function Setup() {
     } catch (err) {
       setConnecting(false);
       if (err instanceof ApiError && err.code === 'MISSING_CREDENTIALS') {
-        setMissingCreds(err.message);
+        setMissingCreds('Intuit credentials are missing. Save the Client ID and Client Secret first.');
         return;
       }
-      toast(err instanceof Error ? err.message : 'Could not start the connection');
+      toast('Could not start the QuickBooks connection. Check the configuration and try again.');
     }
   };
 
@@ -1071,6 +1120,36 @@ export default function Setup() {
                   </div>
                 ))}
               </div>
+              {preflight && (
+                <div
+                  style={{
+                    marginTop: 16,
+                    border: `1px solid ${preflight.ok ? 'var(--okD)' : 'var(--amD)'}`,
+                    background: preflight.ok ? 'var(--okB)' : 'var(--amB)',
+                    borderRadius: 8,
+                    padding: '14px 16px',
+                    fontSize: 13.5,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  <div style={{ fontWeight: 600, color: 'var(--ink)', marginBottom: 4 }}>
+                    Configuration check
+                  </div>
+                  <div>
+                    Client ID: {preflight.clientIdConfigured ? 'configured' : 'missing'}
+                  </div>
+                  <div>
+                    Client Secret: {preflight.clientSecretConfigured ? 'configured' : 'missing'}
+                  </div>
+                  <div>Environment: {preflight.environment}</div>
+                  <div style={{ overflowWrap: 'anywhere' }}>
+                    Redirect URI: <code style={{ fontSize: 12.5 }}>{preflight.redirectUri}</code>
+                  </div>
+                  <div style={{ color: 'var(--mut)', marginTop: 5 }}>
+                    Complete validation occurs when QuickBooks returns from authorization.
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -1206,6 +1285,22 @@ export default function Setup() {
 
           {/* ---- step · Connect (no mode yet: the demo-vs-real chooser;
                real: env cards + Intuit; demo: one-click fake consent) ---- */}
+          {visibleConnectFailure && (
+            <div
+              style={{
+                fontSize: 13.5,
+                color: 'var(--erT)',
+                border: '1px solid var(--erD)',
+                background: 'var(--erB)',
+                borderRadius: 8,
+                padding: '11px 14px',
+                marginBottom: 16,
+                lineHeight: 1.5,
+              }}
+            >
+              {visibleConnectFailure.message}
+            </div>
+          )}
           {stepId === 'connect' && !syncing && mode === null && (
             <div>
               <div style={stepTitle}>Connect another company</div>
@@ -1270,11 +1365,6 @@ export default function Setup() {
                       Real books — needs Intuit approval
                     </div>
                   </label>
-                </div>
-              )}
-              {connectFailed && !companyId && (
-                <div style={{ fontSize: 13.5, color: 'var(--erT)', margin: '-10px 0 14px' }}>
-                  QuickBooks connection failed — try again.
                 </div>
               )}
               {missingCreds !== null && (
@@ -1586,23 +1676,45 @@ export default function Setup() {
               >
                 ← Back
               </button>
-              <button
-                onClick={wNext}
-                className="sw-primary"
-                style={{
-                  background: 'var(--acc)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: 8,
-                  padding: '10px 22px',
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  fontFamily: 'inherit',
-                }}
-              >
-                {stepId === 'sync' ? 'Finish — run first sync' : 'Continue →'}
-              </button>
+              <div style={{ display: 'flex', gap: 10 }}>
+                {stepId === 'credentials' && (
+                  <button
+                    onClick={() => void checkConfiguration()}
+                    disabled={busy}
+                    style={{
+                      border: '1px solid var(--bd)',
+                      background: 'var(--card)',
+                      color: 'var(--ink)',
+                      borderRadius: 8,
+                      padding: '10px 16px',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: busy ? 'default' : 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    {checkingConfiguration ? 'Checking…' : 'Check configuration'}
+                  </button>
+                )}
+                <button
+                  onClick={wNext}
+                  className="sw-primary"
+                  disabled={busy}
+                  style={{
+                    background: 'var(--acc)',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: 8,
+                    padding: '10px 22px',
+                    fontSize: 14,
+                    fontWeight: 600,
+                    cursor: busy ? 'default' : 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  {stepId === 'sync' ? 'Finish — run first sync' : 'Continue →'}
+                </button>
+              </div>
             </div>
           )}
         </div>

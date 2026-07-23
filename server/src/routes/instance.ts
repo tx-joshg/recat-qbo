@@ -8,6 +8,10 @@ import { redirectUri, webhookUrl } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import {
+  getIntuitCredentialPreflight,
+  testStoredQboConnection,
+} from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { devLoginAllowed } from '../services/devLogin.js';
 import {
@@ -26,10 +30,16 @@ const settingsPatchBody = z.object({
   intuitClientSecret: z.string().optional(),
   webhookVerifierToken: z.string().optional(),
   suggestionSource: z.enum(['builtin', 'ai', 'off']).optional(),
+  suggestionProvider: z.enum(['custom', 'openrouter', 'codex']).optional(),
+  suggestionModel: z.string().trim().min(1).optional(),
+  codexModel: z.string().trim().min(1).optional(),
   aiEndpoint: z.string().nullable().optional(),
   // The client contract (api.ts) sends `aiKey`; `aiApiKey` accepted too.
   aiKey: z.string().optional(),
   aiApiKey: z.string().optional(),
+  openrouterApiKey: z.string().optional(),
+  openrouterReferer: z.string().optional(),
+  openrouterTitle: z.string().optional(),
   smtpHost: z.string().trim().optional(),
   smtpPort: z.number().int().min(1).max(65535).optional(),
   smtpUser: z.string().optional(),
@@ -39,6 +49,13 @@ const settingsPatchBody = z.object({
 
 export const instanceRouter = Router();
 instanceRouter.use(requireUser, requireInstanceAdmin);
+
+instanceRouter.post(
+  '/qbo/preflight',
+  asyncHandler(async (_req, res) => {
+    res.json(await getIntuitCredentialPreflight());
+  }),
+);
 
 instanceRouter.get(
   '/settings',
@@ -57,8 +74,14 @@ instanceRouter.patch(
       ...(body.intuitClientSecret !== undefined ? { intuitClientSecret: body.intuitClientSecret } : {}),
       ...(body.webhookVerifierToken !== undefined ? { webhookVerifierToken: body.webhookVerifierToken } : {}),
       ...(body.suggestionSource !== undefined ? { suggestionSource: body.suggestionSource } : {}),
+      ...(body.suggestionProvider !== undefined ? { suggestionProvider: body.suggestionProvider } : {}),
+      ...(body.suggestionModel !== undefined ? { suggestionModel: body.suggestionModel } : {}),
+      ...(body.codexModel !== undefined ? { codexModel: body.codexModel } : {}),
       ...(body.aiEndpoint !== undefined ? { aiEndpoint: body.aiEndpoint ?? '' } : {}),
       ...(aiApiKey !== undefined ? { aiApiKey } : {}),
+      ...(body.openrouterApiKey !== undefined ? { openrouterApiKey: body.openrouterApiKey } : {}),
+      ...(body.openrouterReferer !== undefined ? { openrouterReferer: body.openrouterReferer } : {}),
+      ...(body.openrouterTitle !== undefined ? { openrouterTitle: body.openrouterTitle } : {}),
       ...(body.smtpHost !== undefined ? { smtpHost: body.smtpHost } : {}),
       ...(body.smtpPort !== undefined ? { smtpPort: body.smtpPort } : {}),
       ...(body.smtpUser !== undefined ? { smtpUser: body.smtpUser } : {}),
@@ -68,6 +91,36 @@ instanceRouter.patch(
     // The mailer caches its transport briefly — new SMTP values apply at once.
     invalidateMailerCache();
     res.json(await getInstanceSettingsDto());
+  }),
+);
+
+// Verify the full stored QuickBooks connection without changing accounting
+// data. Company Info is a read-only QBO endpoint; a token refresh may rotate
+// and persist OAuth credentials as part of normal authentication.
+const testQboBody = z.object({ companyId: z.string().trim().min(1) });
+
+instanceRouter.post(
+  '/settings/test-qbo',
+  asyncHandler(async (req, res) => {
+    const { companyId } = validate(testQboBody)(req.body ?? {});
+    try {
+      const result = await testStoredQboConnection(companyId);
+      if (result.kind === 'demo') {
+        throw new HttpError(
+          400,
+          'Choose a real QuickBooks company to test the stored Intuit credentials.',
+          'QBO_DEMO_COMPANY',
+        );
+      }
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(
+        502,
+        'QuickBooks connection failed. Reconnect QuickBooks or verify the stored Intuit credentials.',
+        'QBO_CONNECTION_FAILED',
+      );
+    }
+    res.json({ ok: true });
   }),
 );
 

@@ -6,14 +6,22 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { Company } from '@prisma/client';
-import type { CompanyDto, PollInterval, QboAccountDto, SyncLogDto } from '@recat/shared';
+import type {
+  CompanyDto,
+  PollInterval,
+  QboAccountDto,
+  QboDiagnosticCode,
+  SyncLogDto,
+} from '@recat/shared';
 import { parseConnectRequest } from '../lib/connectRequest.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
-import { hasIntuitCredentials, qboFactory } from '../lib/qbo/factory.js';
+import { classifyQboFailure } from '../lib/qbo/diagnostics.js';
+import { hasIntuitCredentials, qboFactory, testCompanyConnection } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { syncCompany } from '../services/sync.js';
+import { finishPendingQboDisconnect } from '../services/qboDisconnect.js';
 import { createOauthState } from './qboOauth.js';
 import { teamRouter } from './team.js';
 
@@ -40,6 +48,8 @@ export function toCompanyDto(c: Company): CompanyDto {
     connectedAt: c.connectedAt.toISOString(),
     disconnectedAt: c.disconnectedAt?.toISOString() ?? null,
     lastSyncedAt: c.lastSyncedAt?.toISOString() ?? null,
+    taxReferenceRefreshedAt: c.taxReferenceRefreshedAt?.toISOString() ?? null,
+    autopilotMode: c.autopilotMode,
   };
 }
 
@@ -58,7 +68,6 @@ const patchBody = z.object({
 });
 
 const holdingAccountsBody = z.object({ holdingAccountIds: z.array(z.string().min(1)).min(1) });
-
 export const companiesRouter = Router();
 companiesRouter.use(requireUser);
 
@@ -107,6 +116,30 @@ const connectHandler = asyncHandler(async (req, res) => {
 companiesRouter.get('/connect-url', requireInstanceAdmin, connectHandler);
 companiesRouter.post('/connect', requireInstanceAdmin, connectHandler);
 
+function qboDiagnosticStatus(code: QboDiagnosticCode): number {
+  return code === 'COMPANY_DISCONNECTED' ? 409 : 502;
+}
+
+function qboDiagnosticMessage(code: QboDiagnosticCode): string {
+  return code === 'COMPANY_DISCONNECTED'
+    ? 'This company is disconnected from QuickBooks.'
+    : 'QuickBooks connection test failed.';
+}
+
+companiesRouter.post(
+  '/:companyId/test-connection',
+  requireInstanceAdmin,
+  withCompany({ allowDisconnected: true }),
+  asyncHandler(async (req, res) => {
+    try {
+      res.json(await testCompanyConnection(scopedCompany(req).id));
+    } catch (error) {
+      const code = classifyQboFailure(error, 'company_info');
+      throw new HttpError(qboDiagnosticStatus(code), qboDiagnosticMessage(code), code);
+    }
+  }),
+);
+
 companiesRouter.patch(
   '/:companyId',
   withCompany({ allowDisconnected: true }),
@@ -151,17 +184,38 @@ companiesRouter.delete(
   withCompany({ allowDisconnected: true }),
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
-    await qboFactory.revoke(company.id);
-    await prisma.company.update({
-      where: { id: company.id },
-      data: {
-        disconnectedAt: company.disconnectedAt ?? new Date(),
-        accessToken: null,
-        refreshToken: null,
-        tokenExpiresAt: null,
-      },
-    });
-    res.json({ ok: true });
+    // Close the local gate first. Existing workers either fail their next
+    // company check or finish under the serialization lease; no new write can
+    // begin after the disconnect request.
+    await prisma.$transaction([
+      prisma.company.update({
+        where: { id: company.id },
+        data: {
+          disconnectedAt: company.disconnectedAt ?? new Date(),
+          autopilotMode: 'off',
+          autopilotLiveConfirmedAt: null,
+        },
+      }),
+      prisma.agentJob.updateMany({
+        where: {
+          companyId: company.id,
+          status: { in: ['queued', 'retry'] },
+        },
+        data: {
+          status: 'cancelled',
+          lastErrorCode: 'AGENT_DISABLED',
+          lastErrorMessage: 'QuickBooks was disconnected.',
+          lockOwner: null,
+          lockedAt: null,
+          leaseExpiresAt: null,
+        },
+      }),
+    ]);
+    // Try once now. If a write still owns the company lease, the durable
+    // disconnected marker lets the scheduler finish revocation and local
+    // credential cleanup after that write exits (including across restarts).
+    const cleanupComplete = await finishPendingQboDisconnect(company.id);
+    res.status(cleanupComplete ? 200 : 202).json({ ok: true, cleanupPending: !cleanupComplete });
   }),
 );
 

@@ -6,8 +6,16 @@
 
 import type {
   AuditEntryDto,
+  AgentJobDto,
+  AgentRunDto,
+  AutopilotMode,
+  AutopilotSummaryDto,
+  AuthMethodsDto,
   CategorizeBody,
   CompanyDto,
+  CodexDevicePollDto,
+  CodexDeviceStartDto,
+  CodexStatusDto,
   ConnectMode,
   CompanyPatchBody,
   CustomReportDto,
@@ -16,8 +24,13 @@ import type {
   InstanceSettingsDto,
   PollInterval,
   QboAccountDto,
+  QboConnectionTestDto,
+  QboTaxCodeDto,
+  QboTaxProfileDto,
   QboEnv,
+  QboPreflightDto,
   Role,
+  RuleCandidateDto,
   RuleDto,
   RuleTestResult,
   SavedReportConfig,
@@ -28,6 +41,7 @@ import type {
   TransactionLogDto,
   StatementDto,
   SuggestionSetting,
+  SuggestionProvider,
   SyncMode,
   TagDto,
   TeamMemberDto,
@@ -77,7 +91,7 @@ export const api = {
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
-  del: <T>(path: string) => request<T>('DELETE', path),
+  del: <T>(path: string, body?: unknown) => request<T>('DELETE', path, body),
 };
 
 type QueryValue = string | number | boolean | readonly string[] | undefined;
@@ -153,8 +167,15 @@ export interface InstanceSettingsPatchBody {
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
   suggestionSource?: SuggestionSetting;
+  suggestionProvider?: SuggestionProvider;
+  suggestionModel?: string;
+  codexModel?: string;
   aiEndpoint?: string | null;
   aiKey?: string;
+  aiApiKey?: string;
+  openrouterApiKey?: string;
+  openrouterReferer?: string;
+  openrouterTitle?: string;
   smtpHost?: string;
   smtpPort?: number;
   smtpUser?: string;
@@ -167,6 +188,11 @@ export interface TestEmailResponse {
   ok: boolean;
   delivered: boolean;
   to: string;
+}
+
+/** POST /api/instance/settings/test-qbo — no accounting write; may rotate OAuth tokens. */
+export interface TestQboConnectionResponse {
+  ok: true;
 }
 
 export interface InviteMemberBody {
@@ -206,8 +232,11 @@ export interface ConnectUrlParams {
 // ---------------------------------------------------------------------------
 
 export const auth = {
+  methods: () => api.get<AuthMethodsDto>('/auth/methods'),
   /** Always 200 — no user enumeration. */
   magicLink: (email: string) => api.post<void>('/auth/magic-link', { email }),
+  local: (email: string, password: string) =>
+    api.post<SessionDto>('/auth/local', { email, password }),
   logout: () => api.post<void>('/auth/logout'),
   /** 401 (→ ApiError) when signed out. */
   session: () => api.get<SessionDto>('/api/session'),
@@ -251,6 +280,45 @@ export const transactions = {
   bulkPost: (ids: string[]) => api.post<void>('/api/transactions/bulk-post', { ids }),
 };
 
+export const tax = {
+  profile: (companyId: string) =>
+    api.get<QboTaxProfileDto>(`/api/companies/${companyId}/tax-profile`),
+  codes: (companyId: string, includeInactive = false) =>
+    api.get<QboTaxCodeDto[]>(
+      `/api/companies/${companyId}/tax-codes${includeInactive ? '?includeInactive=true' : ''}`,
+    ),
+  refresh: (companyId: string) =>
+    api.post<QboTaxProfileDto>(`/api/companies/${companyId}/tax-codes/refresh`),
+};
+
+export const autopilot = {
+  summary: (companyId: string) =>
+    api.get<AutopilotSummaryDto>(`/api/companies/${companyId}/autopilot`),
+  setMode: (companyId: string, mode: AutopilotMode, confirmation?: string) =>
+    api.patch<AutopilotSummaryDto>(`/api/companies/${companyId}/autopilot`, {
+      mode,
+      ...(confirmation ? { confirmation } : {}),
+    }),
+  jobs: (companyId: string) =>
+    api.get<AgentJobDto[]>(`/api/companies/${companyId}/autopilot/jobs`),
+  run: (companyId: string, runId: string) =>
+    api.get<AgentRunDto>(`/api/companies/${companyId}/autopilot/runs/${runId}`),
+  retry: (companyId: string, jobId: string) =>
+    api.post<AgentJobDto>(`/api/companies/${companyId}/autopilot/jobs/${jobId}/retry`),
+  cancel: (companyId: string, jobId: string) =>
+    api.post<AgentJobDto>(`/api/companies/${companyId}/autopilot/jobs/${jobId}/cancel`),
+  ruleCandidates: (companyId: string) =>
+    api.get<RuleCandidateDto[]>(`/api/companies/${companyId}/autopilot/rule-candidates`),
+  activateRuleCandidate: (companyId: string, candidateId: string) =>
+    api.post<{ candidateId: string; ruleId: string }>(
+      `/api/companies/${companyId}/autopilot/rule-candidates/${candidateId}/activate`,
+    ),
+  dismissRuleCandidate: (companyId: string, candidateId: string) =>
+    api.post<{ ok: true }>(
+      `/api/companies/${companyId}/autopilot/rule-candidates/${candidateId}/dismiss`,
+    ),
+};
+
 export const tags = {
   list: (companyId: string) => api.get<TagDto[]>(`/api/companies/${companyId}/tags`),
   create: (companyId: string, body: { name: string; color: string }) =>
@@ -269,6 +337,9 @@ export interface RuleBody {
   autoPost?: boolean;
   /** Match order — lowest number wins when several rules match. */
   priority?: number;
+  taxCalculation?: import('@recat/shared').TaxCalculation | null;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
 }
 
 export const rules = {
@@ -339,9 +410,31 @@ export const instanceSettings = {
   get: () => api.get<InstanceSettingsDto>('/api/instance/settings'),
   patch: (body: InstanceSettingsPatchBody) =>
     api.patch<InstanceSettingsDto>('/api/instance/settings', body),
+  /** Verify stored credentials, OAuth tokens, and realm without changing accounting data. */
+  testQbo: (companyId: string) =>
+    api.post<TestQboConnectionResponse>('/api/instance/settings/test-qbo', { companyId }),
   /** Send a test email via the current SMTP config; defaults to the caller's address. */
   testEmail: (to?: string) =>
     api.post<TestEmailResponse>('/api/instance/settings/test-email', to !== undefined ? { to } : {}),
+};
+
+/** Instance-admin ChatGPT subscription/device authorization endpoints. */
+export const codex = {
+  start: () => api.post<CodexDeviceStartDto>('/api/instance/ai/codex/device'),
+  poll: (flowId: string) =>
+    api.post<CodexDevicePollDto>('/api/instance/ai/codex/device/poll', { flowId }),
+  cancel: (flowId: string) =>
+    api.del<CodexDevicePollDto>('/api/instance/ai/codex/device', { flowId }),
+  status: () => api.get<CodexStatusDto>('/api/instance/ai/codex/status'),
+  disconnect: () =>
+    api.del<{ status: 'disconnected' }>('/api/instance/ai/codex'),
+  test: () => api.post<{ ok: true }>('/api/instance/ai/codex/test'),
+};
+
+export const qboDiagnostics = {
+  preflight: () => api.post<QboPreflightDto>('/api/instance/qbo/preflight'),
+  testConnection: (companyId: string) =>
+    api.post<QboConnectionTestDto>(`/api/companies/${companyId}/test-connection`),
 };
 
 /** Instance-level user management — instance admins only. */

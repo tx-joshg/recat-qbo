@@ -4,14 +4,16 @@
 
 import { useState } from 'react';
 import type { MouseEvent } from 'react';
-import type { TagDto, TransactionDto } from '@recat/shared';
+import type { QboTaxCodeDto, TagDto, TaxCalculation, TransactionDto } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
+import TaxCodePicker from './TaxCodePicker';
 
 export interface SplitLineDraft {
   amt: string;
   cat: string;
   tags: string[];
+  taxCodeQboId: string | null;
 }
 
 export interface SplitCatOpt {
@@ -27,15 +29,22 @@ export default function SplitEditor({
   catOpts,
   onClose,
   onSave,
+  taxCodes,
+  taxEnabled,
 }: {
   txn: TransactionDto;
   tags: TagDto[];
   catOpts: SplitCatOpt[];
   onClose: () => void;
-  onSave: (lines: SplitLineDraft[]) => void;
+  onSave: (lines: SplitLineDraft[], taxCalculation: TaxCalculation | null) => void;
+  taxCodes: QboTaxCodeDto[];
+  taxEnabled: boolean;
 }) {
   const { toast } = useApp();
   const total = Math.abs(txn.amount);
+  const [taxCalculation, setTaxCalculation] = useState<TaxCalculation>(
+    txn.taxCalculation ?? 'TaxInclusive',
+  );
 
   // Prototype openSplit(): existing splits load as-is; a categorized (or blank)
   // row seeds line 1 = full amount with current cat/tags + line 2 = 0.00.
@@ -45,17 +54,29 @@ export default function SplitEditor({
           amt: Math.abs(sp.amount).toFixed(2),
           cat: sp.category,
           tags: [...sp.tagIds],
+          taxCodeQboId: sp.taxCodeQboId ?? null,
         }))
       : [
-          { amt: total.toFixed(2), cat: txn.category ?? '', tags: [...txn.tagIds] },
-          { amt: '0.00', cat: '', tags: [] },
+          {
+            amt: total.toFixed(2),
+            cat: txn.category ?? '',
+            tags: [...txn.tagIds],
+            taxCodeQboId: txn.taxCodeQboId,
+          },
+          { amt: '0.00', cat: '', tags: [], taxCodeQboId: null },
         ],
   );
 
   const sum = draft.reduce((a, l) => a + (parseFloat(l.amt) || 0), 0);
   const remain = total - sum;
   const valid =
-    Math.abs(remain) < 0.005 && draft.every((l) => l.cat && (parseFloat(l.amt) || 0) > 0);
+    Math.abs(remain) < 0.005 &&
+    draft.every(
+      (l) =>
+        l.cat &&
+        (parseFloat(l.amt) || 0) > 0 &&
+        (!taxEnabled || l.taxCodeQboId !== null),
+    );
 
   const upd = (i: number, patch: Partial<SplitLineDraft>) =>
     setDraft((d) => d.map((l, j) => (j === i ? { ...l, ...patch } : l)));
@@ -106,6 +127,26 @@ export default function SplitEditor({
         <div style={{ fontSize: 13.5, color: 'var(--mut)', margin: '4px 0 16px' }}>
           {txn.payee} · {fmtMoney(txn.amount)} — assign every dollar to a category.
         </div>
+        {taxEnabled && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, fontSize: 13 }}>
+            <span style={{ color: 'var(--mut)' }}>Tax calculation</span>
+            <select
+              value={taxCalculation}
+              onChange={(event) => setTaxCalculation(event.target.value as TaxCalculation)}
+              style={{
+                border: '1px solid var(--bd)',
+                borderRadius: 7,
+                padding: '7px 9px',
+                background: 'var(--card)',
+                color: 'var(--ink)',
+              }}
+            >
+              <option value="TaxInclusive">Tax inclusive (gross fixed)</option>
+              <option value="TaxExcluded">Tax excluded (gross fixed)</option>
+              <option value="NotApplicable">Not applicable</option>
+            </select>
+          </label>
+        )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {draft.map((l, i) => (
             <div key={i} style={{ border: '1px solid var(--bd2)', borderRadius: 9, padding: '12px 14px' }}>
@@ -150,6 +191,15 @@ export default function SplitEditor({
                     </option>
                   ))}
                 </select>
+                {taxEnabled && (
+                  <TaxCodePicker
+                    value={l.taxCodeQboId}
+                    codes={taxCodes}
+                    onPick={(code) => upd(i, { taxCodeQboId: code?.qboId ?? null })}
+                    style={{ width: 132 }}
+                    label={`Tax code for split ${i + 1}`}
+                  />
+                )}
                 <button
                   onClick={() =>
                     setDraft((d) => (d.length > 1 ? d.filter((_, j) => j !== i) : d))
@@ -216,7 +266,12 @@ export default function SplitEditor({
             onClick={() =>
               setDraft((d) => [
                 ...d,
-                { amt: remain > 0 ? remain.toFixed(2) : '0.00', cat: '', tags: [] },
+                {
+                  amt: remain > 0 ? remain.toFixed(2) : '0.00',
+                  cat: '',
+                  tags: [],
+                  taxCodeQboId: null,
+                },
               ])
             }
             className="hov-dash"
@@ -262,7 +317,7 @@ export default function SplitEditor({
                 toast('Assign the full amount and pick a category on every line');
                 return;
               }
-              onSave(draft);
+              onSave(draft, taxEnabled ? taxCalculation : null);
             }}
             className="hov-acc"
             style={{

@@ -21,9 +21,11 @@ import type {
   StatementRow,
   TransactionLogDto,
 } from '@recat/shared';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '../lib/prisma.js';
 import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
 import type { QboStatement, QboStatementRow } from '../lib/qbo/types.js';
+import { lockCompanyRuleBoundary } from './ruleBoundary.js';
 
 const M_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const FULL_M = [
@@ -535,12 +537,34 @@ export async function setTransactionLogTags(
       : null;
 
   if (localTxn) {
-    await prisma.$transaction([
-      prisma.txnTag.deleteMany({ where: { txnId: localTxn.id } }),
-      ...(tagIds.length > 0
-        ? [prisma.txnTag.createMany({ data: tagIds.map((tagId) => ({ txnId: localTxn.id, tagId })) })]
-        : []),
-    ]);
+    await prisma.$transaction(async (tx) => {
+      // Match autopilot and categorization lock order: Company first, then
+      // Transaction. This prevents a human log-tag edit from deadlocking a
+      // concurrent live staging transaction.
+      await lockCompanyRuleBoundary(tx, companyId);
+      // Claim the parent row before replacing relation-backed tags. This makes
+      // tags participate in the same optimistic version used by autopilot
+      // staging/posting and prevents a model write from erasing a human edit.
+      await tx.transaction.update({
+        where: { id: localTxn.id },
+        data: { updatedAt: new Date() },
+        select: { id: true },
+      });
+      await tx.txnTag.deleteMany({ where: { txnId: localTxn.id } });
+      if (tagIds.length > 0) {
+        await tx.txnTag.createMany({
+          data: tagIds.map((tagId) => ({ txnId: localTxn.id, tagId })),
+        });
+      }
+      // Tags are part of the agent input hash. Mark reconciliation in this
+      // transaction so removing the last tag cannot leave an eligible
+      // transaction stranded without a durable queue pass.
+      await tx.company.update({
+        where: { id: companyId },
+        data: { agentReconcileToken: randomUUID() },
+        select: { id: true },
+      });
+    });
     return;
   }
   await prisma.$transaction([

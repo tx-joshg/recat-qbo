@@ -76,6 +76,14 @@ describe('issueMagicLink', () => {
     expect(mail.subject.toLowerCase()).toContain('invited');
   });
 
+  it('can issue a console-only link without attempting email delivery', async () => {
+    const { link } = await issueMagicLink(USER, { deliver: false });
+
+    expect(link).toContain('/auth/callback?token=');
+    expect(mocks.magicLinkToken.create).toHaveBeenCalledOnce();
+    expect(mocks.sendMail).not.toHaveBeenCalled();
+  });
+
   it('builds the callback URL off APP_URL', () => {
     expect(magicLinkUrl('tok123')).toMatch(/\/auth\/callback\?token=tok123$/);
   });

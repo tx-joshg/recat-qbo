@@ -1,7 +1,7 @@
 // Session auth: random tokens in an httpOnly cookie, stored SHA-256-hashed in
 // the Session table (a DB leak never exposes usable session tokens).
 
-import type { RequestHandler } from 'express';
+import type { CookieOptions, RequestHandler } from 'express';
 import type { Role } from '@recat/shared';
 import type { User } from '@prisma/client';
 import { env, isProd } from '../env.js';
@@ -12,21 +12,35 @@ import { prisma } from '../lib/prisma.js';
 export const SESSION_COOKIE = 'recat_session';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-export const sessionCookieOptions = {
+const sessionCookieBaseOptions = {
   httpOnly: true,
   sameSite: 'lax',
-  secure: isProd,
   path: '/',
   maxAge: SESSION_TTL_MS,
 } as const;
 
+/**
+ * Mixed-origin self-hosting can serve the same deployment over HTTPS on a
+ * tailnet and HTTP on a private LAN. Match the cookie's Secure attribute to
+ * the already origin-checked browser request; non-browser flows fall back to
+ * the canonical APP_URL.
+ */
+export function sessionCookieOptions(origin?: string): CookieOptions {
+  let secure = isProd;
+  try {
+    secure = new URL(origin ?? env.APP_URL).protocol === 'https:';
+  } catch {
+    // Invalid browser origins are rejected by originCheck. Fail secure for any
+    // non-browser caller whose canonical configuration is unexpectedly bad.
+  }
+  return { ...sessionCookieBaseOptions, secure };
+}
+
 /** Same attributes minus maxAge, for res.clearCookie (must match to clear). */
-export const clearCookieOptions = {
-  httpOnly: true,
-  sameSite: 'lax',
-  secure: isProd,
-  path: '/',
-} as const;
+export function clearCookieOptions(origin?: string): CookieOptions {
+  const { maxAge: _maxAge, ...options } = sessionCookieOptions(origin);
+  return options;
+}
 
 export async function createSession(userId: string): Promise<{ token: string; expiresAt: Date }> {
   const token = randomToken(32);
@@ -153,10 +167,44 @@ export const requireInstanceAdmin: RequestHandler = (req, _res, next) => {
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+function httpOrigin(value: string, label: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must contain valid absolute URLs`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${label} must contain only http(s) URLs`);
+  }
+  return url.origin;
+}
+
+/** Canonical APP_URL plus explicitly configured, comma-separated browser origins. */
+export function parseTrustedOrigins(appUrl: string, additionalOrigins: string): ReadonlySet<string> {
+  const origins = new Set<string>([httpOrigin(appUrl, 'APP_URL')]);
+  for (const value of additionalOrigins.split(',')) {
+    const trimmed = value.trim();
+    if (trimmed !== '') origins.add(httpOrigin(trimmed, 'TRUSTED_ORIGINS'));
+  }
+  return origins;
+}
+
+export function originIsTrusted(origin: string, trustedOrigins: ReadonlySet<string>): boolean {
+  try {
+    return trustedOrigins.has(httpOrigin(origin, 'Origin'));
+  } catch {
+    return false;
+  }
+}
+
+const trustedOrigins = parseTrustedOrigins(env.APP_URL, env.TRUSTED_ORIGINS);
+
 /**
  * CSRF hardening: on mutating requests, an Origin header (when present) must
- * match the deployment's APP_URL origin. Requests without an Origin header
- * (curl, same-origin GET-initiated fetches in old browsers) pass through.
+ * match the deployment's APP_URL origin or an explicitly configured
+ * TRUSTED_ORIGINS entry. Requests without an Origin header (curl,
+ * same-origin GET-initiated fetches in old browsers) pass through.
  */
 export const originCheck: RequestHandler = (req, _res, next) => {
   if (!MUTATING_METHODS.has(req.method)) {
@@ -168,19 +216,7 @@ export const originCheck: RequestHandler = (req, _res, next) => {
     next();
     return;
   }
-  let allowed: string;
-  let actual: string | null;
-  try {
-    allowed = new URL(env.APP_URL).origin;
-  } catch {
-    allowed = env.APP_URL;
-  }
-  try {
-    actual = new URL(origin).origin;
-  } catch {
-    actual = null;
-  }
-  if (actual !== allowed) {
+  if (!originIsTrusted(origin, trustedOrigins)) {
     next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
     return;
   }

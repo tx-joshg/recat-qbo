@@ -20,6 +20,9 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-Recat <noreply@example.com>}
+      LOCAL_ADMIN_EMAIL: ${LOCAL_ADMIN_EMAIL:-}
+      LOCAL_ADMIN_PASSWORD: ${LOCAL_ADMIN_PASSWORD:-}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       DRY_RUN: ${DRY_RUN:-false}
     depends_on:
