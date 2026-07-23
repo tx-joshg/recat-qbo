@@ -31,6 +31,7 @@ export type QboEnv = 'sandbox' | 'production';
 export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
+export type SuggestionProvider = 'custom' | 'openrouter' | 'codex';
 export type AuditAction =
   | 'posted'
   | 'dry-run'
@@ -234,8 +235,15 @@ export interface InstanceSettingsDto {
   redirectUri: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
+  suggestionProvider: SuggestionProvider;
+  suggestionModel: string;
+  /** ChatGPT subscription model; intentionally independent of custom/OpenRouter. */
+  codexModel: string;
   aiEndpoint: string | null;
   aiKeySet: boolean;
+  openrouterKeySet: boolean;
+  openrouterReferer: string;
+  openrouterTitle: string;
   needsSetup: boolean; // true until an admin user exists
   smtpHost: string;
   smtpPort: number;
@@ -244,6 +252,43 @@ export interface InstanceSettingsDto {
   smtpPassSet: boolean;
   smtpConfigured: boolean; // an SMTP host is present (env var or DB)
   smtpFromEnv: boolean; // true → SMTP managed by env vars; DB values ignored
+}
+
+export type CodexConnectionState =
+  | 'connected'
+  | 'disconnected'
+  | 'reconnect_required'
+  | 'pending';
+
+/** Public device-flow fields. Upstream device ids and exchange codes never cross the API. */
+export interface CodexDeviceDto {
+  flowId: string;
+  userCode: string;
+  verificationUrl: string;
+  expiresAt: number;
+  intervalMs: number;
+}
+
+export interface CodexDeviceStartDto extends CodexDeviceDto {
+  status: 'pending';
+}
+
+export interface CodexDevicePollDto {
+  status: 'pending' | 'connected' | 'cancelled' | 'expired' | 'failed';
+  retryAfterMs?: number;
+  reconnectRequired?: boolean;
+  reason?: string;
+}
+
+/** Masked connection status safe for the admin client. */
+export interface CodexStatusDto {
+  connected: boolean;
+  state: CodexConnectionState;
+  accountLabel?: string;
+  expiresAt?: number;
+  reconnectRequired?: boolean;
+  reason?: string;
+  device?: CodexDeviceDto;
 }
 
 export interface SessionDto {

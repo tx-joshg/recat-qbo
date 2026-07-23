@@ -33,6 +33,16 @@ enum QboEnv {
   production
 }
 
+enum CodexDeviceFlowState {
+  pending
+  polling
+  authorized
+  completed
+  cancelled
+  expired
+  failed
+}
+
 model User {
   id              String           @id @default(uuid())
   email           String           @unique
@@ -46,6 +56,7 @@ model User {
   magicLinks      MagicLinkToken[]
   sessions        Session[]
   memberships     Membership[]
+  codexDeviceFlows CodexDeviceFlow[]
 }
 
 /// Per-company role (handoff §5 matrix, scoped per specs.md §2).
@@ -294,4 +305,41 @@ model WebhookEvent {
   processed   Boolean   @default(false)
   processedAt DateTime?
   createdAt   DateTime  @default(now())
+}
+
+/// Singleton, instance-global ChatGPT subscription credential. The entire
+/// payload is one authenticated AES-GCM envelope so refresh-token rotation is
+/// atomic and no individual token is queryable in plaintext.
+model CodexCredential {
+  singleton        Boolean  @id @default(true)
+  encryptedPayload String   @map("encrypted_payload") @db.Text
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("ai_codex_credentials")
+}
+
+/// Restart-safe device authorization bound to both the initiating admin and
+/// SHA-256 session hash. Every upstream code/token field is AES-GCM encrypted.
+model CodexDeviceFlow {
+  id                   String               @id @default(uuid())
+  adminUserId          String               @map("admin_user_id")
+  adminUser            User                 @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  sessionHash          String               @map("session_hash") @db.Char(64)
+  deviceAuthIdEnc      String?              @map("device_auth_id_enc") @db.Text
+  userCodeEnc          String?              @map("user_code_enc") @db.Text
+  authorizationCodeEnc String?              @map("authorization_code_enc") @db.Text
+  codeVerifierEnc      String?              @map("code_verifier_enc") @db.Text
+  intervalMs           Int                  @map("interval_ms")
+  expiresAt            DateTime             @map("expires_at")
+  nextPollAt           DateTime             @map("next_poll_at")
+  state                CodexDeviceFlowState @default(pending)
+  failureCode          String?              @map("failure_code") @db.VarChar(100)
+  createdAt            DateTime             @default(now()) @map("created_at")
+  updatedAt            DateTime             @updatedAt @map("updated_at")
+  completedAt          DateTime?            @map("completed_at")
+
+  @@index([adminUserId, sessionHash, state], map: "idx_ai_codex_flows_owner_state")
+  @@index([expiresAt], map: "idx_ai_codex_flows_expiry")
+  @@map("ai_codex_device_flows")
 }
