@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="client/public/icon.svg" alt="Recat QBO logo" width="128" height="128">
+</p>
+
 # Recat QBO
 
 **Self-hosted, open-source transaction categorization and review for QuickBooks Online.**
