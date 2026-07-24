@@ -1,5 +1,54 @@
-import { describe, expect, it } from 'vitest';
-import { historySuggestion, normalizePayee, pickSuggestion, ruleSuggestion, type HistoryTxnLike, type RuleLike } from './suggestions.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  getInstanceSettings: vi.fn(),
+  fetch: vi.fn(),
+  company: { findUnique: vi.fn() },
+  qboAccount: { findMany: vi.fn() },
+  rule: { findMany: vi.fn() },
+  transaction: { findMany: vi.fn() },
+}));
+
+vi.mock('./instanceSettings.js', () => ({ getInstanceSettings: mocks.getInstanceSettings }));
+vi.mock('../lib/prisma.js', () => ({
+  prisma: {
+    company: mocks.company,
+    qboAccount: mocks.qboAccount,
+    rule: mocks.rule,
+    transaction: mocks.transaction,
+  },
+}));
+
+import {
+  historySuggestion,
+  normalizePayee,
+  pickSuggestion,
+  ruleSuggestion,
+  suggestFor,
+  type HistoryTxnLike,
+  type RuleLike,
+} from './suggestions.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal('fetch', mocks.fetch);
+  mocks.getInstanceSettings.mockResolvedValue({
+    suggestionSource: 'ai',
+    aiEndpoint: 'https://models.example/v1',
+    aiApiKey: 'test-key',
+    suggestionModel: 'gpt-4o-mini',
+  });
+  mocks.company.findUnique.mockResolvedValue({ holdingAccountIds: [] });
+  mocks.qboAccount.findMany.mockResolvedValue([
+    { qboId: '1', name: 'Office supplies' },
+  ]);
+  mocks.rule.findMany.mockResolvedValue([]);
+  mocks.transaction.findMany.mockResolvedValue([]);
+  mocks.fetch.mockResolvedValue({
+    ok: true,
+    json: async () => ({ choices: [{ message: { content: 'Office supplies' } }] }),
+  });
+});
 
 function rule(overrides: Partial<RuleLike> & { matchText: string; category: string }): RuleLike {
   return {
@@ -9,6 +58,9 @@ function rule(overrides: Partial<RuleLike> & { matchText: string; category: stri
     categoryQboId: overrides.categoryQboId ?? null,
     priority: overrides.priority ?? 0,
     createdAt: overrides.createdAt ?? new Date('2026-01-01'),
+    taxCalculation: overrides.taxCalculation,
+    taxCode: overrides.taxCode,
+    taxCodeQboId: overrides.taxCodeQboId,
   };
 }
 
@@ -32,6 +84,29 @@ describe('ruleSuggestion', () => {
     const r = rule({ matchText: 'sysco', category: 'Food purchases' });
     expect(ruleSuggestion('SYSCO FOODS #212', [r])).toMatchObject({ category: 'Food purchases', source: 'rule', ruleId: 'r1' });
     expect(ruleSuggestion('COMCAST BUSINESS', [r])).toBeNull();
+  });
+
+  it('matches normalized punctuation and whitespace for generated rules', () => {
+    const r = rule({ matchText: 'acme west', category: 'Supplies' });
+    expect(ruleSuggestion('ACME /  WEST #1234', [r])).toMatchObject({
+      category: 'Supplies',
+      ruleId: 'r1',
+    });
+  });
+
+  it('preserves meaningful digits in normalized rule matching', () => {
+    const r = rule({ matchText: '7-ELEVEN', category: 'Meals' });
+    expect(ruleSuggestion('7 / ELEVEN STORE 1234', [r])).toMatchObject({ ruleId: 'r1' });
+    expect(ruleSuggestion('ELEVEN MADISON PARK', [r])).toBeNull();
+  });
+
+  it('does not broaden punctuation-only or numeric-only rules', () => {
+    expect(
+      ruleSuggestion('C OFFICE SUPPLIES', [rule({ matchText: 'C++', category: 'Software' })]),
+    ).toBeNull();
+    expect(
+      ruleSuggestion('ORDER 1123', [rule({ matchText: '#1123', category: 'Supplies' })]),
+    ).toBeNull();
   });
 
   it('prefers the matching rule with the lowest priority number', () => {
@@ -77,6 +152,24 @@ describe('ruleSuggestion', () => {
     const got = ruleSuggestion('SQ *SQUARE INC', [older, newer]);
     expect(got).toMatchObject({ category: 'Sales — beverage', ruleId: 'new' });
   });
+
+  it('carries a complete rule tax decision without inventing one for legacy rules', () => {
+    const complete = rule({
+      matchText: 'SYSCO',
+      category: 'Food purchases',
+      taxCalculation: 'TaxInclusive',
+      taxCode: 'GST 5%',
+      taxCodeQboId: 'gst',
+    });
+    expect(ruleSuggestion('SYSCO FOODS', [complete])).toMatchObject({
+      taxCalculation: 'TaxInclusive',
+      taxCode: 'GST 5%',
+      taxCodeQboId: 'gst',
+    });
+    expect(ruleSuggestion('SYSCO FOODS', [rule({ matchText: 'SYSCO', category: 'Food purchases' })])).not.toHaveProperty(
+      'taxCalculation',
+    );
+  });
 });
 
 describe('historySuggestion', () => {
@@ -94,6 +187,23 @@ describe('historySuggestion', () => {
 
   it('returns null with no matching history', () => {
     expect(historySuggestion('GUSTO PAYROLL', history)).toBeNull();
+  });
+
+  it('carries only a complete verified-history tax decision', () => {
+    const got = historySuggestion('VENDOR', [
+      {
+        payee: 'VENDOR',
+        category: 'Supplies',
+        categoryQboId: '20',
+        taxCalculation: 'TaxInclusive',
+        taxCode: 'GST 5%',
+        taxCodeQboId: 'gst',
+      },
+    ]);
+    expect(got).toMatchObject({
+      taxCalculation: 'TaxInclusive',
+      taxCodeQboId: 'gst',
+    });
   });
 });
 
@@ -116,5 +226,89 @@ describe('pickSuggestion precedence', () => {
 
   it('returns null when history is disabled and no rule matches', () => {
     expect(pickSuggestion('SYSCO FOODS #212', [], history, false)).toBeNull();
+  });
+});
+
+describe('AI suggestion model', () => {
+  it('sends the configured model in the existing chat completion request', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionSource: 'ai',
+      aiEndpoint: 'https://models.example/v1',
+      aiApiKey: 'test-key',
+      suggestionModel: 'local-category-model',
+    });
+
+    await expect(suggestFor('company-1', { payee: 'MODEL TEST CONFIGURED', amount: -12.34 })).resolves.toMatchObject({
+      category: 'Office supplies',
+      source: 'ai',
+    });
+
+    expect(JSON.parse(mocks.fetch.mock.calls[0]?.[1]?.body as string)).toMatchObject({ model: 'local-category-model' });
+  });
+
+  it('sends gpt-4o-mini when the merged setting is at its default', async () => {
+    await expect(suggestFor('company-1', { payee: 'MODEL TEST DEFAULT', amount: -56.78 })).resolves.toMatchObject({
+      category: 'Office supplies',
+      source: 'ai',
+    });
+
+    expect(JSON.parse(mocks.fetch.mock.calls[0]?.[1]?.body as string)).toMatchObject({ model: 'gpt-4o-mini' });
+  });
+
+  it('uses the pinned OpenRouter endpoint and passes a vendor-qualified model through', async () => {
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionSource: 'ai',
+      suggestionProvider: 'openrouter',
+      aiEndpoint: 'https://custom.example/v1',
+      aiApiKey: 'custom-key',
+      openrouterApiKey: 'openrouter-key',
+      openrouterReferer: 'https://recat.example',
+      openrouterTitle: 'Recat QBO',
+      suggestionModel: 'openai/gpt-4o-mini',
+    });
+
+    await expect(suggestFor('company-1', { payee: 'OPENROUTER DISPATCH', amount: -12.34 })).resolves.toMatchObject({
+      category: 'Office supplies',
+      source: 'ai',
+    });
+
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      'https://openrouter.ai/api/v1/chat/completions',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer openrouter-key',
+          'HTTP-Referer': 'https://recat.example',
+          'X-Title': 'Recat QBO',
+        }),
+        body: expect.stringContaining('openai/gpt-4o-mini'),
+      }),
+    );
+  });
+
+  it('caches a valid blank model answer as no suggestion', async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '   ' } }] }),
+    });
+
+    await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
+    await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
+
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates cached AI suggestions when effective model settings change', async () => {
+    const payee = 'CACHE SETTINGS TEST';
+    await suggestFor('company-1', { payee, amount: -12.34 });
+    mocks.getInstanceSettings.mockResolvedValue({
+      suggestionSource: 'ai',
+      aiEndpoint: 'https://models.example/v1',
+      aiApiKey: 'test-key',
+      suggestionModel: 'replacement-model',
+    });
+
+    await suggestFor('company-1', { payee, amount: -12.34 });
+
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
   });
 });

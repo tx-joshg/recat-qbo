@@ -18,10 +18,16 @@ import {
   type QboClient,
   type QboCompanyInfo,
   type QboStatement,
+  type QboTaxCodeInfo,
+  type QboTaxProfile,
+  type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
   type QboWriteResult,
 } from './types.js';
+import { buildPurchaseRecategorization, buildPurchaseRestore, type QboPreparedWrite } from './purchaseTax.js';
+import type { RawPurchase } from './real.js';
+import type { QboRecategorizationPlan } from '../../services/tax/model.js';
 
 import { MOCK_REALM_IDS } from '@recat/shared';
 
@@ -48,6 +54,8 @@ interface MockLine {
   amount: number;
   accountQboId: string;
   memo?: string;
+  taxCodeQboId?: string;
+  taxInclusiveAmount?: number;
 }
 
 interface MockTxnEntity {
@@ -64,6 +72,8 @@ interface MockTxnEntity {
   lines: MockLine[];
   lastUpdated: string; // ISO
   deleted?: boolean;
+  taxCalculation?: QboRecategorizationPlan['taxCalculation'];
+  totalTax?: number;
 }
 
 interface MockTransfer {
@@ -83,6 +93,58 @@ export interface MockRealm {
   txns: MockTxnEntity[];
   transfers: MockTransfer[];
   nextId: number;
+  taxCodes?: QboTaxCodeInfo[];
+  taxRates?: QboTaxRateInfo[];
+  usingSalesTax?: boolean;
+}
+
+function mockTaxRates(): QboTaxRateInfo[] {
+  return [
+    { qboId: 'tax-rate-gst-5', name: 'GST 5%', active: true, rateValue: 5, raw: { Id: 'tax-rate-gst-5' } },
+    { qboId: 'tax-rate-hst-13', name: 'HST 13%', active: true, rateValue: 13, raw: { Id: 'tax-rate-hst-13' } },
+    { qboId: 'tax-rate-old', name: 'Old tax', active: false, rateValue: 7, raw: { Id: 'tax-rate-old' } },
+  ];
+}
+
+function mockTaxCodes(): QboTaxCodeInfo[] {
+  return [
+    {
+      qboId: 'tax-gst-5',
+      name: 'GST 5%',
+      active: true,
+      taxable: true,
+      purchaseTaxRateList: [{ taxRateQboId: 'tax-rate-gst-5', taxOrder: 1 }],
+      salesTaxRateList: [],
+      raw: { Id: 'tax-gst-5' },
+    },
+    {
+      qboId: 'tax-hst-13',
+      name: 'HST 13%',
+      active: true,
+      taxable: true,
+      purchaseTaxRateList: [{ taxRateQboId: 'tax-rate-hst-13', taxOrder: 1 }],
+      salesTaxRateList: [],
+      raw: { Id: 'tax-hst-13' },
+    },
+    {
+      qboId: 'tax-out-of-scope',
+      name: 'Out of Scope',
+      active: true,
+      taxable: false,
+      purchaseTaxRateList: [],
+      salesTaxRateList: [],
+      raw: { Id: 'tax-out-of-scope' },
+    },
+    {
+      qboId: 'tax-sales-only',
+      name: 'Sales only',
+      active: true,
+      taxable: true,
+      purchaseTaxRateList: [],
+      salesTaxRateList: [{ taxRateQboId: 'tax-rate-gst-5' }],
+      raw: { Id: 'tax-sales-only' },
+    },
+  ];
 }
 
 function acct(qboId: string, name: string, classification: string, accountType: string): MockAccount {
@@ -371,7 +433,40 @@ export class MockQboClient implements QboClient {
         accountName: this.accountById(l.accountQboId)?.name ?? '',
         memo: l.memo,
       })),
-      raw: JSON.parse(JSON.stringify(e)) as unknown,
+      raw:
+        e.qboType === 'Purchase'
+          ? ({
+              Id: e.qboId,
+              SyncToken: String(e.syncToken),
+              TxnDate: e.date,
+              TotalAmt: Math.abs(e.amount),
+              Credit: e.amount > 0,
+              PrivateNote: e.memo,
+              EntityRef: { value: `vendor-${e.qboId}`, name: e.payee },
+              AccountRef: {
+                value: e.bankAccountQboId,
+                name: this.accountById(e.bankAccountQboId)?.name ?? '',
+              },
+              GlobalTaxCalculation: e.taxCalculation,
+              ...(e.totalTax !== undefined ? { TxnTaxDetail: { TotalTax: e.totalTax } } : {}),
+              Line: e.lines.map((line) => ({
+                Id: line.id,
+                Amount: line.amount,
+                DetailType: 'AccountBasedExpenseLineDetail',
+                Description: line.memo,
+                AccountBasedExpenseLineDetail: {
+                  AccountRef: {
+                    value: line.accountQboId,
+                    name: this.accountById(line.accountQboId)?.name ?? '',
+                  },
+                  ...(line.taxCodeQboId ? { TaxCodeRef: { value: line.taxCodeQboId } } : {}),
+                  ...(line.taxInclusiveAmount !== undefined
+                    ? { TaxInclusiveAmt: line.taxInclusiveAmount }
+                    : {}),
+                },
+              })),
+            } satisfies RawPurchase)
+          : (JSON.parse(JSON.stringify(e)) as unknown),
     };
   }
 
@@ -396,6 +491,26 @@ export class MockQboClient implements QboClient {
       accountType: a.accountType,
       active: true,
     }));
+  }
+
+  async getTaxProfile(): Promise<QboTaxProfile> {
+    await ensureMockRealmsHydrated();
+    const usingSalesTax = this.realm.usingSalesTax ?? this.realmId !== MOCK_REALM_BLUEBIRD;
+    return {
+      usingSalesTax,
+      partnerTaxEnabled: false,
+      raw: { TaxPrefs: { UsingSalesTax: usingSalesTax } },
+    };
+  }
+
+  async listTaxCodes(): Promise<QboTaxCodeInfo[]> {
+    await ensureMockRealmsHydrated();
+    return structuredClone(this.realm.taxCodes ?? mockTaxCodes());
+  }
+
+  async listTaxRates(): Promise<QboTaxRateInfo[]> {
+    await ensureMockRealmsHydrated();
+    return structuredClone(this.realm.taxRates ?? mockTaxRates());
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {
@@ -530,6 +645,70 @@ export class MockQboClient implements QboClient {
     const result = this.replaceLines(txn, this.holdingIds, splits);
     await persistMockRealm(this.realmId);
     return result;
+  }
+
+  async prepareRecategorization(
+    txn: QboTxn,
+    plan: QboRecategorizationPlan,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    await ensureMockRealmsHydrated();
+    return buildPurchaseRecategorization(
+      txn,
+      this.holdingIds,
+      plan,
+      { taxCodes: await this.listTaxCodes(), taxRates: await this.listTaxRates() },
+      requestId,
+    );
+  }
+
+  async executePreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
+    await ensureMockRealmsHydrated();
+    const entity = this.findEntity('Purchase', prepared.body.Id);
+    if (!entity) throw new Error(`Mock QBO: Purchase ${prepared.body.Id} not found`);
+    if (String(entity.syncToken) !== prepared.body.SyncToken) throw new QboSyncTokenConflict();
+    entity.lines = (prepared.body.Line ?? []).map((line, index) => {
+      const detail = line.AccountBasedExpenseLineDetail;
+      const accountQboId = detail?.AccountRef?.value;
+      if (!accountQboId || !this.accountById(accountQboId)) {
+        throw new Error(`Mock QBO: unknown account id "${accountQboId ?? ''}" in realm ${this.realmId}`);
+      }
+      return {
+        id: line.Id ?? String(index + 1),
+        amount: round2(line.Amount ?? 0),
+        accountQboId,
+        ...(line.Description !== undefined ? { memo: line.Description } : {}),
+        ...(detail?.TaxCodeRef?.value ? { taxCodeQboId: detail.TaxCodeRef.value } : {}),
+        ...(detail?.TaxInclusiveAmt !== undefined ? { taxInclusiveAmount: detail.TaxInclusiveAmt } : {}),
+      };
+    });
+    entity.taxCalculation = prepared.body.GlobalTaxCalculation;
+    entity.totalTax =
+      prepared.operation === 'recategorize'
+        ? round2(
+            prepared.expected.targetLines.reduce((sum, line) => sum + line.taxCents, 0) / 100,
+          )
+        : prepared.expected.totalTaxCents === null
+          ? undefined
+          : prepared.expected.totalTaxCents / 100;
+    entity.syncToken += 1;
+    entity.lastUpdated = new Date().toISOString();
+    await persistMockRealm(this.realmId);
+    const response = { Purchase: this.toQboTxn(entity, this.holdingIds).raw as RawPurchase };
+    return {
+      ok: true,
+      newSyncToken: String(entity.syncToken),
+      rawResponse: response,
+    };
+  }
+
+  async preparePurchaseRestore(
+    txn: QboTxn,
+    before: RawPurchase,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    await ensureMockRealmsHydrated();
+    return buildPurchaseRestore(txn, before, requestId);
   }
 
   async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {

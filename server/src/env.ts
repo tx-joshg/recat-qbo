@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { parseLocalAdminConfig } from './services/localAdminConfig.js';
 
 // Load the repo-root .env (Node ≥20.12 built-in; no dotenv dependency).
 // Values already present in the environment win — .env only fills gaps.
@@ -42,6 +43,11 @@ const schema = z.object({
   QBO_CLIENT_SECRET: z.string().optional().default(''),
   QBO_ENVIRONMENT: z.enum(['sandbox', 'production']).default('sandbox'),
   QBO_WEBHOOK_VERIFIER_TOKEN: z.string().optional().default(''),
+  SUGGESTION_MODEL: z.string().optional(),
+  SUGGESTION_PROVIDER: z.string().optional(),
+  OPENROUTER_API_KEY: z.string().optional(),
+  OPENROUTER_REFERER: z.string().optional(),
+  OPENROUTER_TITLE: z.string().optional(),
   QBO_MOCK: z
     .string()
     .default('false')
@@ -64,11 +70,23 @@ const schema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true'),
+  LOCAL_ADMIN_EMAIL: z.string().optional().default(''),
+  LOCAL_ADMIN_PASSWORD: z.string().optional().default(''),
+  // Additional browser origins allowed to make authenticated mutations.
+  // APP_URL remains the canonical public/OAuth URL.
+  TRUSTED_ORIGINS: z.string().optional().default(''),
+  TRUSTED_PROXY_IPS: z.string().optional().default(''),
   DIGEST_HOUR: z.coerce.number().min(0).max(23).default(8),
   NODE_ENV: z.string().default('development'),
 });
 
-export const env = schema.parse(process.env);
+const parsedEnv = schema.parse(process.env);
+
+export const localAdminConfig = parseLocalAdminConfig(
+  parsedEnv.LOCAL_ADMIN_EMAIL,
+  parsedEnv.LOCAL_ADMIN_PASSWORD,
+);
+export const env = parsedEnv;
 
 export const isProd = env.NODE_ENV === 'production';
 

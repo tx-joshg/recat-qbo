@@ -5,6 +5,11 @@
 // the exact same sync/write-back paths as production. Which implementation a
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
+import type { QboDiagnosticCode } from '@recat/shared';
+import type { QboPreparedWrite } from './purchaseTax.js';
+import type { RawPurchase } from './real.js';
+import type { QboRecategorizationPlan } from '../../services/tax/model.js';
+
 export interface QboTokenSet {
   accessToken: string;
   refreshToken: string;
@@ -21,6 +26,40 @@ export interface QboAccountInfo {
   classification: string;
   accountType: string;
   active: boolean;
+}
+
+export interface QboTaxRateDetail {
+  taxRateQboId: string;
+  taxTypeApplicable?: string;
+  taxOrder?: number;
+  taxOnTaxOrder?: number;
+}
+
+export interface QboTaxCodeInfo {
+  qboId: string;
+  name: string;
+  description?: string;
+  active: boolean;
+  taxable: boolean | null;
+  purchaseTaxRateList: QboTaxRateDetail[];
+  salesTaxRateList: QboTaxRateDetail[];
+  raw: unknown;
+}
+
+export interface QboTaxRateInfo {
+  qboId: string;
+  name: string;
+  description?: string;
+  active: boolean;
+  rateValue: number | null;
+  raw: unknown;
+}
+
+export interface QboTaxProfile {
+  usingSalesTax: boolean;
+  /** QBO locale/capability signal when supplied by Preferences. */
+  partnerTaxEnabled: boolean | null;
+  raw: unknown;
 }
 
 export interface QboTxnLine {
@@ -106,6 +145,7 @@ export interface QboLogTxn {
 export interface QboWriteResult {
   ok: true;
   newSyncToken: string;
+  rawResponse?: unknown;
 }
 
 export class QboSyncTokenConflict extends Error {
@@ -117,6 +157,13 @@ export class QboSyncTokenConflict extends Error {
 
 export class QboAuthError extends Error {
   code = 'QBO_AUTH' as const;
+  readonly reason: QboDiagnosticCode;
+
+  constructor(message: string, reason: QboDiagnosticCode = 'QBO_CONNECTION_FAILED') {
+    super(message);
+    this.name = 'QboAuthError';
+    this.reason = reason;
+  }
 }
 
 /**
@@ -134,6 +181,9 @@ export interface QboClient {
 
   getCompanyInfo(): Promise<QboCompanyInfo>;
   listAccounts(): Promise<QboAccountInfo[]>;
+  getTaxProfile(): Promise<QboTaxProfile>;
+  listTaxCodes(): Promise<QboTaxCodeInfo[]>;
+  listTaxRates(): Promise<QboTaxRateInfo[]>;
 
   /**
    * All txns (Purchase/Deposit/JournalEntry) with a line posting to any of the
@@ -158,6 +208,18 @@ export interface QboClient {
     txn: QboTxn,
     splits: { amount: number; accountQboId: string; memo?: string }[],
   ): Promise<QboWriteResult>;
+
+  /** Build once after a fresh read; dry-run and live persist this exact artifact. */
+  prepareRecategorization(
+    txn: QboTxn,
+    plan: QboRecategorizationPlan,
+    requestId: string,
+  ): Promise<QboPreparedWrite>;
+
+  /** Execute the prepared body with its already-stored stable request ID. */
+  executePreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult>;
+
+  preparePurchaseRestore(txn: QboTxn, before: RawPurchase, requestId: string): Promise<QboPreparedWrite>;
 
   /**
    * Undo: replace the lines posting to `fromAccountQboIds` (the categories a

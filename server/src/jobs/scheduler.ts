@@ -5,10 +5,23 @@
 // exactly once per day even though the ticker runs every minute.
 
 import { env } from '../env.js';
+import { hostname } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import {
+  requeueStaleAgentJobs,
+  sweepExpiredAgentLeases,
+} from '../services/agent/jobs.js';
+import { sweepPendingAutopilotReconciliations } from '../services/agent/reconciliation.js';
+import { runAgentWorkerBatch } from '../services/agent/worker.js';
 import { writeAudit } from '../services/audit.js';
-import { syncCompany, type SyncKind } from '../services/sync.js';
+import { sweepPendingQboDisconnects } from '../services/qboDisconnect.js';
+import { dueRuleWriteRetryCompanyIds } from '../services/ruleWriteRetry.js';
+import {
+  syncCompany,
+  type SyncKind,
+} from '../services/sync.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -18,6 +31,8 @@ let ticker: NodeJS.Timeout | null = null;
 const inFlight = new Set<string>();
 let lastNightlyDate = '';
 let lastDigestDate = '';
+const agentWorkerId = `${hostname()}:${process.pid}:${randomUUID()}`;
+let agentWorkerInFlight = false;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
@@ -87,6 +102,11 @@ async function pollTick(now: Date): Promise<void> {
   }
 }
 
+async function deferredRuleWriteTick(now: Date): Promise<void> {
+  const companyIds = await dueRuleWriteRetryCompanyIds(now);
+  for (const companyId of companyIds) runSync(companyId, 'poll');
+}
+
 // ---------------------------------------------------------------------------
 // Nightly reconcile (02:00 server time) — full sweep catches txns fixed
 // directly inside QuickBooks (SUPERSEDED detection).
@@ -151,6 +171,19 @@ async function tick(): Promise<void> {
   const now = new Date();
   try {
     await sweepStuckPosting();
+    await sweepExpiredAgentLeases(now);
+    await sweepPendingQboDisconnects();
+    await requeueStaleAgentJobs();
+    await sweepPendingAutopilotReconciliations();
+    if (!agentWorkerInFlight) {
+      agentWorkerInFlight = true;
+      void runAgentWorkerBatch(agentWorkerId)
+        .catch((err) => console.error('[jobs] autopilot worker failed:', err))
+        .finally(() => {
+          agentWorkerInFlight = false;
+        });
+    }
+    await deferredRuleWriteTick(now);
     await pollTick(now);
     await nightlyTick(now);
     await digestTick(now);
@@ -163,6 +196,29 @@ export function startJobs(): void {
   if (ticker !== null) return;
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));
+  sweepExpiredAgentLeases().catch((err) =>
+    console.error('[jobs] boot agent-lease sweep failed:', err),
+  );
+  sweepPendingQboDisconnects().catch((err) =>
+    console.error('[jobs] boot QuickBooks disconnect sweep failed:', err),
+  );
+  requeueStaleAgentJobs().catch((err) =>
+    console.error('[jobs] boot stale-agent-job recovery failed:', err),
+  );
+  sweepPendingAutopilotReconciliations().catch((err) =>
+    console.error('[jobs] boot autopilot reconciliation failed:', err),
+  );
+  dueRuleWriteRetryCompanyIds()
+    .then((companyIds) => {
+      for (const companyId of companyIds) runSync(companyId, 'poll');
+    })
+    .catch((err) => console.error('[jobs] boot deferred-rule recovery failed:', err));
+  agentWorkerInFlight = true;
+  void runAgentWorkerBatch(agentWorkerId)
+    .catch((err) => console.error('[jobs] boot autopilot worker failed:', err))
+    .finally(() => {
+      agentWorkerInFlight = false;
+    });
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();

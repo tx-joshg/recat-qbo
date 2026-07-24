@@ -33,19 +33,51 @@ enum QboEnv {
   production
 }
 
+enum CodexDeviceFlowState {
+  pending
+  polling
+  authorized
+  completed
+  cancelled
+  expired
+  failed
+}
+
+enum AutopilotMode {
+  off
+  shadow
+  live
+}
+
+enum AgentJobStatus {
+  queued
+  running
+  retry
+  completed
+  failed
+  cancelled
+}
+
+enum RuleCandidateStatus {
+  pending
+  activated
+  dismissed
+}
+
 model User {
-  id              String           @id @default(uuid())
-  email           String           @unique
-  name            String?
+  id               String            @id @default(uuid())
+  email            String            @unique
+  name             String?
   /// Instance admins manage instance settings, users, and company connections,
   /// and implicitly hold the admin role in every company.
-  isInstanceAdmin Boolean          @default(false)
-  invitePending   Boolean          @default(false)
-  dashboardLayout Json?
-  createdAt       DateTime         @default(now())
-  magicLinks      MagicLinkToken[]
-  sessions        Session[]
-  memberships     Membership[]
+  isInstanceAdmin  Boolean           @default(false)
+  invitePending    Boolean           @default(false)
+  dashboardLayout  Json?
+  createdAt        DateTime          @default(now())
+  magicLinks       MagicLinkToken[]
+  sessions         Session[]
+  memberships      Membership[]
+  codexDeviceFlows CodexDeviceFlow[]
 }
 
 /// Per-company role (handoff §5 matrix, scoped per specs.md §2).
@@ -79,61 +111,206 @@ model Session {
 }
 
 model Company {
-  id                String        @id @default(uuid())
-  realmId           String        @unique
-  legalName         String
-  nickname          String
-  env               QboEnv        @default(sandbox)
-  syncMode          SyncMode      @default(polling)
-  pollIntervalMin   Int           @default(10)
-  holdingAccountIds Json          @default("[]")
-  dryRun            Boolean       @default(true)
-  tagsRequired      Boolean       @default(false)
-  accessToken       String? // encrypted (AES-256-GCM)
-  refreshToken      String? // encrypted (AES-256-GCM)
-  tokenExpiresAt    DateTime?
-  connectedAt       DateTime      @default(now())
-  disconnectedAt    DateTime?
-  lastSyncedAt      DateTime?
-  transactions      Transaction[]
-  tags              Tag[]
-  rules             Rule[]
-  savedReports      SavedReport[]
-  auditEntries      AuditEntry[]
-  qboAccounts       QboAccount[]
-  syncLogs          SyncLog[]
-  memberships       Membership[]
-  logTags           LogTag[]
+  id                       String             @id @default(uuid())
+  realmId                  String             @unique
+  legalName                String
+  nickname                 String
+  env                      QboEnv             @default(sandbox)
+  syncMode                 SyncMode           @default(polling)
+  pollIntervalMin          Int                @default(10)
+  holdingAccountIds        Json               @default("[]")
+  dryRun                   Boolean            @default(true)
+  tagsRequired             Boolean            @default(false)
+  accessToken              String? // encrypted (AES-256-GCM)
+  refreshToken             String? // encrypted (AES-256-GCM)
+  tokenExpiresAt           DateTime?
+  connectedAt              DateTime           @default(now())
+  disconnectedAt           DateTime?
+  lastSyncedAt             DateTime?
+  taxReferenceRefreshedAt  DateTime?
+  taxUsingSalesTax         Boolean?
+  taxSupportStatus         String             @default("needs_setup")
+  taxSupportReason         String?
+  autopilotMode            AutopilotMode      @default(off)
+  autopilotLiveConfirmedAt DateTime?
+  agentReconcileToken      String?
+  ruleWriteRetryAt         DateTime?
+  transactions             Transaction[]
+  tags                     Tag[]
+  rules                    Rule[]
+  savedReports             SavedReport[]
+  auditEntries             AuditEntry[]
+  qboAccounts              QboAccount[]
+  qboTaxCodes              QboTaxCode[]
+  qboTaxRates              QboTaxRate[]
+  syncLogs                 SyncLog[]
+  memberships              Membership[]
+  logTags                  LogTag[]
+  agentJobs                AgentJob[]
+  agentRuns                AgentRun[]
+  agentCompanyLease        AgentCompanyLease?
+  ruleCandidates           RuleCandidate[]
+
+  @@index([agentReconcileToken])
+  @@index([ruleWriteRetryAt])
 }
 
 model Transaction {
-  id             String    @id @default(uuid())
-  companyId      String
-  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  qboId          String
-  qboType        String // Purchase | Deposit | JournalEntry
-  qboSyncToken   String
-  date           DateTime
-  payee          String
-  memo           String?
-  amount         Decimal   @db.Decimal(14, 2) // signed; + = money in
-  bankAccount    String
-  status         TxnStatus @default(PENDING)
-  category       String? // chosen category display name (single-category case)
-  categoryQboId  String? // chosen QBO account id (single-category case)
-  splitLines     SplitLine[] // when present, replaces category (multi-category)
-  suggestion     Json? // { category, categoryQboId?, source: 'rule'|'history'|'ai', ruleId? }
-  errorCode      String?
-  errorMessage   String?
-  postedAt       DateTime?
-  postedByUserId String?
-  rawData        Json?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  txnTags        TxnTag[]
+  id               String               @id @default(uuid())
+  companyId        String
+  company          Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId            String
+  qboType          String // Purchase | Deposit | JournalEntry
+  qboSyncToken     String
+  date             DateTime
+  payee            String
+  memo             String?
+  amount           Decimal              @db.Decimal(14, 2) // signed; + = money in
+  bankAccount      String
+  status           TxnStatus            @default(PENDING)
+  category         String? // chosen category display name (single-category case)
+  categoryQboId    String? // chosen QBO account id (single-category case)
+  taxCalculation   String? // TaxInclusive | TaxExcluded | NotApplicable (Purchase only)
+  taxCode          String? // chosen QBO tax code display name (single-category case)
+  taxCodeQboId     String? // chosen company-scoped QBO TaxCode id
+  splitLines       SplitLine[] // when present, replaces category (multi-category)
+  suggestion       Json? // { category, categoryQboId?, source: 'rule'|'history'|'ai', ruleId? }
+  errorCode        String?
+  errorMessage     String?
+  postedAt         DateTime?
+  postedByUserId   String?
+  rawData          Json?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  txnTags          TxnTag[]
+  mutationAttempts QboMutationAttempt[]
+  agentJobs        AgentJob[]
+  agentRuns        AgentRun[]
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
+}
+
+/// Durable identity and exact artifacts for one logical QuickBooks mutation.
+/// The row exists before network I/O; retries reuse requestId.
+model QboMutationAttempt {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  operation     String
+  requestId     String      @unique
+  decisionHash  String
+  status        String
+  requestPath   String?
+  requestBody   Json?
+  before        Json?
+  expected      Json?
+  response      Json?
+  verification  Json?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([transactionId, createdAt])
+}
+
+/// Durable, idempotent work item for the current decision-relevant version of
+/// one transaction. Input changes reset this row and append a new AgentRun.
+model AgentJob {
+  id               String         @id @default(uuid())
+  transactionId    String         @unique
+  transaction      Transaction    @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  companyId        String
+  company          Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  status           AgentJobStatus @default(queued)
+  inputHash        String
+  attempt          Int            @default(0)
+  nextAttemptAt    DateTime       @default(now())
+  lockedAt         DateTime?
+  lockOwner        String?
+  leaseExpiresAt   DateTime?
+  lastErrorCode    String?
+  lastErrorMessage String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  runs             AgentRun[]
+
+  @@index([status, nextAttemptAt])
+  @@index([companyId, status])
+  @@index([leaseExpiresAt])
+}
+
+/// Append-only evidence for one claimed attempt. Application code may populate
+/// a running row once; completed rows are never edited or deleted.
+model AgentRun {
+  id                  String        @id @default(uuid())
+  jobId               String
+  job                 AgentJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  transactionId       String
+  transaction         Transaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  companyId           String
+  company             Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider            String
+  model               String
+  promptVersion       String
+  toolSchemaVersion   String
+  inputHash           String
+  transactionSnapshot Json?
+  candidatePayee      String?
+  mode                AutopilotMode
+  startedAt           DateTime      @default(now())
+  completedAt         DateTime?
+  decision            Json?
+  toolTrace           Json?
+  validation          Json?
+  verification        Json?
+  verifier            Json?
+  turnCount           Int           @default(0)
+  toolCallCount       Int           @default(0)
+  errorCode           String?
+  errorMessage        String?
+
+  @@index([jobId, startedAt])
+  @@index([companyId, startedAt])
+  @@index([companyId, candidatePayee, completedAt])
+  @@index([transactionId, startedAt])
+}
+
+/// Host-created proposal derived from repeated verifier-agreed, single-line
+/// decisions. It is never an active posting rule until an admin activates it.
+model RuleCandidate {
+  id              String              @id @default(uuid())
+  companyId       String
+  company         Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  fingerprint     String              @unique
+  normalizedPayee String
+  matchText       String
+  category        String
+  categoryQboId   String
+  taxCalculation  String
+  taxCode         String
+  taxCodeQboId    String
+  evidenceCount   Int
+  evidenceRunIds  Json
+  conflicts       Json
+  status          RuleCandidateStatus @default(pending)
+  createdRuleId   String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([companyId, status])
+  @@index([companyId, normalizedPayee])
+}
+
+/// Cross-process serialization for accounting writes. Reads and model calls do
+/// not hold this lease.
+model AgentCompanyLease {
+  companyId      String   @id
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  owner          String
+  leaseExpiresAt DateTime
+  updatedAt      DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
 }
 
 model Tag {
@@ -160,7 +337,7 @@ model LogTag {
   /// JournalEntry) where known, else the report's type string verbatim.
   qboKey    String
   tagId     String
-  tag       Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
 
   @@id([companyId, qboKey, tagId])
   @@index([companyId, qboKey])
@@ -176,6 +353,8 @@ model SplitLine {
   amount        Decimal        @db.Decimal(14, 2) // signed, same sign as the txn
   category      String
   categoryQboId String?
+  taxCode       String?
+  taxCodeQboId  String?
   memo          String?
   tags          SplitLineTag[]
 
@@ -202,19 +381,22 @@ model TxnTag {
 }
 
 model Rule {
-  id            String    @id @default(uuid())
-  companyId     String
-  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  id             String    @id @default(uuid())
+  companyId      String
+  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   /// Match order: lowest priority number wins when several rules match a payee.
-  priority      Int       @default(0)
-  matchField    String    @default("payee") // v1: payee contains, case-insensitive
-  matchText     String
-  category      String // category display name
-  categoryQboId String?
-  autoPost      Boolean   @default(false)
-  createdById   String?
-  createdAt     DateTime  @default(now())
-  ruleTags      RuleTag[]
+  priority       Int       @default(0)
+  matchField     String    @default("payee") // v1: payee contains, case-insensitive
+  matchText      String
+  category       String // category display name
+  categoryQboId  String?
+  taxCalculation String?
+  taxCode        String?
+  taxCodeQboId   String?
+  autoPost       Boolean   @default(false)
+  createdById    String?
+  createdAt      DateTime  @default(now())
+  ruleTags       RuleTag[]
 }
 
 model RuleTag {
@@ -269,6 +451,41 @@ model QboAccount {
   @@unique([companyId, qboId])
 }
 
+/// Company-scoped mirror of QuickBooks TaxCode reference data. Recat never
+/// authors these rows in QBO; it only refreshes them for validation and UI.
+model QboTaxCode {
+  id                  String   @id @default(uuid())
+  companyId           String
+  company             Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId               String
+  name                String
+  description         String?
+  active              Boolean  @default(true)
+  taxable             Boolean?
+  purchaseTaxRateList Json?
+  salesTaxRateList    Json?
+  rawData             Json?
+  updatedAt           DateTime @updatedAt
+
+  @@unique([companyId, qboId])
+}
+
+/// Company-scoped mirror of QuickBooks TaxRate reference data.
+model QboTaxRate {
+  id          String   @id @default(uuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId       String
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  rateValue   Decimal? @db.Decimal(12, 6)
+  rawData     Json?
+  updatedAt   DateTime @updatedAt
+
+  @@unique([companyId, qboId])
+}
+
 model SyncLog {
   id        String   @id @default(uuid())
   companyId String
@@ -294,4 +511,41 @@ model WebhookEvent {
   processed   Boolean   @default(false)
   processedAt DateTime?
   createdAt   DateTime  @default(now())
+}
+
+/// Singleton, instance-global ChatGPT subscription credential. The entire
+/// payload is one authenticated AES-GCM envelope so refresh-token rotation is
+/// atomic and no individual token is queryable in plaintext.
+model CodexCredential {
+  singleton        Boolean  @id @default(true)
+  encryptedPayload String   @map("encrypted_payload") @db.Text
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("ai_codex_credentials")
+}
+
+/// Restart-safe device authorization bound to both the initiating admin and
+/// SHA-256 session hash. Every upstream code/token field is AES-GCM encrypted.
+model CodexDeviceFlow {
+  id                   String               @id @default(uuid())
+  adminUserId          String               @map("admin_user_id")
+  adminUser            User                 @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  sessionHash          String               @map("session_hash") @db.Char(64)
+  deviceAuthIdEnc      String?              @map("device_auth_id_enc") @db.Text
+  userCodeEnc          String?              @map("user_code_enc") @db.Text
+  authorizationCodeEnc String?              @map("authorization_code_enc") @db.Text
+  codeVerifierEnc      String?              @map("code_verifier_enc") @db.Text
+  intervalMs           Int                  @map("interval_ms")
+  expiresAt            DateTime             @map("expires_at")
+  nextPollAt           DateTime             @map("next_poll_at")
+  state                CodexDeviceFlowState @default(pending)
+  failureCode          String?              @map("failure_code") @db.VarChar(100)
+  createdAt            DateTime             @default(now()) @map("created_at")
+  updatedAt            DateTime             @updatedAt @map("updated_at")
+  completedAt          DateTime?            @map("completed_at")
+
+  @@index([adminUserId, sessionHash, state], map: "idx_ai_codex_flows_owner_state")
+  @@index([expiresAt], map: "idx_ai_codex_flows_expiry")
+  @@map("ai_codex_device_flows")
 }

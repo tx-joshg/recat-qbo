@@ -16,7 +16,16 @@ import { env } from '../env.js';
 import { encrypt, randomToken } from '../lib/crypto.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
-import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
+import {
+  classifyIntuitOAuthBody,
+  classifyQboFailure,
+  qboFailureRedirect,
+} from '../lib/qbo/diagnostics.js';
+import {
+  inspectAuthorizedConnection,
+  isMockRealmId,
+  qboFactory,
+} from '../lib/qbo/factory.js';
 import { MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR, resolveMockRealmId } from '../lib/qbo/mock.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { installDemoFinancials } from '../services/demoFinancials.js';
@@ -43,10 +52,10 @@ function pruneStates(): void {
 }
 
 /** Issue a state token for a new connect flow (used by /api/companies/connect-url). */
-export function createOauthState(choice: ConnectChoice): string {
+export function createOauthState(choice: ConnectChoice, issuedAt = Date.now()): string {
   pruneStates();
   const state = randomToken(16);
-  states.set(state, { expiresAt: Date.now() + STATE_TTL_MS, choice });
+  states.set(state, { expiresAt: issuedAt + STATE_TTL_MS, choice });
   return state;
 }
 
@@ -98,77 +107,137 @@ qboOauthRouter.get(
   asyncHandler(async (req, res) => {
     const code = queryString(req.query.code);
     const state = queryString(req.query.state);
+    const intuitError = queryString(req.query.error);
+    const intuitErrorDescription = queryString(req.query.error_description);
     let realmId = queryString(req.query.realmId);
 
     const choice = state !== '' ? consumeOauthState(state) : null;
     if (!choice) {
-      throw new HttpError(400, 'Invalid or expired OAuth state — restart the connect flow.', 'BAD_STATE');
+      res.redirect(qboFailureRedirect(env.APP_URL, 'STATE_EXPIRED'));
+      return;
     }
-    if (code === '') throw new HttpError(400, 'Missing authorization code', 'BAD_REQUEST');
-    if (realmId === '' && choice.mode === 'demo') {
-      const connected = await prisma.company.findMany({ where: { disconnectedAt: null }, select: { realmId: true } });
-      realmId = resolveMockRealmId(code, connected.map((c) => c.realmId));
-    }
-    if (realmId === '') throw new HttpError(400, 'Missing realmId', 'BAD_REQUEST');
-    // A real Intuit code can never belong to a mock realm; refuse the cross.
-    if (choice.mode === 'real' && isMockRealmId(realmId)) {
-      throw new HttpError(400, 'Demo realm on a real connect flow — restart the connect flow.', 'BAD_REQUEST');
+    if (intuitError !== '') {
+      const publicCode = classifyIntuitOAuthBody(
+        400,
+        JSON.stringify({
+          error: intuitError,
+          error_description: intuitErrorDescription,
+        }),
+      );
+      res.redirect(qboFailureRedirect(env.APP_URL, publicCode));
+      return;
     }
 
     try {
-      const tokens = await qboFactory.exchangeCode(code, realmId, choice.mode);
+      if (code === '') throw new HttpError(400, 'Missing authorization code', 'BAD_REQUEST');
+      if (realmId === '' && choice.mode === 'demo') {
+        const connected = await prisma.company.findMany({
+          where: { disconnectedAt: null },
+          select: { realmId: true },
+        });
+        realmId = resolveMockRealmId(code, connected.map((c) => c.realmId));
+      }
+      if (realmId === '') throw new HttpError(400, 'Missing realmId', 'BAD_REQUEST');
+      // A real Intuit code can never belong to a mock realm; refuse the cross.
+      if (choice.mode === 'real' && isMockRealmId(realmId)) {
+        throw new HttpError(400, 'Demo realm on a real connect flow — restart the connect flow.', 'BAD_REQUEST');
+      }
+
+      const exchangedTokens = await qboFactory.exchangeCode(code, realmId, choice.mode);
+
+      // Resolve reconnect state before validation, but do not publish the new
+      // credentials yet. A failed CompanyInfo probe must leave an existing
+      // healthy connection untouched and must not create a schedulable row.
+      const existing = await prisma.company.findUnique({ where: { realmId } });
+      const companyEnv =
+        choice.mode === 'demo'
+          ? 'sandbox'
+          : existing?.env ?? choice.env ?? (await defaultQboEnv());
+      const inspected = await inspectAuthorizedConnection({
+        realmId,
+        environment: companyEnv,
+        mode: choice.mode,
+        tokens: exchangedTokens,
+      }).catch((err: unknown) => {
+        console.error('[qbo-oauth] CompanyInfo validation failed:', err);
+        res.redirect(
+          qboFailureRedirect(env.APP_URL, classifyQboFailure(err, 'company_info')),
+        );
+        return null;
+      });
+      if (!inspected) return;
       const tokenData = {
-        accessToken: encrypt(tokens.accessToken),
-        refreshToken: encrypt(tokens.refreshToken),
-        tokenExpiresAt: new Date(tokens.expiresAt),
+        accessToken: encrypt(inspected.tokens.accessToken),
+        refreshToken: encrypt(inspected.tokens.refreshToken),
+        tokenExpiresAt: new Date(inspected.tokens.expiresAt),
       };
-      // The user's per-connection env choice wins; demo companies are always
-      // 'sandbox' (there is no production fake QuickBooks).
-      const companyEnv = choice.mode === 'demo' ? 'sandbox' : choice.env ?? (await defaultQboEnv());
 
       // No Membership row is created for the connecting user: only instance
       // admins can reach this route, and instance admins are implicitly
       // 'admin' in every company — an explicit membership would be redundant.
-      const existing = await prisma.company.findUnique({ where: { realmId } });
       let company: Company;
-      if (existing) {
-        // Reconnect: fresh tokens, clear the disconnect flag, keep nickname,
-        // holding accounts, and all history.
+      if (!existing && choice.mode === 'demo') {
+        // Demo financial installation needs a company id. Keep this new row
+        // explicitly disconnected and credential-free until all demo setup
+        // succeeds so background jobs cannot schedule it prematurely.
+        const pending = await prisma.company.create({
+          data: {
+            realmId,
+            legalName: inspected.info.legalName,
+            nickname: defaultNickname(inspected.info.legalName),
+            env: 'sandbox',
+            dryRun: true,
+            disconnectedAt: new Date(),
+          },
+        });
+        await installDemoFinancials(pending.id, realmId);
+        company = await prisma.company.update({
+          where: { id: pending.id },
+          data: {
+            ...tokenData,
+            disconnectedAt: null,
+            connectedAt: new Date(),
+          },
+        });
+      } else if (existing) {
+        // Existing demo setup is idempotent. Complete it before swapping any
+        // credentials or connection state so a failed reconnect preserves the
+        // current healthy connection.
+        if (choice.mode === 'demo') {
+          await installDemoFinancials(existing.id, realmId);
+        }
         company = await prisma.company.update({
           where: { id: existing.id },
-          data: { ...tokenData, disconnectedAt: null },
+          data: {
+            ...tokenData,
+            disconnectedAt: null,
+            autopilotMode: 'off',
+            autopilotLiveConfirmedAt: null,
+            legalName: inspected.info.legalName,
+            ...(choice.mode === 'demo' && existing.disconnectedAt !== null
+              ? { connectedAt: new Date() }
+              : {}),
+          },
         });
       } else {
+        // New real connections become visible only after CompanyInfo succeeds.
         company = await prisma.company.create({
           data: {
             realmId,
-            legalName: realmId, // placeholder until getCompanyInfo below
-            nickname: realmId,
+            legalName: inspected.info.legalName,
+            nickname: defaultNickname(inspected.info.legalName),
             env: companyEnv,
-            dryRun: true, // safe default — nothing touches the real books until the admin flips it
+            dryRun: true,
+            disconnectedAt: null,
             ...tokenData,
           },
         });
       }
 
-      const client = await qboFactory.forCompany(company.id);
-      const info = await client.getCompanyInfo();
-      company = await prisma.company.update({
-        where: { id: company.id },
-        data: {
-          legalName: info.legalName,
-          ...(existing ? {} : { nickname: defaultNickname(info.legalName) }),
-        },
-      });
-
-      // Demo connections get the prototype's financial series so the
-      // dashboard and reports show the full experience, not empty charts.
-      if (choice.mode === 'demo') await installDemoFinancials(company.id, realmId);
-
       res.redirect(`${env.APP_URL}/setup?connected=${company.id}`);
     } catch (err) {
       console.error('[qbo-oauth] connect failed:', err);
-      res.redirect(`${env.APP_URL}/setup?error=connect_failed`);
+      res.redirect(qboFailureRedirect(env.APP_URL, classifyQboFailure(err, 'oauth')));
     }
   }),
 );

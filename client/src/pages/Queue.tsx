@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { SplitDto, TransactionDto, TxnStatus } from '@recat/shared';
+import type { SplitDto, TaxCalculation, TransactionDto, TxnStatus } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import {
   ApiError,
@@ -24,6 +24,7 @@ import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
 import RulePrompt from '../components/RulePrompt';
+import TaxCodePicker from '../components/TaxCodePicker';
 
 // ---------------------------------------------------------------------------
 // Prototype-state mapping & small helpers
@@ -102,6 +103,9 @@ interface RulePromptState {
   payee: string;
   category: string;
   categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +116,8 @@ export default function Queue() {
     activeCompanyId,
     accounts,
     tags,
+    taxProfile,
+    taxCodes,
     setPendingCount,
     refreshCompanies,
     dryRun,
@@ -320,9 +326,14 @@ export default function Queue() {
     () =>
       selPend.filter((id) => {
         const t = rows.find((r) => r.id === id);
-        return !!t && !!t.category && !(tagsRequired && t.tagIds.length === 0);
+        const taxComplete =
+          !t ||
+          t.qboType !== 'Purchase' ||
+          taxProfile?.status !== 'ready' ||
+          Boolean(t.taxCalculation && t.taxCodeQboId);
+        return !!t && !!t.category && taxComplete && !(tagsRequired && t.tagIds.length === 0);
       }),
-    [selPend, rows, tagsRequired],
+    [selPend, rows, tagsRequired, taxProfile],
   );
 
   // ---- picker options (suggested pinned first) ----
@@ -386,8 +397,19 @@ export default function Queue() {
       const prev = { category: t.category, categoryQboId: t.categoryQboId };
       const categoryQboId = qboIdOf(name);
       patchRow(t.id, { category: name, categoryQboId }); // optimistic
+      const suggestedTax =
+        t.suggestion?.category === name &&
+        t.suggestion.taxCalculation &&
+        t.suggestion.taxCode &&
+        t.suggestion.taxCodeQboId
+          ? {
+              taxCalculation: t.suggestion.taxCalculation,
+              taxCode: t.suggestion.taxCode,
+              taxCodeQboId: t.suggestion.taxCodeQboId,
+            }
+          : {};
       txnApi
-        .categorize(t.id, { category: name, categoryQboId, tagIds: t.tagIds })
+        .categorize(t.id, { category: name, categoryQboId, tagIds: t.tagIds, ...suggestedTax })
         .then((dto) => {
           if (aliveRef.current) updateRow(dto);
         })
@@ -397,6 +419,33 @@ export default function Queue() {
         });
     },
     [qboIdOf, patchRow, updateRow, toast],
+  );
+
+  const stageTax = useCallback(
+    (t: TransactionDto, taxCalculation: TaxCalculation, taxCodeQboId: string | null) => {
+      const code = taxCodes.find((candidate) => candidate.qboId === taxCodeQboId) ?? null;
+      const prev = {
+        taxCalculation: t.taxCalculation,
+        taxCode: t.taxCode,
+        taxCodeQboId: t.taxCodeQboId,
+      };
+      const patch = {
+        taxCalculation,
+        taxCode: code?.name ?? null,
+        taxCodeQboId: code?.qboId ?? null,
+      };
+      patchRow(t.id, patch);
+      txnApi
+        .categorize(t.id, patch)
+        .then((dto) => {
+          if (aliveRef.current) updateRow(dto);
+        })
+        .catch((error) => {
+          if (aliveRef.current) patchRow(t.id, prev);
+          toast(errText(error));
+        });
+    },
+    [taxCodes, patchRow, updateRow, toast],
   );
 
   const pickChoose = useCallback(
@@ -422,6 +471,17 @@ export default function Queue() {
       const t0 = rows.find((t) => t.id === id);
       const hasSplit = !!(t0 && t0.splits && t0.splits.length);
       if (!t0 || !(t0.category || hasSplit)) return;
+      if (
+        t0.qboType === 'Purchase' &&
+        taxProfile?.status === 'ready' &&
+        (!t0.taxCalculation ||
+          (hasSplit
+            ? !t0.splits!.every((split) => split.taxCodeQboId)
+            : !t0.taxCodeQboId))
+      ) {
+        toast(hasSplit ? 'Pick a tax code on every split' : 'Pick a tax code before posting');
+        return;
+      }
       // Mirror the server guard: split txns need a tag on every split;
       // unsplit txns need at least one row-level tag.
       const effTags = hasSplit
@@ -453,6 +513,9 @@ export default function Queue() {
                   payee: dto.payee,
                   category: dto.category ?? '',
                   categoryQboId: dto.categoryQboId,
+                  taxCalculation: dto.taxCalculation,
+                  taxCode: dto.taxCode,
+                  taxCodeQboId: dto.taxCodeQboId,
                 },
             );
           }
@@ -463,7 +526,7 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [rows, tagsRequired, patchRow, updateRow, toast],
+    [rows, tagsRequired, taxProfile, patchRow, updateRow, toast],
   );
 
   const undoPost = useCallback(
@@ -534,7 +597,7 @@ export default function Queue() {
   );
 
   const saveSplit = useCallback(
-    (t: TransactionDto, lines: SplitLineDraft[]) => {
+    (t: TransactionDto, lines: SplitLineDraft[], taxCalculation: TaxCalculation | null) => {
       const sign = t.amount < 0 ? -1 : 1;
       const splits: SplitDto[] = lines.map((l) => {
         const amount = Math.round((parseFloat(l.amt) || 0) * 100) / 100;
@@ -544,6 +607,7 @@ export default function Queue() {
           category: l.cat,
           ...(categoryQboId ? { categoryQboId } : {}),
           tagIds: [...l.tags],
+          ...(l.taxCodeQboId ? { taxCodeQboId: l.taxCodeQboId } : {}),
         };
       });
       const prev = { category: t.category, categoryQboId: t.categoryQboId, splits: t.splits };
@@ -551,7 +615,7 @@ export default function Queue() {
       patchRow(t.id, { category: null, categoryQboId: null, splits }); // optimistic
       toast('Split saved — ready to post');
       txnApi
-        .categorize(t.id, { category: null, categoryQboId: null, splits })
+        .categorize(t.id, { category: null, categoryQboId: null, splits, taxCalculation })
         .then((dto) => {
           if (aliveRef.current) updateRow(dto);
         })
@@ -631,6 +695,9 @@ export default function Queue() {
         matchText: rp.payee,
         category: rp.category,
         categoryQboId: rp.categoryQboId,
+        taxCalculation: rp.taxCalculation,
+        taxCode: rp.taxCode,
+        taxCodeQboId: rp.taxCodeQboId,
       })
       .then(() => toast('Rule created — matching payees will be pre-filled'))
       .catch((e) => toast(errText(e)));
@@ -795,6 +862,13 @@ export default function Queue() {
       ? t.splits!.every((sp) => sp.tagIds.length > 0)
       : t.tagIds.length > 0;
     const isActive = t.id === activeId;
+    const taxRequired = t.qboType === 'Purchase' && taxProfile?.status === 'ready';
+    const taxComplete =
+      !taxRequired ||
+      Boolean(
+        t.taxCalculation &&
+          (hasSplit ? t.splits!.every((split) => split.taxCodeQboId) : t.taxCodeQboId),
+      );
     return {
       t,
       state,
@@ -806,11 +880,20 @@ export default function Queue() {
       effTags,
       isActive,
       canUndo: canUndoPosted(t.postedAt),
-      ready: state === 'pending' && (!!t.category || hasSplit) && !(tagsRequired && !effTags),
+      ready:
+        state === 'pending' &&
+        (!!t.category || hasSplit) &&
+        taxComplete &&
+        !(tagsRequired && !effTags),
       notReady:
-        state === 'pending' && ((!t.category && !hasSplit) || (tagsRequired && !effTags)),
+        state === 'pending' &&
+        ((!t.category && !hasSplit) || !taxComplete || (tagsRequired && !effTags)),
       pendTip:
-        tagsRequired && !effTags
+        !taxComplete
+          ? hasSplit
+            ? 'Pick a tax code on every split'
+            : 'Pick a tax code before posting'
+          : tagsRequired && !effTags
           ? hasSplit
             ? 'Tags are required — add a tag to every split'
             : 'Tags are required — add a tag first'
@@ -825,6 +908,35 @@ export default function Queue() {
       pickColor:
         t.category || hasSplit ? 'var(--ink)' : suggested ? 'var(--amT)' : 'var(--fnt)',
     };
+  };
+
+  const shadowLabel = (t: TransactionDto): string | null => {
+    const raw = t.shadowDecision?.decision;
+    if (!raw || typeof raw !== 'object') return null;
+    const decision = raw as Record<string, unknown>;
+    const validation =
+      t.shadowDecision?.validation && typeof t.shadowDecision.validation === 'object'
+        ? (t.shadowDecision.validation as Record<string, unknown>)
+        : null;
+    if (validation?.ok === false) return `Shadow rejected · ${String(validation.code ?? 'invalid')}`;
+    if (decision.kind === 'skip') return `Shadow skipped · ${String(decision.reasonCode ?? 'needs review')}`;
+    if (decision.kind === 'transfer') return 'Shadow suggests transfer';
+    if (decision.kind !== 'categorize' || !Array.isArray(decision.lines)) return null;
+    const names = decision.lines
+      .slice(0, 3)
+      .map((line) => {
+        const id =
+          line && typeof line === 'object'
+            ? (line as Record<string, unknown>).categoryQboId
+            : null;
+        const account = accounts.find((value) => value.qboId === id);
+        return account ? fullCat(account.name) : typeof id === 'string' ? id : null;
+      })
+      .filter((value): value is string => value !== null);
+    if (names.length === 0) return 'Shadow suggests a categorization';
+    const confidence =
+      typeof decision.confidence === 'number' ? ` · ${Math.round(decision.confidence * 100)}%` : '';
+    return `Shadow: ${names.join(' + ')}${confidence}`;
   };
 
   const onRowClick = (t: TransactionDto) => {
@@ -869,6 +981,120 @@ export default function Queue() {
         }
       />
     ) : null;
+
+  const taxControls = (v: RowView, mobile: boolean) => {
+    if (v.t.qboType !== 'Purchase' || taxProfile?.status !== 'ready') return null;
+    if (v.hasSplit) {
+      return (
+        <span style={{ fontSize: 11.5, color: 'var(--mut)' }}>
+          {v.t.taxCalculation ?? 'Tax not set'} ·{' '}
+          {v.t.splits?.every((split) => split.taxCodeQboId)
+            ? v.t.splits.map((split) => split.taxCode).filter(Boolean).join(' / ')
+            : 'open Split to choose tax'}
+        </span>
+      );
+    }
+    const mode = v.t.taxCalculation ?? 'TaxInclusive';
+    const choices =
+      mode === 'NotApplicable'
+        ? taxCodes.filter((code) => code.taxable === false)
+        : taxCodes;
+    if (v.state === 'dry') {
+      return (
+        <span
+          onClick={(event) => event.stopPropagation()}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 6,
+            width: '100%',
+            fontSize: 11.5,
+            color: 'var(--mut)',
+          }}
+        >
+          <span>
+            {v.t.taxCode ?? 'Tax not set'} · {v.t.taxCalculation ?? 'not set'}
+          </span>
+          {v.canUndo && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                undoPost(v.t.id);
+              }}
+              onMouseDown={stopMouse}
+              data-tip="Reopen this dry run to confirm or change tax. Nothing is written to QuickBooks."
+              style={{
+                border: 'none',
+                background: 'none',
+                color: 'var(--acc)',
+                padding: 0,
+                font: 'inherit',
+                fontSize: 11.5,
+                fontWeight: 600,
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Edit tax
+            </button>
+          )}
+        </span>
+      );
+    }
+    if (v.state !== 'pending' && v.state !== 'error') {
+      return (
+        <span style={{ fontSize: 11.5, color: 'var(--mut)' }}>
+          {v.t.taxCode ?? 'No tax'} · {v.t.taxCalculation ?? 'not set'}
+        </span>
+      );
+    }
+    return (
+      <span
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          display: 'grid',
+          gridTemplateColumns: mobile ? '1fr 1fr' : 'minmax(0,1fr) minmax(0,1fr)',
+          gap: 5,
+          width: '100%',
+        }}
+      >
+        <select
+          aria-label={`Tax calculation for ${v.t.payee}`}
+          value={mode}
+          onChange={(event) => {
+            const nextMode = event.target.value as TaxCalculation;
+            const nextCode =
+              nextMode === 'NotApplicable'
+                ? taxCodes.find((code) => code.taxable === false)?.qboId ?? null
+                : v.t.taxCodeQboId;
+            stageTax(v.t, nextMode, nextCode);
+          }}
+          style={{
+            border: '1px solid var(--bd)',
+            borderRadius: 7,
+            padding: '6px 7px',
+            fontSize: 11.5,
+            background: 'var(--card)',
+            color: 'var(--ink)',
+            minWidth: 0,
+          }}
+        >
+          <option value="TaxInclusive">Inclusive</option>
+          <option value="TaxExcluded">Excluded</option>
+          <option value="NotApplicable">Not applicable</option>
+        </select>
+        <TaxCodePicker
+          value={v.t.taxCodeQboId}
+          codes={choices}
+          onPick={(code) => stageTax(v.t, mode, code?.qboId ?? null)}
+          label={`Tax code for ${v.t.payee}`}
+          style={{ width: '100%', padding: '6px 7px', fontSize: 11.5 }}
+        />
+      </span>
+    );
+  };
 
   const tagChips = (t: TransactionDto) =>
     t.tagIds
@@ -1220,6 +1446,18 @@ export default function Queue() {
                         {t.memo}
                       </span>
                     )}
+                    {shadowLabel(t) && (
+                      <span
+                        style={{
+                          display: 'block',
+                          fontSize: 12,
+                          color: 'var(--acc)',
+                          marginTop: 2,
+                        }}
+                      >
+                        {shadowLabel(t)}
+                      </span>
+                    )}
                     <span
                       style={{
                         display: 'flex',
@@ -1297,7 +1535,13 @@ export default function Queue() {
                   </span>
                   <span style={{ color: 'var(--mut)', fontSize: 13 }}>{t.bankAccount}</span>
                   <span
-                    style={{ position: 'relative', display: 'flex', gap: 5, alignItems: 'center' }}
+                    style={{
+                      position: 'relative',
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: 5,
+                      alignItems: 'center',
+                    }}
                   >
                     <button
                       onClick={onOpenPicker(v)}
@@ -1369,6 +1613,7 @@ export default function Queue() {
                       </button>
                     )}
                     {rowPicker(v, false)}
+                    {taxControls(v, false)}
                   </span>
                   <span style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
                 </div>
@@ -1441,6 +1686,18 @@ export default function Queue() {
                     >
                       {fmtDate(t.date)} · {t.bankAccount}
                     </span>
+                    {shadowLabel(t) && (
+                      <span
+                        style={{
+                          display: 'block',
+                          fontSize: 12,
+                          color: 'var(--acc)',
+                          marginTop: 3,
+                        }}
+                      >
+                        {shadowLabel(t)}
+                      </span>
+                    )}
                   </span>
                   <span
                     style={{
@@ -1564,6 +1821,7 @@ export default function Queue() {
                     {statusCell(v, true)}
                   </span>
                 </div>
+                <div style={{ marginTop: 6 }}>{taxControls(v, true)}</div>
                 {errLine(v, 6)}
               </div>
             );
@@ -1660,8 +1918,10 @@ export default function Queue() {
           txn={splitTxn}
           tags={tags}
           catOpts={catOpts}
+          taxCodes={taxCodes}
+          taxEnabled={splitTxn.qboType === 'Purchase' && taxProfile?.status === 'ready'}
           onClose={() => setSplitEditId(null)}
-          onSave={(lines) => saveSplit(splitTxn, lines)}
+          onSave={(lines, taxCalculation) => saveSplit(splitTxn, lines, taxCalculation)}
         />
       )}
     </div>

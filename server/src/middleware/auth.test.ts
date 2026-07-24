@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Role } from '@recat/shared';
-import { effectiveRole, roleRank, type MembershipReader } from './auth.js';
+import {
+  effectiveRole,
+  originIsTrusted,
+  parseTrustedOrigins,
+  roleRank,
+  sessionCookieOptions,
+  type MembershipReader,
+} from './auth.js';
 
 /** Fake Membership table keyed by `${userId}:${companyId}`. */
 function fakeDb(rows: Record<string, Role>): MembershipReader {
@@ -47,5 +54,50 @@ describe('roleRank', () => {
   it('orders viewer < categorizer < admin', () => {
     expect(roleRank('viewer')).toBeLessThan(roleRank('categorizer'));
     expect(roleRank('categorizer')).toBeLessThan(roleRank('admin'));
+  });
+});
+
+describe('trusted browser origins', () => {
+  it('includes APP_URL and explicitly configured http(s) origins', () => {
+    const origins = parseTrustedOrigins(
+      'https://recat.example:12443/setup',
+      ' http://umbrel.local:12443, http://192.168.4.131:12443 ',
+    );
+
+    expect([...origins]).toEqual([
+      'https://recat.example:12443',
+      'http://umbrel.local:12443',
+      'http://192.168.4.131:12443',
+    ]);
+    expect(originIsTrusted('http://umbrel.local:12443', origins)).toBe(true);
+    expect(originIsTrusted('https://recat.example:12443', origins)).toBe(true);
+  });
+
+  it('rejects unconfigured, malformed, and non-http origins', () => {
+    const origins = parseTrustedOrigins('https://recat.example', '');
+
+    expect(originIsTrusted('https://attacker.example', origins)).toBe(false);
+    expect(originIsTrusted('not a URL', origins)).toBe(false);
+    expect(originIsTrusted('file:///tmp/recat', origins)).toBe(false);
+  });
+
+  it('fails startup configuration on invalid additional origins', () => {
+    expect(() => parseTrustedOrigins('https://recat.example', 'not a URL')).toThrow(
+      'TRUSTED_ORIGINS must contain valid absolute URLs',
+    );
+    expect(() => parseTrustedOrigins('https://recat.example', 'file:///tmp/recat')).toThrow(
+      'TRUSTED_ORIGINS must contain only http(s) URLs',
+    );
+  });
+});
+
+describe('mixed-protocol session cookies', () => {
+  it('uses Secure cookies for HTTPS browser origins', () => {
+    expect(sessionCookieOptions('https://recat.example:12443').secure).toBe(true);
+  });
+
+  it('allows a session cookie on an explicitly trusted HTTP LAN origin', () => {
+    expect(sessionCookieOptions('http://umbrel.local:12443').secure).toBe(false);
+    expect(sessionCookieOptions('http://192.168.4.131:12443').secure).toBe(false);
   });
 });

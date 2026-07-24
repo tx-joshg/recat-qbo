@@ -4,15 +4,23 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import type { Company, Prisma } from '@prisma/client';
-import type { RuleDto, RuleTestConflict, RuleTestMatch, RuleTestResult, TxnStatus } from '@recat/shared';
+import { randomUUID } from 'node:crypto';
+import type { Company, Prisma, PrismaClient } from '@prisma/client';
+import type { RuleDto, RuleTestConflict, RuleTestMatch, RuleTestResult, TaxCalculation, TxnStatus } from '@recat/shared';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
-import { ruleSuggestion, type RuleLike } from '../services/suggestions.js';
+import {
+  ruleMatchesPayee,
+  ruleSuggestion,
+  type RuleLike,
+} from '../services/suggestions.js';
+import { StagingError, validatePurchaseTaxDecision } from '../services/categorization.js';
+import { lockCompanyRuleBoundary } from '../services/ruleBoundary.js';
 
 type RuleRow = Prisma.RuleGetPayload<{ include: { ruleTags: true } }>;
+type RuleDb = PrismaClient | Prisma.TransactionClient;
 
 const createBody = z.object({
   matchText: z.string().trim().min(1).max(200),
@@ -20,6 +28,9 @@ const createBody = z.object({
   categoryQboId: z.string().min(1).nullish(),
   tagIds: z.array(z.string().min(1)).optional(),
   autoPost: z.boolean().optional(),
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']).nullish(),
+  taxCode: z.string().min(1).nullish(),
+  taxCodeQboId: z.string().min(1).nullish(),
 });
 
 const patchBody = z.object({
@@ -29,6 +40,9 @@ const patchBody = z.object({
   tagIds: z.array(z.string().min(1)).optional(),
   autoPost: z.boolean().optional(),
   priority: z.number().int().optional(),
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']).nullish(),
+  taxCode: z.string().min(1).nullish(),
+  taxCodeQboId: z.string().min(1).nullish(),
 });
 
 const orderBody = z.object({
@@ -55,6 +69,9 @@ function toRuleDto(rule: RuleRow): RuleDto {
     matchText: rule.matchText,
     category: rule.category,
     categoryQboId: rule.categoryQboId,
+    taxCalculation: rule.taxCalculation as TaxCalculation | null,
+    taxCode: rule.taxCode,
+    taxCodeQboId: rule.taxCodeQboId,
     tagIds: rule.ruleTags.map((rt) => rt.tagId),
     autoPost: rule.autoPost,
     createdAt: rule.createdAt.toISOString(),
@@ -62,28 +79,64 @@ function toRuleDto(rule: RuleRow): RuleDto {
 }
 
 async function resolveCategoryQboId(
+  db: RuleDb,
   companyId: string,
   category: string,
   given: string | null | undefined,
 ): Promise<string | null> {
   if (given) return given;
-  const acct = await prisma.qboAccount.findFirst({ where: { companyId, name: category, active: true } });
+  const acct = await db.qboAccount.findFirst({ where: { companyId, name: category, active: true } });
   return acct?.qboId ?? null;
 }
 
-async function assertTagsBelong(companyId: string, tagIds: string[]): Promise<void> {
+async function assertTagsBelong(db: RuleDb, companyId: string, tagIds: string[]): Promise<void> {
   if (tagIds.length === 0) return;
-  const owned = await prisma.tag.count({ where: { companyId, id: { in: tagIds } } });
+  const owned = await db.tag.count({ where: { companyId, id: { in: tagIds } } });
   if (owned !== new Set(tagIds).size) {
     throw new HttpError(400, 'One or more tags do not belong to this company', 'BAD_TAGS');
   }
 }
 
-async function loadRule(companyId: string, id: string | undefined): Promise<RuleRow> {
+async function validatedRuleTax(
+  db: RuleDb,
+  companyId: string,
+  taxCalculation: TaxCalculation | null,
+  taxCodeQboId: string | null,
+): Promise<{ taxCalculation: TaxCalculation | null; taxCode: string | null; taxCodeQboId: string | null }> {
+  try {
+    const codes = await validatePurchaseTaxDecision(
+      db,
+      companyId,
+      'Purchase',
+      taxCalculation,
+      [taxCodeQboId],
+    );
+    return {
+      taxCalculation,
+      taxCode: codes[0]?.name ?? null,
+      taxCodeQboId: codes[0]?.qboId ?? null,
+    };
+  } catch (err) {
+    if (err instanceof StagingError) throw new HttpError(400, err.message, err.code);
+    throw err;
+  }
+}
+
+async function loadRule(db: RuleDb, companyId: string, id: string | undefined): Promise<RuleRow> {
   if (!id) throw new HttpError(400, 'Missing rule id', 'BAD_REQUEST');
-  const rule = await prisma.rule.findUnique({ where: { id }, include: { ruleTags: true } });
+  const rule = await db.rule.findUnique({ where: { id }, include: { ruleTags: true } });
   if (!rule || rule.companyId !== companyId) throw new HttpError(404, 'Rule not found', 'RULE_NOT_FOUND');
   return rule;
+}
+
+async function markAutopilotRulesChanged(
+  db: RuleDb,
+  companyId: string,
+): Promise<void> {
+  await db.company.update({
+    where: { id: companyId },
+    data: { agentReconcileToken: randomUUID() },
+  });
 }
 
 export const rulesRouter = Router({ mergeParams: true });
@@ -110,27 +163,45 @@ rulesRouter.post(
     const company = scopedCompany(req);
     const body = validate(createBody)(req.body);
     const tagIds = [...new Set(body.tagIds ?? [])];
-    await assertTagsBelong(company.id, tagIds);
     const user = req.user;
-
-    // New rules go to the TOP of the match order: min(priority) - 1. Gaps are
-    // fine (lowest number wins); this avoids renumbering every row on create.
-    const agg = await prisma.rule.aggregate({ where: { companyId: company.id }, _min: { priority: true } });
-    const priority = agg._min.priority === null ? 0 : agg._min.priority - 1;
-
-    const rule = await prisma.rule.create({
-      data: {
-        companyId: company.id,
-        matchField: 'payee',
-        matchText: body.matchText,
-        category: body.category,
-        categoryQboId: await resolveCategoryQboId(company.id, body.category, body.categoryQboId),
-        autoPost: body.autoPost ?? false,
-        priority,
-        createdById: user?.id ?? null,
-        ruleTags: { create: tagIds.map((tagId) => ({ tagId })) },
-      },
-      include: { ruleTags: true },
+    const rule = await prisma.$transaction(async (tx) => {
+      await lockCompanyRuleBoundary(tx, company.id);
+      await assertTagsBelong(tx, company.id, tagIds);
+      const tax = await validatedRuleTax(
+        tx,
+        company.id,
+        (body.taxCalculation ?? null) as TaxCalculation | null,
+        body.taxCodeQboId ?? null,
+      );
+      // New rules go to the top of the match order. The shared company lock
+      // also makes this priority allocation deterministic across requests.
+      const agg = await tx.rule.aggregate({
+        where: { companyId: company.id },
+        _min: { priority: true },
+      });
+      const priority = agg._min.priority === null ? 0 : agg._min.priority - 1;
+      const rule = await tx.rule.create({
+        data: {
+          companyId: company.id,
+          matchField: 'payee',
+          matchText: body.matchText,
+          category: body.category,
+          categoryQboId: await resolveCategoryQboId(
+            tx,
+            company.id,
+            body.category,
+            body.categoryQboId,
+          ),
+          ...tax,
+          autoPost: body.autoPost ?? false,
+          priority,
+          createdById: user?.id ?? null,
+          ruleTags: { create: tagIds.map((tagId) => ({ tagId })) },
+        },
+        include: { ruleTags: true },
+      });
+      await markAutopilotRulesChanged(tx, company.id);
+      return rule;
     });
     res.status(201).json(toRuleDto(rule));
   }),
@@ -147,8 +218,6 @@ rulesRouter.post(
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
     const body = validate(testBody)(req.body);
-    const needle = body.matchText.toLowerCase();
-
     const [txns, existingRules] = await Promise.all([
       prisma.transaction.findMany({
         where: { companyId: company.id, status: { in: ['PENDING', 'POSTED', 'DRY_RUN'] } },
@@ -164,7 +233,7 @@ rulesRouter.post(
     ]);
 
     const matches: RuleTestMatch[] = txns
-      .filter((t) => t.payee.toLowerCase().includes(needle))
+      .filter((t) => ruleMatchesPayee(t.payee, body.matchText))
       .map((t) => {
         const existingWinner = ruleSuggestion(t.payee, existingRules);
         return {
@@ -179,12 +248,8 @@ rulesRouter.post(
         };
       });
 
-    const ruleMatches = (rule: RuleLike, payee: string): boolean => {
-      const match = rule.matchText.trim().toLowerCase();
-      return match.length > 0 && payee.toLowerCase().includes(match);
-    };
     const conflicts: RuleTestConflict[] = existingRules
-      .filter((rule) => matches.some((m) => ruleMatches(rule, m.payee)))
+      .filter((rule) => matches.some((m) => ruleMatchesPayee(m.payee, rule.matchText)))
       .map((rule) => ({
         ruleId: rule.id,
         matchText: rule.matchText,
@@ -212,18 +277,31 @@ rulesRouter.put(
     if (new Set(ids).size !== ids.length) {
       throw new HttpError(400, 'Duplicate rule ids in order', 'BAD_ORDER');
     }
-    const existing = await prisma.rule.findMany({ where: { companyId: company.id }, select: { id: true } });
-    const existingIds = new Set(existing.map((r) => r.id));
-    if (existingIds.size !== ids.length || ids.some((id) => !existingIds.has(id))) {
-      throw new HttpError(400, 'Order must contain exactly the ids of every rule in this company', 'BAD_ORDER');
-    }
-    await prisma.$transaction(
-      ids.map((id, index) => prisma.rule.update({ where: { id }, data: { priority: index } })),
-    );
-    const rules = await prisma.rule.findMany({
-      where: { companyId: company.id },
-      include: { ruleTags: true },
-      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
+    const rules = await prisma.$transaction(async (tx) => {
+      await lockCompanyRuleBoundary(tx, company.id);
+      const existing = await tx.rule.findMany({
+        where: { companyId: company.id },
+        select: { id: true },
+      });
+      const existingIds = new Set(existing.map((rule) => rule.id));
+      if (existingIds.size !== ids.length || ids.some((id) => !existingIds.has(id))) {
+        throw new HttpError(
+          400,
+          'Order must contain exactly the ids of every rule in this company',
+          'BAD_ORDER',
+        );
+      }
+      await Promise.all(
+        ids.map((id, index) =>
+          tx.rule.update({ where: { id }, data: { priority: index } }),
+        ),
+      );
+      await markAutopilotRulesChanged(tx, company.id);
+      return tx.rule.findMany({
+        where: { companyId: company.id },
+        include: { ruleTags: true },
+        orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
+      });
     });
     const body: RuleDto[] = rules.map(toRuleDto);
     res.json(body);
@@ -234,34 +312,49 @@ rulesRouter.patch(
   '/:id',
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
-    const rule = await loadRule(company.id, req.params.id);
     const patch = validate(patchBody)(req.body);
+    const updated = await prisma.$transaction(async (tx) => {
+      await lockCompanyRuleBoundary(tx, company.id);
+      const rule = await loadRule(tx, company.id, req.params.id);
+      const category = patch.category ?? rule.category;
+      const categoryQboId =
+        patch.category !== undefined || patch.categoryQboId !== undefined
+          ? await resolveCategoryQboId(tx, company.id, category, patch.categoryQboId)
+          : rule.categoryQboId;
+      const tax = await validatedRuleTax(
+        tx,
+        company.id,
+        (patch.taxCalculation !== undefined
+          ? patch.taxCalculation
+          : rule.taxCalculation) as TaxCalculation | null,
+        patch.taxCodeQboId !== undefined ? patch.taxCodeQboId : rule.taxCodeQboId,
+      );
 
-    const category = patch.category ?? rule.category;
-    const categoryQboId =
-      patch.category !== undefined || patch.categoryQboId !== undefined
-        ? await resolveCategoryQboId(company.id, category, patch.categoryQboId)
-        : rule.categoryQboId;
-
-    if (patch.tagIds !== undefined) {
-      const tagIds = [...new Set(patch.tagIds)];
-      await assertTagsBelong(company.id, tagIds);
-      await prisma.ruleTag.deleteMany({ where: { ruleId: rule.id } });
-      for (const tagId of tagIds) {
-        await prisma.ruleTag.create({ data: { ruleId: rule.id, tagId } });
+      if (patch.tagIds !== undefined) {
+        const tagIds = [...new Set(patch.tagIds)];
+        await assertTagsBelong(tx, company.id, tagIds);
+        await tx.ruleTag.deleteMany({ where: { ruleId: rule.id } });
+        if (tagIds.length > 0) {
+          await tx.ruleTag.createMany({
+            data: tagIds.map((tagId) => ({ ruleId: rule.id, tagId })),
+          });
+        }
       }
-    }
 
-    const updated = await prisma.rule.update({
-      where: { id: rule.id },
-      data: {
-        ...(patch.matchText !== undefined ? { matchText: patch.matchText } : {}),
-        category,
-        categoryQboId,
-        ...(patch.autoPost !== undefined ? { autoPost: patch.autoPost } : {}),
-        ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
-      },
-      include: { ruleTags: true },
+      const updated = await tx.rule.update({
+        where: { id: rule.id },
+        data: {
+          ...(patch.matchText !== undefined ? { matchText: patch.matchText } : {}),
+          category,
+          categoryQboId,
+          ...tax,
+          ...(patch.autoPost !== undefined ? { autoPost: patch.autoPost } : {}),
+          ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
+        },
+        include: { ruleTags: true },
+      });
+      await markAutopilotRulesChanged(tx, company.id);
+      return updated;
     });
     res.json(toRuleDto(updated));
   }),
@@ -271,8 +364,12 @@ rulesRouter.delete(
   '/:id',
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
-    const rule = await loadRule(company.id, req.params.id);
-    await prisma.rule.delete({ where: { id: rule.id } });
+    await prisma.$transaction(async (tx) => {
+      await lockCompanyRuleBoundary(tx, company.id);
+      const rule = await loadRule(tx, company.id, req.params.id);
+      await tx.rule.delete({ where: { id: rule.id } });
+      await markAutopilotRulesChanged(tx, company.id);
+    });
     res.json({ ok: true });
   }),
 );

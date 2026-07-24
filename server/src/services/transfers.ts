@@ -149,6 +149,7 @@ export async function recordTransfer(
   txnId: string,
   counterpartId: string,
   actor: Actor,
+  canContinue: () => boolean = () => true,
 ): Promise<{ status: TxnStatus }> {
   if (txnId === counterpartId) throw new Error('A transaction cannot be its own transfer counterpart.');
 
@@ -224,6 +225,11 @@ export async function recordTransfer(
     };
 
     let newSyncToken: string | null = null;
+    if (!canContinue()) {
+      throw new Error(
+        `The accounting write lease was lost before "${leg.txn.payee}" was posted.`,
+      );
+    }
     if (!dryRun) {
       const result = await client.recategorize(fresh, splits);
       newSyncToken = result.newSyncToken;
@@ -256,8 +262,14 @@ export async function recordTransfer(
     });
   };
 
+  if (!canContinue()) {
+    throw new Error('The accounting write lease was lost before the transfer was posted.');
+  }
   await postLeg(legA); // throws with nothing written if it fails
   try {
+    if (!canContinue()) {
+      throw new Error('The accounting write lease was lost before the second transfer leg was posted.');
+    }
     await postLeg(legB);
   } catch (err) {
     // Leg A is already posted and committed. Be honest about it: mark leg B

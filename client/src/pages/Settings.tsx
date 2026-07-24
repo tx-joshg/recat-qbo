@@ -19,6 +19,8 @@ import EmailCard from './settings/EmailCard';
 import HoverButton from './settings/HoverButton';
 import SuggestionsCard from './settings/SuggestionsCard';
 import TeamCard from './settings/TeamCard';
+import TaxCard from './settings/TaxCard';
+import AutopilotCard from './settings/AutopilotCard';
 import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
@@ -44,6 +46,11 @@ export default function Settings() {
   const [holdingOptions, setHoldingOptions] = useState<HoldingAccountOption[]>([]);
   const [syncLog, setSyncLog] = useState<SyncLogDto[]>([]);
   const [settings, setSettings] = useState<InstanceSettingsDto | null>(null);
+  const [autopilotReadinessVersion, setAutopilotReadinessVersion] = useState(0);
+  const updateSettings = useCallback((next: InstanceSettingsDto) => {
+    setSettings(next);
+    setAutopilotReadinessVersion((version) => version + 1);
+  }, []);
 
   // TODO(server): GET /api/companies/:id/sync-log — helper missing from lib/api.ts.
   const reloadSyncLog = useCallback(async (): Promise<SyncLogDto[]> => {
@@ -222,14 +229,16 @@ export default function Settings() {
           {isAdmin && settings && (
             <ApiAccessCard
               settings={settings}
-              onSettings={setSettings}
+              onSettings={updateSettings}
+              companyId={activeCompany.id}
+              companyConnected={activeCompany.disconnectedAt === null}
               syncMode={activeCompany.syncMode}
               lastWebhookEventAt={lastWebhookEventAt}
             />
           )}
 
           {/* email / smtp (admin) */}
-          {isAdmin && settings && <EmailCard settings={settings} onSettings={setSettings} />}
+          {isAdmin && settings && <EmailCard settings={settings} onSettings={updateSettings} />}
 
           {/* tags required */}
           <div
@@ -253,13 +262,23 @@ export default function Settings() {
             <ToggleSwitch on={tagsRequired} onToggle={toggleReqTags} />
           </div>
 
-          {/* density (per-user, per-browser) */}
-          <DensityCard />
+          <TaxCard
+            isAdmin={isAdmin}
+            onRefreshed={() => setAutopilotReadinessVersion((version) => version + 1)}
+          />
+
+          <AutopilotCard
+            isAdmin={isAdmin}
+            readinessVersion={autopilotReadinessVersion}
+          />
 
           {/* suggestions */}
           {settings && (
-            <SuggestionsCard key={settings.suggestionSource} settings={settings} onSettings={setSettings} />
+            <SuggestionsCard key={`${settings.suggestionSource}-${settings.suggestionProvider}`} settings={settings} onSettings={updateSettings} />
           )}
+
+          {/* density (per-user, per-browser) */}
+          <DensityCard />
 
           {/* team (admin) */}
           {isAdmin && <TeamCard />}

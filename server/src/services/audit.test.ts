@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { AuditEntryDto } from '@recat/shared';
-import { AUDIT_CSV_HEADER, buildAuditCsv, csvEscape } from './audit.js';
+import {
+  AUDIT_CSV_HEADER,
+  buildAuditCsv,
+  csvEscape,
+  normalizeAuditAction,
+  redactAuditPayload,
+} from './audit.js';
 
 function entry(overrides: Partial<AuditEntryDto> = {}): AuditEntryDto {
   return {
@@ -33,6 +39,29 @@ describe('csvEscape', () => {
   it('quotes values containing newlines', () => {
     expect(csvEscape('line1\nline2')).toBe('"line1\nline2"');
     expect(csvEscape('line1\r\nline2')).toBe('"line1\r\nline2"');
+  });
+});
+
+describe('redactAuditPayload', () => {
+  it('redacts nested credentials while preserving accounting fields', () => {
+    expect(
+      redactAuditPayload({
+        qbo: { body: { Id: '1' }, authorization: 'Bearer secret' },
+        accessToken: 'secret',
+        nested: [{ refresh_token: 'secret', amount: 12.34 }],
+      }),
+    ).toEqual({
+      qbo: { body: { Id: '1' }, authorization: '[REDACTED]' },
+      accessToken: '[REDACTED]',
+      nested: [{ refresh_token: '[REDACTED]', amount: 12.34 }],
+    });
+  });
+});
+
+describe('normalizeAuditAction', () => {
+  it('presents legacy autopilot mode rows with the concise public label', () => {
+    expect(normalizeAuditAction('autopilot-mode-changed')).toBe('autopilot');
+    expect(normalizeAuditAction('autopilot')).toBe('autopilot');
   });
 });
 

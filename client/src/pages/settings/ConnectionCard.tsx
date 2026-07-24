@@ -5,8 +5,9 @@
 import { useRef, useState } from 'react';
 import { isDemoRealmId } from '@recat/shared';
 import type { CompanyDto, PollInterval, SyncLogDto, SyncMode } from '@recat/shared';
-import { companies as companiesApi } from '../../lib/api';
+import { ApiError, companies as companiesApi, qboDiagnostics } from '../../lib/api';
 import { useApp } from '../../state/AppContext';
+import { readQboCallbackFailure } from '../qboDiagnostics';
 import { errMsg, fmtLongDate, fmtTxnCount, fmtWhen } from './format';
 import HoverButton from './HoverButton';
 
@@ -35,13 +36,18 @@ export default function ConnectionCard({
   holdingOptions: HoldingAccountOption[];
   reloadSyncLog: () => Promise<SyncLogDto[]>;
 }) {
-  const { updateCompany, refreshCompanies, toast } = useApp();
+  const { session, updateCompany, refreshCompanies, toast } = useApp();
 
   const nickRef = useRef<HTMLInputElement>(null);
   const [nick, setNick] = useState(company.nickname);
   const [nickHover, setNickHover] = useState(false);
   const [nickFocus, setNickFocus] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<{
+    status: 'success' | 'failure';
+    message: string;
+  } | null>(null);
 
   const saveNick = () => {
     const trimmed = nick.trim();
@@ -98,6 +104,35 @@ export default function ConnectionCard({
         window.location.href = url;
       })
       .catch((err) => toast(errMsg(err)));
+  };
+
+  const testConnection = () => {
+    if (!session?.isInstanceAdmin || testingConnection) return;
+    setTestingConnection(true);
+    setConnectionTest(null);
+    qboDiagnostics
+      .testConnection(company.id)
+      .then((result) => {
+        const demoNote =
+          result.mode === 'demo' ? ' (demo data; Intuit credentials were not tested)' : '';
+        setConnectionTest({
+          status: 'success',
+          message: `Connection healthy — ${result.legalName}${demoNote}`,
+        });
+      })
+      .catch((error: unknown) => {
+        const code = error instanceof ApiError ? error.code : undefined;
+        const failure = readQboCallbackFailure(
+          `?qbo_error=${encodeURIComponent(code ?? 'QBO_CONNECTION_FAILED')}`,
+        );
+        setConnectionTest({
+          status: 'failure',
+          message:
+            failure?.message ??
+            'QuickBooks could not complete the connection. Check the app environment and redirect URI, then try again.',
+        });
+      })
+      .finally(() => setTestingConnection(false));
   };
 
   const disconnected = company.disconnectedAt !== null;
@@ -267,7 +302,46 @@ export default function ConnectionCard({
         >
           Reconnect
         </HoverButton>
+        {session?.isInstanceAdmin && (
+          <HoverButton
+            onClick={testConnection}
+            disabled={testingConnection}
+            style={{
+              border: '1px solid var(--bd)',
+              background: 'var(--card)',
+              color: 'var(--ink)',
+              borderRadius: 7,
+              padding: '8px 14px',
+              fontSize: 13.5,
+              fontWeight: 500,
+              cursor: testingConnection ? 'default' : 'pointer',
+              font: 'inherit',
+            }}
+            hoverStyle={{ background: 'var(--hl)' }}
+          >
+            {testingConnection ? 'Testing…' : 'Test connection'}
+          </HoverButton>
+        )}
       </div>
+
+      {connectionTest && (
+        <div
+          style={{
+            marginTop: 14,
+            border: `1px solid ${
+              connectionTest.status === 'success' ? 'var(--okD)' : 'var(--erD)'
+            }`,
+            background: connectionTest.status === 'success' ? 'var(--okB)' : 'var(--erB)',
+            color: connectionTest.status === 'success' ? 'var(--okT)' : 'var(--erT)',
+            borderRadius: 8,
+            padding: '10px 13px',
+            fontSize: 13.5,
+            lineHeight: 1.5,
+          }}
+        >
+          {connectionTest.message}
+        </div>
+      )}
 
       <div
         style={{

@@ -28,6 +28,22 @@ export interface AuditInput {
   payload?: unknown;
 }
 
+const SECRET_KEY = /(?:access|refresh)?token|authorization|clientsecret|api[_-]?key|password/i;
+
+/** Defense in depth: audit payloads are durable and must never retain secrets. */
+export function redactAuditPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactAuditPayload);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
+        key,
+        SECRET_KEY.test(key) ? '[REDACTED]' : redactAuditPayload(nested),
+      ]),
+    );
+  }
+  return value;
+}
+
 export async function writeAudit(tx: PrismaTransactionClientOrPrisma, entry: AuditInput): Promise<void> {
   await tx.auditEntry.create({
     data: {
@@ -40,7 +56,10 @@ export async function writeAudit(tx: PrismaTransactionClientOrPrisma, entry: Aud
       action: entry.action,
       before: entry.before,
       after: entry.after,
-      payload: entry.payload === undefined ? undefined : (entry.payload as Prisma.InputJsonValue),
+      payload:
+        entry.payload === undefined
+          ? undefined
+          : (redactAuditPayload(entry.payload) as Prisma.InputJsonValue),
     },
   });
 }
@@ -56,6 +75,11 @@ export interface AuditPage {
   nextCursor: string | null;
 }
 
+/** Keep append-only legacy rows readable under the current public action name. */
+export function normalizeAuditAction(action: string): AuditAction {
+  return action === 'autopilot-mode-changed' ? 'autopilot' : (action as AuditAction);
+}
+
 function toAuditDto(row: AuditEntry): AuditEntryDto {
   const dto: AuditEntryDto = {
     id: row.id,
@@ -64,7 +88,7 @@ function toAuditDto(row: AuditEntry): AuditEntryDto {
     actor: row.actorLabel,
     payee: row.payee,
     amount: Number(row.amount),
-    action: row.action as AuditAction,
+    action: normalizeAuditAction(row.action),
     before: row.before,
     after: row.after,
   };
