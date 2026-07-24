@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Recat">
+  <rect width="512" height="512" rx="112" fill="#F4F1E8"/>
+  <rect x="12" y="12" width="488" height="488" rx="100" fill="none" stroke="#DDD8CB" stroke-width="24"/>
+  <text x="92" y="372" fill="#25241F" font-family="Georgia, 'Times New Roman', serif" font-size="340" font-weight="700">R</text>
+  <circle cx="398" cy="358" r="32" fill="#2F6659"/>
+</svg>
