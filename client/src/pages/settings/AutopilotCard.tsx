@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { Role } from '@recat/shared';
 import {
@@ -967,6 +967,8 @@ export function AutopilotQueueStatus({
   const [runs, setRuns] = useState<AutopilotRunDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [expanded, setExpanded] = useState(surface === 'audit');
+  const detailsId = useId();
   const generationRef = useRef(0);
 
   useEffect(() => {
@@ -977,6 +979,7 @@ export function AutopilotQueueStatus({
     setRuns([]);
     setNextCursor(null);
     setLoadingOlder(false);
+    setExpanded(surface === 'audit');
     Promise.all([
       autopilot.get(companyId),
       autopilot.listRuns(companyId, { limit: 5 })
@@ -997,7 +1000,7 @@ export function AutopilotQueueStatus({
       cancelled = true;
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [companyId]);
+  }, [companyId, surface]);
 
   const loadOlder = async () => {
     if (nextCursor === null || loadingOlder) return;
@@ -1030,33 +1033,72 @@ export function AutopilotQueueStatus({
         gap: 12,
       }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-        <div>
-          <div style={{ fontSize: 13.5, fontWeight: 600 }}>Shadow autopilot</div>
-          <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 2 }}>
-            {state.queue.queued} queued · {state.queue.running} running ·{' '}
-            {state.queue.retrying} retrying
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        aria-label={`${expanded ? 'Hide' : 'Show'} Shadow Autopilot details`}
+        onClick={() => setExpanded((current) => !current)}
+        style={{
+          appearance: 'none',
+          border: 0,
+          background: 'transparent',
+          color: 'inherit',
+          cursor: 'pointer',
+          padding: 0,
+          width: '100%',
+          textAlign: 'left',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <span
+              aria-hidden="true"
+              style={{
+                color: 'var(--mut)',
+                display: 'inline-block',
+                fontSize: 14,
+                lineHeight: '20px',
+                transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                transition: 'transform 120ms ease',
+              }}
+            >
+              ▸
+            </span>
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 600 }}>Shadow autopilot</div>
+              <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 2 }}>
+                {state.queue.queued} queued · {state.queue.running} running ·{' '}
+                {state.queue.retrying} retrying
+              </div>
+            </div>
           </div>
+          <EvidenceProgress state={state} />
         </div>
-        <EvidenceProgress state={state} />
+      </button>
+      <div
+        id={detailsId}
+        hidden={!expanded}
+        style={{ display: expanded ? 'grid' : undefined, gap: 12 }}
+      >
+        <LiveReadiness readiness={readiness} compact />
+        {runs.length === 0 ? (
+          <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>No shadow runs yet.</div>
+        ) : (
+          <LiveRunHistory runs={runs} label="Recent autopilot runs" />
+        )}
+        {nextCursor !== null && (
+          <button
+            className="btn-ghost"
+            type="button"
+            disabled={loadingOlder}
+            onClick={() => void loadOlder()}
+            style={{ justifySelf: 'start' }}
+          >
+            {loadingOlder ? 'Loading older runs…' : 'Load older runs'}
+          </button>
+        )}
       </div>
-      <LiveReadiness readiness={readiness} compact />
-      {runs.length === 0 ? (
-        <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>No shadow runs yet.</div>
-      ) : (
-        <LiveRunHistory runs={runs} label="Recent autopilot runs" />
-      )}
-      {nextCursor !== null && (
-        <button
-          className="btn-ghost"
-          type="button"
-          disabled={loadingOlder}
-          onClick={() => void loadOlder()}
-          style={{ justifySelf: 'start' }}
-        >
-          {loadingOlder ? 'Loading older runs…' : 'Load older runs'}
-        </button>
-      )}
     </aside>
   );
 }

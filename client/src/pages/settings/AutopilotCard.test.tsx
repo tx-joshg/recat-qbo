@@ -862,12 +862,21 @@ describe('AutopilotQueueStatus', () => {
     expect(screen.queryByText('LIVE_DAILY_LIMIT_REACHED')).not.toBeInTheDocument();
   });
 
-  it('surfaces health and recent safe run inspection on the categorization queue', async () => {
+  it('keeps the summary visible while details are collapsed by default and toggle accessibly', async () => {
     render(<AutopilotQueueStatus companyId="company-1" />);
+    const user = userEvent.setup();
 
-    expect(await screen.findByText(/1 line proposal/i)).toBeInTheDocument();
-    expect(screen.getByText(/3 queued · 1 running · 1 retrying/i)).toBeInTheDocument();
+    expect(await screen.findByText(/3 queued · 1 running · 1 retrying/i)).toBeInTheDocument();
     expect(screen.getByText(/12 of 50 qualified outcomes/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 line proposal/i)).not.toBeVisible();
+
+    const toggle = screen.getByRole('button', { name: 'Show Shadow Autopilot details' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await user.click(toggle);
+
+    expect(screen.getByRole('button', { name: 'Hide Shadow Autopilot details' }))
+      .toHaveAttribute('aria-expanded', 'true');
+    expect(await screen.findByText(/1 line proposal/i)).toBeInTheDocument();
     expect(screen.getByText(/attempt 1/i)).toBeInTheDocument();
     expect(screen.getByText(new RegExp(`config ${CONFIG_VERSION}`))).toBeInTheDocument();
     expect(screen.getByText(/TaxInclusive · evidence rule/i)).toBeInTheDocument();
@@ -877,6 +886,17 @@ describe('AutopilotQueueStatus', () => {
     expect(screen.getByText(/input 100 · output 20 · total 120 tokens/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /apply|approve|post|stage|write/i }))
       .not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Hide Shadow Autopilot details' }));
+    expect(screen.getByText(/1 line proposal/i)).not.toBeVisible();
+  });
+
+  it('keeps the audit surface expanded by default', async () => {
+    render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
+
+    expect(await screen.findByRole('button', { name: 'Hide Shadow Autopilot details' }))
+      .toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText(/1 line proposal/i)).toBeVisible();
   });
 
   it('loads older run summaries through the opaque cursor without adding mutation controls', async () => {
@@ -886,7 +906,7 @@ describe('AutopilotQueueStatus', () => {
     render(<AutopilotQueueStatus companyId="company-1" />);
     const user = userEvent.setup();
 
-    await screen.findByText(/1 line proposal/i);
+    await user.click(await screen.findByRole('button', { name: 'Show Shadow Autopilot details' }));
     await user.click(screen.getByRole('button', { name: 'Load older runs' }));
 
     await waitFor(() => expect(mocks.listRuns).toHaveBeenLastCalledWith(
@@ -907,7 +927,7 @@ describe('AutopilotQueueStatus', () => {
     render(<AutopilotQueueStatus companyId="company-1" />);
     const user = userEvent.setup();
 
-    await screen.findByText(/1 line proposal/i);
+    await user.click(await screen.findByRole('button', { name: 'Show Shadow Autopilot details' }));
     await user.click(screen.getByRole('button', { name: 'Load older runs' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Load older runs' }))
       .toBeEnabled());
@@ -924,6 +944,8 @@ describe('AutopilotQueueStatus', () => {
 
     expect(await screen.findByText(/3 queued · 1 running · 1 retrying/i)).toBeInTheDocument();
     expect(screen.getByText(/12 of 50 qualified outcomes/i)).toBeInTheDocument();
+    expect(screen.getByText('No shadow runs yet.')).not.toBeVisible();
+    await userEvent.click(screen.getByRole('button', { name: 'Show Shadow Autopilot details' }));
     expect(screen.getByText('No shadow runs yet.')).toBeInTheDocument();
   });
 
@@ -945,7 +967,7 @@ describe('AutopilotQueueStatus', () => {
     const view = render(<AutopilotQueueStatus companyId="company-1" />);
     const user = userEvent.setup();
 
-    await screen.findByText(/1 line proposal/i);
+    await user.click(await screen.findByRole('button', { name: 'Show Shadow Autopilot details' }));
     await user.click(screen.getByRole('button', { name: 'Load older runs' }));
     await waitFor(() => expect(mocks.listRuns).toHaveBeenCalledWith(
       'company-1',
@@ -954,12 +976,14 @@ describe('AutopilotQueueStatus', () => {
 
     view.rerender(<AutopilotQueueStatus companyId="company-2" />);
     expect(await screen.findByText(/9 queued · 0 running · 0 retrying/i)).toBeInTheDocument();
-    expect(screen.getByText('No shadow runs yet.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show Shadow Autopilot details' }))
+      .toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('No shadow runs yet.')).not.toBeVisible();
 
     await act(async () => pendingOlderRuns.resolve(olderRuns));
 
     expect(screen.queryByText(/Abstained · provider failure/i)).not.toBeInTheDocument();
-    expect(screen.getByText('No shadow runs yet.')).toBeInTheDocument();
+    expect(screen.getByText('No shadow runs yet.')).not.toBeVisible();
     expect(screen.queryByRole('button', { name: 'Load older runs' })).not.toBeInTheDocument();
   });
 });
