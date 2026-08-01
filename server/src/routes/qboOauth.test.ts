@@ -163,9 +163,12 @@ describe('QuickBooks OAuth callback failure redirects', () => {
   });
 
   it('redirects an expired state with only STATE_EXPIRED', async () => {
-    const now = Date.now();
     const state = createOauthState({ mode: 'real', env: 'production' });
-    vi.spyOn(Date, 'now').mockReturnValue(now + 10 * 60 * 1000 + 1);
+    // Read the clock *after* issuing the state: the entry's expiresAt is set
+    // from Date.now() inside createOauthState, so anchoring to an earlier
+    // reading leaves the mocked clock short of expiry whenever more than a
+    // millisecond elapses between the two calls.
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10 * 60 * 1000 + 1);
     const response = await callback(
       `/auth/qbo/callback?state=${state}&code=CODE_SENTINEL&realmId=REALM_SENTINEL`,
     );
