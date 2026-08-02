@@ -1,7 +1,3 @@
----
-last_edited: 2026-08-02
----
-
 <p align="center">
   <img src="client/public/icon.svg" alt="Recat QBO logo" width="128" height="128">
 </p>
