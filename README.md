@@ -39,6 +39,7 @@ One click provisions the app + PostgreSQL with generated secrets. The setup wiza
 - Searchable category picker fed by your real chart of accounts, with suggestions pinned on top
 - Suggestions from three sources, first match wins: your **rules**, each payee's **history**, or an optional **AI endpoint** you control (OpenAI-compatible — works with OpenAI, Anthropic, Mistral, or local Ollama)
 - **Split** any transaction across multiple categories, each line with its own tags
+- **Sales tax on purchases** — pick a tax code from your company's real QuickBooks tax references, per transaction or per split line. Recat reads the posted result back from QuickBooks and only marks the transaction done once the tax it recorded matches what you chose
 - **Transfer detection** — matching in/out pairs get a one-click "record as transfer"
 - **Bulk mode**: select rows, assign one category, post them all
 - **Undo** any post for 30 days — the transaction moves back to the queue, with an audit entry
@@ -85,6 +86,13 @@ One click provisions the app + PostgreSQL with generated secrets. The setup wiza
 - An **instance admin** manages the deployment: Intuit keys, email, users, connecting companies
 - Multi-company from day one — connect as many QuickBooks companies as you like and switch from the nav
 
+**MCP server — let an AI assistant work your books**
+- Recat speaks the [Model Context Protocol](https://modelcontextprotocol.io) at `/mcp`, so an MCP client (Claude, or anything else that speaks it) can read your queue and categorize through the same verified paths the UI uses
+- **Reads**: companies, transactions, categories, tags, rules, tax codes, and transfer candidates
+- **Writes are two-phase.** A client calls `prepare_categorization` (or `prepare_transfer` / `prepare_undo`), gets back exactly what would change, then must `commit_` it as a separate step. Nothing writes to QuickBooks on a single blind tool call, and every commit is read back and verified
+- **These tokens can change your books.** A token grants everything its user can do, so a leaked one can recategorize real transactions. Treat it like a password: issue one per client, keep the expiry short, revoke it when you're done
+- Create and revoke tokens in **Settings → MCP access tokens**. They're shown once, stored only as a SHA-256 digest, expire in 90 days by default (1–365), and honour per-company roles, dry-run, and per-token rate limits
+
 **Safety, first-class**
 - **Dry-run mode** (default on): Recat logs the exact payload it *would* send to QuickBooks — but writes nothing. Turn it off when you trust the setup.
 - **Append-only audit log**: every write recorded before it happens — who, what, before → after, exact payload. Nothing can be edited or deleted; CSV export included.
@@ -111,6 +119,8 @@ cp .env.example .env        # set SESSION_SECRET + ENCRYPTION_KEY
 docker compose up -d
 open http://localhost:3001  # first-run setup wizard takes it from here
 ```
+
+Prebuilt images are published to `ghcr.io/tx-joshg/recat-qbo` for **`linux/amd64` and `linux/arm64`**, so the same tag works on an x86 server, an Apple Silicon Mac, or a Raspberry Pi.
 
 The wizard walks you through everything: how you want to start (demo or real) → admin account → Intuit keys (real path only) → email (SMTP, skippable) → connect QuickBooks → pick holding accounts → first sync. For the real path you'll need free QuickBooks API credentials from the [Intuit Developer Portal](https://developer.intuit.com) — **[docs/intuit-setup.md](docs/intuit-setup.md) walks you through it step by step**, including the production-access questionnaire.
 
@@ -186,13 +196,15 @@ Everything can be configured in the UI (setup wizard / Settings). Env vars are o
 | `LOCAL_ADMIN_EMAIL` / `LOCAL_ADMIN_PASSWORD` | Optional local login for one existing instance administrator; set both, with a random password of at least 12 characters. Umbrel maps its generated `${APP_PASSWORD}` to `LOCAL_ADMIN_PASSWORD` |
 | `TRUSTED_PROXY_IPS` | Optional comma-separated exact immediate reverse-proxy peer IPs. Empty (the default) trusts none and ignores `X-Forwarded-For` from direct or untrusted peers |
 | `SLACK_WEBHOOK_URL` | Optional digest notifications to Slack |
-| `DRY_RUN` | `true` = never write to QuickBooks, log payloads instead |
+| `DRY_RUN` | `true` = never write to QuickBooks, log payloads instead — applies to MCP writes too |
 
 Full list with comments in [.env.example](.env.example).
 
 The optional provider-neutral shadow decision core and the exact bookkeeping
 fields it can send to an external model are documented in
 [docs/autopilot.md](docs/autopilot.md).
+
+MCP access tokens are not env vars — they're issued per user in **Settings → MCP access tokens** and stored only as digests. See the MCP section above before handing one to a client.
 
 ## Architecture
 
