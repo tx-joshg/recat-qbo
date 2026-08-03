@@ -4,31 +4,9 @@ import type { ReceiptStatsDto } from '@recat/shared';
 import { receipts } from '../../lib/api';
 import ReceiptDropzone from '../../components/receipts/ReceiptDropzone';
 import { useApp } from '../../state/AppContext';
+import { readPreference, writePreference } from '../../lib/storage';
 
 type Timeframe = '30' | '90' | 'all';
-
-// localStorage here stores a view preference, never anything authoritative, so
-// every path degrades to "no saved preference" rather than taking the page
-// down. Optional chaining alone is not enough: it guards localStorage being
-// absent, but the property can also throw on access under strict privacy
-// settings, and can be a partial stub without getItem/setItem. Safari in
-// private mode additionally rejects writes, and any browser rejects them once
-// the quota is full.
-function readPreference(key: string): string | null {
-  try {
-    return globalThis.localStorage?.getItem(key) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function writePreference(key: string, value: string): void {
-  try {
-    globalThis.localStorage?.setItem(key, value);
-  } catch {
-    // A rejected write must not block the timeframe from changing on screen.
-  }
-}
 
 function rangeFor(timeframe: Timeframe): { dateFrom?: string; dateTo?: string } {
   if (timeframe === 'all') return {};

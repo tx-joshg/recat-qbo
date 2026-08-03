@@ -29,6 +29,7 @@ import {
   tax as taxApi,
   transactions as txnApi,
 } from '../lib/api';
+import { readPreference, writePreference } from '../lib/storage';
 
 export type Theme = 'light' | 'dark';
 
@@ -103,7 +104,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const [companies, setCompanies] = useState<CompanyDto[]>([]);
   const [activeCompanyId, setActiveCompanyIdState] = useState<string | null>(
-    () => localStorage.getItem(COMPANY_KEY),
+    () => readPreference(COMPANY_KEY),
   );
 
   const [accounts, setAccounts] = useState<QboAccountDto[]>([]);
@@ -113,7 +114,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [pendingCount, setPendingCount] = useState(0);
 
   const [theme, setTheme] = useState<Theme>(() =>
-    localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light',
+    readPreference(THEME_KEY) === 'dark' ? 'dark' : 'light',
   );
 
   const [activeToast, setActiveToast] = useState<ActiveToast | null>(null);
@@ -162,14 +163,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const first = companies[0];
       if (first) {
         setActiveCompanyIdState(first.id);
-        localStorage.setItem(COMPANY_KEY, first.id);
+        writePreference(COMPANY_KEY, first.id);
       }
     }
   }, [companies, activeCompanyId]);
 
   const setActiveCompany = useCallback((id: string) => {
     setActiveCompanyIdState(id);
-    localStorage.setItem(COMPANY_KEY, id);
+    writePreference(COMPANY_KEY, id);
   }, []);
 
   const activeCompany = useMemo(
@@ -280,17 +281,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const toggleTheme = useCallback(() => {
     setTheme((t) => {
       const next: Theme = t === 'light' ? 'dark' : 'light';
-      localStorage.setItem(THEME_KEY, next);
+      writePreference(THEME_KEY, next);
       return next;
     });
   }, []);
 
   // ---- density (comfortable default, per prototype) ----
   const [density, setDensityState] = useState<Density>(() =>
-    localStorage.getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable',
+    readPreference(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable',
   );
   const setDensity = useCallback((d: Density) => {
-    localStorage.setItem(DENSITY_KEY, d);
+    writePreference(DENSITY_KEY, d);
     setDensityState(d);
   }, []);
 
