@@ -846,14 +846,9 @@ describe('LiveRunHistory', () => {
 
 describe('AutopilotQueueStatus', () => {
   it('renders the daily cap stop as a safe operator-facing message', async () => {
-    mocks.listRuns.mockResolvedValueOnce({
-      runs: [{
-        ...runs.runs[0]!,
-        status: 'failed',
-        outcome: 'failed_before_write',
-        errorCode: 'LIVE_DAILY_LIMIT_REACHED',
-      }],
-      nextCursor: null,
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
     });
 
     render(<AutopilotQueueStatus companyId="company-1" />);
@@ -866,21 +861,21 @@ describe('AutopilotQueueStatus', () => {
     expect(screen.queryByText('LIVE_DAILY_LIMIT_REACHED')).not.toBeInTheDocument();
   });
 
-  it('clears the blocking notice once a newer run completes without error', async () => {
-    // History is newest-first, so a succeeded run ahead of a failed one means
-    // the stop is spent — after a UTC day rollover, for instance. Scanning the
-    // whole list instead of the latest run reported it as still current.
+  it('does not raise the cap notice from run history alone', async () => {
+    // /autopilot/runs is an event log. A failed row can be days old, already
+    // resolved, or a shadow run that never touched the live cap — none of which
+    // means live writes are currently blocked. Usage is the only authority.
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 0, limit: 25 },
+    });
     mocks.listRuns.mockResolvedValueOnce({
-      runs: [
-        { ...runs.runs[0]!, status: 'succeeded', outcome: 'shadow_verified', errorCode: null },
-        {
-          ...runs.runs[0]!,
-          id: 'older-failed-run',
-          status: 'failed',
-          outcome: 'failed_before_write',
-          errorCode: 'LIVE_DAILY_LIMIT_REACHED',
-        },
-      ],
+      runs: [{
+        ...runs.runs[0]!,
+        status: 'failed',
+        outcome: 'failed_before_write',
+        errorCode: 'LIVE_DAILY_LIMIT_REACHED',
+      }],
       nextCursor: null,
     });
 
@@ -890,6 +885,24 @@ describe('AutopilotQueueStatus', () => {
     for (const node of screen.queryAllByText('Daily live-write limit reached')) {
       expect(node).not.toBeVisible();
     }
+  });
+
+  it('keeps the cap notice while a newer run is in progress', async () => {
+    // The reported regression: a running row has a null errorCode, so deriving
+    // from the latest run hid a cap that is still exhausted until UTC rollover.
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
+    });
+    mocks.listRuns.mockResolvedValueOnce({
+      runs: [{ ...runs.runs[0]!, status: 'running', outcome: 'in_progress', errorCode: null }],
+      nextCursor: null,
+    });
+
+    render(<AutopilotQueueStatus companyId="company-1" />);
+
+    const [notice] = await screen.findAllByText('Daily live-write limit reached');
+    expect(notice).toBeVisible();
   });
 
   it('keeps the summary visible while details are collapsed by default and toggle accessibly', async () => {

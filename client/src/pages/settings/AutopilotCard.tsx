@@ -978,12 +978,14 @@ export function AutopilotQueueStatus({
     if (readiness?.state.paused) {
       return readiness.state.pauseMessage ?? 'Live mode paused';
     }
-    // Latest run only. History is newest-first and "load older" appends, so
-    // scanning the whole list would keep reporting a spent daily cap after the
-    // UTC day rolled over, or resurrect one the moment older rows are loaded.
-    // A newer run completing without an error means the stop is resolved.
-    const latest = runs[0];
-    return latest?.errorCode ? runErrorLabel(latest.errorCode) : null;
+    // Read current state, never infer it from run history. /autopilot/runs is
+    // an event log: it includes in-progress rows and shadow runs, neither of
+    // which says anything about live-write availability, and paging back
+    // through it can surface failures that were resolved days ago.
+    if (state && state.liveWrites.used >= state.liveWrites.limit) {
+      return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
+    }
+    return null;
   })();
 
   useEffect(() => {
