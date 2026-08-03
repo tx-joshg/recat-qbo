@@ -906,6 +906,39 @@ describe('AutopilotQueueStatus', () => {
     }
   });
 
+  it('expires the cap notice at the UTC rollover without a refetch', async () => {
+    // The date guard is only read during render, and midnight does not itself
+    // cause one. An idle Audit tab kept the banner until something else
+    // re-rendered it.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-08-03T23:59:30.000Z'));
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { utcDay: '2026-08-03', used: 25, limit: 25 },
+    });
+
+    try {
+      render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
+
+      const [before] = await screen.findAllByText('Daily live-write limit reached');
+      expect(before).toBeVisible();
+
+      await act(async () => {
+        vi.setSystemTime(new Date('2026-08-04T00:00:02.000Z'));
+        await vi.advanceTimersByTimeAsync(35_000);
+      });
+
+      await waitFor(() => {
+        for (const node of screen.queryAllByText('Daily live-write limit reached')) {
+          expect(node).not.toBeVisible();
+        }
+      });
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps the cap notice while a newer run is in progress', async () => {
     // The reported regression: a running row has a null errorCode, so deriving
     // from the latest run hid a cap that is still exhausted until UTC rollover.

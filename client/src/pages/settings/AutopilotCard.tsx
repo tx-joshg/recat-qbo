@@ -53,6 +53,10 @@ const RUN_ERROR_LABEL: Readonly<Record<string, string>> = {
   LIVE_DAILY_LIMIT_REACHED: 'Daily live-write limit reached',
 };
 
+function currentUtcDay(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
 function runErrorLabel(code: string): string {
   return RUN_ERROR_LABEL[code] ?? code;
 }
@@ -968,8 +972,26 @@ export function AutopilotQueueStatus({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [expanded, setExpanded] = useState(surface === 'audit');
+  const [utcDay, setUtcDay] = useState(currentUtcDay);
   const detailsId = useId();
   const generationRef = useRef(0);
+
+  // Reaching UTC midnight does not itself re-render, so an idle tab would hold
+  // an expired cap banner indefinitely. Wake once at the rollover; the effect
+  // re-runs on the new day and schedules the next one.
+  useEffect(() => {
+    const now = new Date();
+    const nextRollover = Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() + 1,
+    );
+    const timer = setTimeout(
+      () => setUtcDay(currentUtcDay()),
+      Math.max(0, nextRollover - now.getTime()) + 1_000,
+    );
+    return () => clearTimeout(timer);
+  }, [utcDay]);
 
   // A paused live mode, or a run that stopped before writing, has to reach the
   // operator whether or not the panel is expanded. Prefer the pause reason:
@@ -989,7 +1011,7 @@ export function AutopilotQueueStatus({
     if (
       state
       && state.liveWrites.used >= state.liveWrites.limit
-      && state.liveWrites.utcDay === new Date().toISOString().slice(0, 10)
+      && state.liveWrites.utcDay === utcDay
     ) {
       return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
     }
