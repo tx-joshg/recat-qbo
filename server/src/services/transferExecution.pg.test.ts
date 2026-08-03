@@ -840,10 +840,19 @@ describePostgres('transfer execution PostgreSQL durability', () => {
       );
       leaseRowsLocked.resolve();
       await releaseLeaseRows.promise;
+      // Expire the leases under the same row lock the renewal is queued behind,
+      // rather than sleeping past the TTL. The renewal then observes expiry the
+      // instant it acquires the row, which is the property under test — and it
+      // no longer depends on a wall-clock margin that a loaded runner can eat.
+      await tx.$executeRawUnsafe(
+        `UPDATE "QboEntityLease"
+            SET "leaseExpiresAt" = clock_timestamp() - interval '1 second'
+          WHERE "companyId" = $1`,
+        fixture.companyId,
+      );
     });
     await leaseRowsLocked.promise;
     releaseFinalRenew.resolve();
-    await delay(450);
     releaseLeaseRows.resolve();
     await locker;
     await pending.catch(() => undefined);
