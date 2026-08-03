@@ -41,9 +41,6 @@ import AutopilotCard, {
   LiveRunHistory,
 } from './AutopilotCard';
 
-// The cap notice expires with the UTC day its snapshot describes, so tests
-// asserting a live cap must present a snapshot for today.
-const TODAY_UTC = new Date().toISOString().slice(0, 10);
 const CONFIG_VERSION = 'a'.repeat(64);
 const SECOND_CONFIG_VERSION = 'b'.repeat(64);
 const LIVE_POLICY_VERSION = 'recat-live-purchase-v1';
@@ -851,7 +848,7 @@ describe('AutopilotQueueStatus', () => {
   it('renders the daily cap stop as a safe operator-facing message', async () => {
     mocks.get.mockResolvedValueOnce({
       ...overview,
-      liveWrites: { ...overview.liveWrites, utcDay: TODAY_UTC, used: 25, limit: 25 },
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
     });
 
     render(<AutopilotQueueStatus companyId="company-1" />);
@@ -890,31 +887,18 @@ describe('AutopilotQueueStatus', () => {
     }
   });
 
-  it('expires the cap notice once the reported UTC day has passed', async () => {
-    // The overview is fetched once per company/surface. An overnight session
-    // otherwise keeps asserting yesterday's exhausted cap long after rollover.
-    mocks.get.mockResolvedValueOnce({
-      ...overview,
-      liveWrites: { utcDay: '2020-01-01', used: 25, limit: 25 },
-    });
-
-    render(<AutopilotQueueStatus companyId="company-1" />);
-
-    await screen.findByText(/queued/);
-    for (const node of screen.queryAllByText('Daily live-write limit reached')) {
-      expect(node).not.toBeVisible();
-    }
-  });
-
-  it('expires the cap notice at the UTC rollover without a refetch', async () => {
-    // The date guard is only read during render, and midnight does not itself
-    // cause one. An idle Audit tab kept the banner until something else
-    // re-rendered it.
+  it('refetches at the server-reported UTC boundary so a skewed clock cannot suppress the cap', async () => {
+    // The notice must never depend on the workstation agreeing with Postgres
+    // about the date. The local clock only schedules the refresh.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-08-03T23:59:30.000Z'));
     mocks.get.mockResolvedValueOnce({
       ...overview,
       liveWrites: { utcDay: '2026-08-03', used: 25, limit: 25 },
+    });
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { utcDay: '2026-08-04', used: 0, limit: 25 },
     });
 
     try {
@@ -928,12 +912,31 @@ describe('AutopilotQueueStatus', () => {
         await vi.advanceTimersByTimeAsync(35_000);
       });
 
+      await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
       await waitFor(() => {
         for (const node of screen.queryAllByText('Daily live-write limit reached')) {
           expect(node).not.toBeVisible();
         }
       });
-      expect(mocks.get).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the cap when the workstation clock disagrees with the server date', async () => {
+    // The exact reported failure: comparing server utcDay to the browser date
+    // hid the notice for a whole day whenever the two disagreed.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2027-01-01T12:00:00.000Z'));
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { utcDay: '2026-08-03', used: 25, limit: 25 },
+    });
+
+    try {
+      render(<AutopilotQueueStatus companyId="company-1" />);
+      const [notice] = await screen.findAllByText('Daily live-write limit reached');
+      expect(notice).toBeVisible();
     } finally {
       vi.useRealTimers();
     }
@@ -944,7 +947,7 @@ describe('AutopilotQueueStatus', () => {
     // from the latest run hid a cap that is still exhausted until UTC rollover.
     mocks.get.mockResolvedValueOnce({
       ...overview,
-      liveWrites: { ...overview.liveWrites, utcDay: TODAY_UTC, used: 25, limit: 25 },
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
     });
     mocks.listRuns.mockResolvedValueOnce({
       runs: [{ ...runs.runs[0]!, status: 'running', outcome: 'in_progress', errorCode: null }],

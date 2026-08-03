@@ -53,10 +53,6 @@ const RUN_ERROR_LABEL: Readonly<Record<string, string>> = {
   LIVE_DAILY_LIMIT_REACHED: 'Daily live-write limit reached',
 };
 
-function currentUtcDay(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
 function runErrorLabel(code: string): string {
   return RUN_ERROR_LABEL[code] ?? code;
 }
@@ -972,26 +968,28 @@ export function AutopilotQueueStatus({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [expanded, setExpanded] = useState(surface === 'audit');
-  const [utcDay, setUtcDay] = useState(currentUtcDay);
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const detailsId = useId();
   const generationRef = useRef(0);
 
-  // Reaching UTC midnight does not itself re-render, so an idle tab would hold
-  // an expired cap banner indefinitely. Wake once at the rollover; the effect
-  // re-runs on the new day and schedules the next one.
+  // The cap resets on the server's UTC day, so refetch at that boundary rather
+  // than asking the browser whether the snapshot is stale — a skewed
+  // workstation clock would otherwise suppress a live cap for a whole day.
+  // Anchor on the day the server reported; the local clock only decides when
+  // to refresh, never whether the notice is correct. A clock already past the
+  // boundary clamps to an immediate refresh.
+  const reportedUtcDay = state?.liveWrites.utcDay ?? null;
   useEffect(() => {
-    const now = new Date();
-    const nextRollover = Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate() + 1,
-    );
+    if (reportedUtcDay === null) return;
+    const boundary = Date.parse(`${reportedUtcDay}T00:00:00.000Z`);
+    if (Number.isNaN(boundary)) return;
     const timer = setTimeout(
-      () => setUtcDay(currentUtcDay()),
-      Math.max(0, nextRollover - now.getTime()) + 1_000,
+      () => setRefreshNonce((current) => current + 1),
+      Math.max(0, boundary + 86_400_000 - Date.now()) + 1_000,
     );
     return () => clearTimeout(timer);
-  }, [utcDay]);
+  }, [reportedUtcDay, refreshNonce]);
+
 
   // A paused live mode, or a run that stopped before writing, has to reach the
   // operator whether or not the panel is expanded. Prefer the pause reason:
@@ -1004,15 +1002,7 @@ export function AutopilotQueueStatus({
     // an event log: it includes in-progress rows and shadow runs, neither of
     // which says anything about live-write availability, and paging back
     // through it can surface failures that were resolved days ago.
-    // The overview is fetched once per company/surface, so an overnight session
-    // holds yesterday's snapshot. Past the UTC day it describes, that snapshot
-    // proves nothing about today's cap — expire it rather than assert a stop
-    // that may have reset hours ago.
-    if (
-      state
-      && state.liveWrites.used >= state.liveWrites.limit
-      && state.liveWrites.utcDay === utcDay
-    ) {
+    if (state && state.liveWrites.used >= state.liveWrites.limit) {
       return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
     }
     return null;
@@ -1047,7 +1037,7 @@ export function AutopilotQueueStatus({
       cancelled = true;
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [companyId, surface]);
+  }, [companyId, surface, refreshNonce]);
 
   const loadOlder = async () => {
     if (nextCursor === null || loadingOlder) return;
