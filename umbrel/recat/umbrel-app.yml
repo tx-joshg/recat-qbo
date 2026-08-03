@@ -38,7 +38,7 @@ developer: Josh Goble
 website: https://github.com/tx-joshg/recat-qbo
 repo: https://github.com/tx-joshg/recat-qbo
 support: https://github.com/tx-joshg/recat-qbo/issues
-port: 3001
+port: 3009
 path: ""
 gallery: []
 defaultUsername: admin@recat.local

@@ -19,9 +19,16 @@ recat/
 request, which does not exist until you open it. Umbrel will reject the
 manifest with `PENDING` in place.
 
-**`port: 3001` must be unique across the whole App Store.** Nothing here can
-verify that — check for a collision against the current `umbrel-apps` tree
-before opening the PR, and pick another if 3001 is taken.
+**`port: 3009`** — checked against the full App Store index (391 apps, current
+as of 2026-08-03). `3001` was taken by `ride-the-lightning`; `3009` is the
+nearest free port and nothing else references it. The app id `recat` is also
+unclaimed. Re-check before submitting, since the store moves.
+
+Note the split: `port` is the host-facing app_proxy port and must be unique,
+while `APP_PORT` and the container's `PORT` stay `3001` — that is Recat's own
+listen port and is not visible to the host. `APP_URL` follows the *host-facing*
+port, because it is what a browser hits and what the QuickBooks redirect URI is
+built from.
 
 **Images are pinned by digest** and must be re-pinned on every release:
 
@@ -53,7 +60,7 @@ entirely.
 
 ### APP_URL and the QuickBooks redirect
 
-`APP_URL` is hardcoded to `http://umbrel.local:3001`. Umbrel does not expose the
+`APP_URL` is hardcoded to `http://umbrel.local:3009`. Umbrel does not expose the
 device address as a compose variable — neither Immich nor Vaultwarden reference
 one — so it cannot be derived.
 
@@ -62,7 +69,7 @@ Umbrel by another name (a custom domain, a Tailscale address) must change it to
 match what they register in the Intuit developer portal.
 
 **Unverified and worth settling before submission:** Intuit requires HTTPS
-redirect URIs for production apps, and `http://umbrel.local:3001` is neither
+redirect URIs for production apps, and `http://umbrel.local:3009` is neither
 HTTPS nor a public hostname. If Intuit rejects it, Umbrel users can run the
 built-in demo QuickBooks but may not be able to connect real books without
 fronting the app with TLS. Confirm against a real Intuit app registration before
@@ -127,7 +134,7 @@ point rather than only after step 2.
 ### Still unverified
 
 `GET /api/setup/status` reports the redirect URI the app will use:
-`http://umbrel.local:3001/auth/qbo/callback`. Whether Intuit accepts a
+`http://umbrel.local:3009/auth/qbo/callback`. Whether Intuit accepts a
 non-HTTPS, non-public redirect URI for a production app is still open, and it
 decides whether Umbrel users can connect real books or only run the demo.
 Answerable in minutes against a real Intuit app registration.
