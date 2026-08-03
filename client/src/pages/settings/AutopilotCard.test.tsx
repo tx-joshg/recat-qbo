@@ -858,7 +858,11 @@ describe('AutopilotQueueStatus', () => {
 
     render(<AutopilotQueueStatus companyId="company-1" />);
 
-    expect(await screen.findByText('Daily live-write limit reached')).toBeInTheDocument();
+    // toBeVisible, not toBeInTheDocument: the queue surface renders collapsed,
+    // and a stop that is only present inside the hidden details panel never
+    // reaches the operator. The weaker assertion passed while it was hidden.
+    const [notice] = await screen.findAllByText('Daily live-write limit reached');
+    expect(notice).toBeVisible();
     expect(screen.queryByText('LIVE_DAILY_LIMIT_REACHED')).not.toBeInTheDocument();
   });
 

@@ -971,6 +971,17 @@ export function AutopilotQueueStatus({
   const detailsId = useId();
   const generationRef = useRef(0);
 
+  // A paused live mode, or a run that stopped before writing, has to reach the
+  // operator whether or not the panel is expanded. Prefer the pause reason:
+  // it persists, where a run error is a single event.
+  const blockingNotice: string | null = (() => {
+    if (readiness?.state.paused) {
+      return readiness.state.pauseMessage ?? 'Live mode paused';
+    }
+    const stopped = runs.find((run) => run.errorCode);
+    return stopped?.errorCode ? runErrorLabel(stopped.errorCode) : null;
+  })();
+
   useEffect(() => {
     const generation = ++generationRef.current;
     let cancelled = false;
@@ -1076,6 +1087,25 @@ export function AutopilotQueueStatus({
           <EvidenceProgress state={state} />
         </div>
       </button>
+      {blockingNotice !== null && (
+        // Collapsing the panel must not hide a stop. A paused live mode or a
+        // run that halted before writing is exactly what the operator needs to
+        // see on the queue surface, where the panel starts collapsed.
+        <div
+          role="status"
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            color: 'var(--erT)',
+            background: 'var(--erB)',
+            border: '1px solid var(--erD)',
+            borderRadius: 8,
+            padding: '8px 10px',
+          }}
+        >
+          {blockingNotice}
+        </div>
+      )}
       <div
         id={detailsId}
         hidden={!expanded}
