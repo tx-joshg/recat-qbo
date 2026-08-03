@@ -1,0 +1,86 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: recat_server_1
+      APP_PORT: 3001
+
+  server:
+    image: ghcr.io/tx-joshg/recat-qbo:sha-63f04f5@sha256:b431315cffa2c88fe63281e49ea097378c92ca66db16e4c470779342596b5bab
+    restart: on-failure
+    environment:
+      # Umbrel does not inject the device address, so this is the default
+      # umbrel.local URL. It is the base for the QuickBooks OAuth redirect, so
+      # anyone reaching their Umbrel by another name — a custom domain, a
+      # Tailscale address — must change this to match what they register in the
+      # Intuit developer portal. See README-umbrel.md.
+      APP_URL: http://umbrel.local:3001
+      PORT: 3001
+      DATABASE_URL: postgresql://recat:${APP_RECAT_DB_PASSWORD}@recat_db_1:5432/recat
+      SESSION_SECRET: ${APP_RECAT_SESSION_SECRET}
+      ENCRYPTION_KEY: ${APP_RECAT_ENCRYPTION_KEY}
+
+      # Local sign-in, because an Umbrel install has no outbound mail and
+      # magic links cannot deliver. The wizard must create this exact address
+      # as the first administrator; it is surfaced to the user as
+      # defaultUsername in the manifest.
+      LOCAL_ADMIN_EMAIL: admin@recat.local
+      LOCAL_ADMIN_PASSWORD: ${APP_PASSWORD}
+
+      # TRUSTED_PROXY_IPS is deliberately unset. The app_proxy container's
+      # address is assigned by Docker and is not exposed as an Umbrel variable,
+      # and the default of trusting nothing is the safe failure mode:
+      # X-Forwarded-For is ignored, so per-IP rate limiting counts the proxy
+      # rather than the client. Trusting a guessed CIDR would instead let a
+      # client spoof its own source address.
+
+      RECEIPT_EXTRACTOR_URL: http://recat_receipt-extractor_1:8485
+      RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}
+    depends_on:
+      db:
+        condition: service_healthy
+      receipt-extractor:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: on-failure
+    environment:
+      POSTGRES_USER: recat
+      POSTGRES_PASSWORD: ${APP_RECAT_DB_PASSWORD}
+      POSTGRES_DB: recat
+    volumes:
+      # Bind mount, not a named volume: Umbrel backs up and restores
+      # ${APP_DATA_DIR} and recreates containers on update.
+      - ${APP_DATA_DIR}/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recat -d recat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  receipt-extractor:
+    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:sha-63f04f5@sha256:387579a6123e6c0a9e454f1730b64839b05caf0e338a83d68e1b0876dd8d46e0
+    restart: on-failure
+    environment:
+      RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}
+    # Not published to the host — reachable only from the app container.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    mem_limit: 1g
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8485/healthz')
+      interval: 10s
+      timeout: 3s
+      retries: 10
