@@ -41,6 +41,9 @@ import AutopilotCard, {
   LiveRunHistory,
 } from './AutopilotCard';
 
+// The cap notice expires with the UTC day its snapshot describes, so tests
+// asserting a live cap must present a snapshot for today.
+const TODAY_UTC = new Date().toISOString().slice(0, 10);
 const CONFIG_VERSION = 'a'.repeat(64);
 const SECOND_CONFIG_VERSION = 'b'.repeat(64);
 const LIVE_POLICY_VERSION = 'recat-live-purchase-v1';
@@ -848,7 +851,7 @@ describe('AutopilotQueueStatus', () => {
   it('renders the daily cap stop as a safe operator-facing message', async () => {
     mocks.get.mockResolvedValueOnce({
       ...overview,
-      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
+      liveWrites: { ...overview.liveWrites, utcDay: TODAY_UTC, used: 25, limit: 25 },
     });
 
     render(<AutopilotQueueStatus companyId="company-1" />);
@@ -887,12 +890,28 @@ describe('AutopilotQueueStatus', () => {
     }
   });
 
+  it('expires the cap notice once the reported UTC day has passed', async () => {
+    // The overview is fetched once per company/surface. An overnight session
+    // otherwise keeps asserting yesterday's exhausted cap long after rollover.
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { utcDay: '2020-01-01', used: 25, limit: 25 },
+    });
+
+    render(<AutopilotQueueStatus companyId="company-1" />);
+
+    await screen.findByText(/queued/);
+    for (const node of screen.queryAllByText('Daily live-write limit reached')) {
+      expect(node).not.toBeVisible();
+    }
+  });
+
   it('keeps the cap notice while a newer run is in progress', async () => {
     // The reported regression: a running row has a null errorCode, so deriving
     // from the latest run hid a cap that is still exhausted until UTC rollover.
     mocks.get.mockResolvedValueOnce({
       ...overview,
-      liveWrites: { ...overview.liveWrites, used: 25, limit: 25 },
+      liveWrites: { ...overview.liveWrites, utcDay: TODAY_UTC, used: 25, limit: 25 },
     });
     mocks.listRuns.mockResolvedValueOnce({
       runs: [{ ...runs.runs[0]!, status: 'running', outcome: 'in_progress', errorCode: null }],

@@ -982,7 +982,15 @@ export function AutopilotQueueStatus({
     // an event log: it includes in-progress rows and shadow runs, neither of
     // which says anything about live-write availability, and paging back
     // through it can surface failures that were resolved days ago.
-    if (state && state.liveWrites.used >= state.liveWrites.limit) {
+    // The overview is fetched once per company/surface, so an overnight session
+    // holds yesterday's snapshot. Past the UTC day it describes, that snapshot
+    // proves nothing about today's cap — expire it rather than assert a stop
+    // that may have reset hours ago.
+    if (
+      state
+      && state.liveWrites.used >= state.liveWrites.limit
+      && state.liveWrites.utcDay === new Date().toISOString().slice(0, 10)
+    ) {
       return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
     }
     return null;
