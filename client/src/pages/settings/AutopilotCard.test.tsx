@@ -866,6 +866,32 @@ describe('AutopilotQueueStatus', () => {
     expect(screen.queryByText('LIVE_DAILY_LIMIT_REACHED')).not.toBeInTheDocument();
   });
 
+  it('clears the blocking notice once a newer run completes without error', async () => {
+    // History is newest-first, so a succeeded run ahead of a failed one means
+    // the stop is spent — after a UTC day rollover, for instance. Scanning the
+    // whole list instead of the latest run reported it as still current.
+    mocks.listRuns.mockResolvedValueOnce({
+      runs: [
+        { ...runs.runs[0]!, status: 'succeeded', outcome: 'shadow_verified', errorCode: null },
+        {
+          ...runs.runs[0]!,
+          id: 'older-failed-run',
+          status: 'failed',
+          outcome: 'failed_before_write',
+          errorCode: 'LIVE_DAILY_LIMIT_REACHED',
+        },
+      ],
+      nextCursor: null,
+    });
+
+    render(<AutopilotQueueStatus companyId="company-1" />);
+
+    await screen.findByText(/queued/);
+    for (const node of screen.queryAllByText('Daily live-write limit reached')) {
+      expect(node).not.toBeVisible();
+    }
+  });
+
   it('keeps the summary visible while details are collapsed by default and toggle accessibly', async () => {
     render(<AutopilotQueueStatus companyId="company-1" />);
     const user = userEvent.setup();

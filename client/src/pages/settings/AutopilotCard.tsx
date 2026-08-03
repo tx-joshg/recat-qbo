@@ -978,8 +978,12 @@ export function AutopilotQueueStatus({
     if (readiness?.state.paused) {
       return readiness.state.pauseMessage ?? 'Live mode paused';
     }
-    const stopped = runs.find((run) => run.errorCode);
-    return stopped?.errorCode ? runErrorLabel(stopped.errorCode) : null;
+    // Latest run only. History is newest-first and "load older" appends, so
+    // scanning the whole list would keep reporting a spent daily cap after the
+    // UTC day rolled over, or resurrect one the moment older rows are loaded.
+    // A newer run completing without an error means the stop is resolved.
+    const latest = runs[0];
+    return latest?.errorCode ? runErrorLabel(latest.errorCode) : null;
   })();
 
   useEffect(() => {
