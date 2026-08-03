@@ -87,17 +87,47 @@ only pull, never build. Receipt extraction is still opt-in and off by default,
 and enabling it sends receipt images to whichever provider the operator
 configures.
 
-## Verified so far
+## Verified by running it
 
-- Manifest and compose parse; every required manifest field present
-- Every `APP_RECAT_*` reference in compose is defined in `exports.sh`, and none
-  is unused
-- No published ports, no named volumes, all three images digest-pinned
-- All three images confirmed multi-arch in their registries
-- The package's env values pass the app's own production env schema, including
-  the strict 64-hex `ENCRYPTION_KEY`, and local admin resolves to enabled
+Booted from the pinned digests on an **arm64** host — the architecture most
+Umbrel devices use — with `derive_entropy` values simulated and `app_proxy`
+replaced by a direct port publish, so the server, database and extractor
+definitions ran exactly as they ship.
 
-**Not verified:** no container has actually been started. Docker was unavailable
-in the environment where this was authored, so migrations, healthcheck
-behaviour, `app_proxy` routing, and the first-run wizard are all untested. Boot
-it on a real Umbrel before submitting.
+- All three digests pull and resolve on arm64
+- Containers start, Postgres and the extractor report healthy, the server waits
+  on both
+- **All 26 migrations apply** against an empty database on first boot
+- The app serves; `/auth/methods` reports `localAdmin: true`
+- The extractor is reachable from the server container over the app network
+  (`/healthz` → 200) and is not published to the host
+- `ReceiptCompanyConfig.enabled` defaults to `false` in the created schema, so
+  extraction is off until an operator turns it on
+- Postgres data lands in the `APP_DATA_DIR` bind mount, and **survives a full
+  `down` / `up` cycle** — the admin account and its session both persisted,
+  which is what Umbrel does on update
+
+### First-run flow, end to end
+
+1. Fresh install reports `needsSetup: true`
+2. The wizard creates the first instance admin; with no SMTP it returns
+   `delivered: false` plus a one-click link rather than failing
+3. Local sign-in with the password Umbrel displays then returns HTTP 200
+
+**The order matters.** Before step 2 those same credentials return
+`401 INVALID_CREDENTIALS` — reproduced, not inferred. `authenticateLocalAdmin`
+authenticates an existing instance admin and never creates one, so the account
+must exist first. A user who tries the displayed password before finishing the
+wizard will be told it is wrong.
+
+That is the strongest argument for having the wizard default its admin address
+to `LOCAL_ADMIN_EMAIL`: it would make the displayed credential correct at every
+point rather than only after step 2.
+
+### Still unverified
+
+`GET /api/setup/status` reports the redirect URI the app will use:
+`http://umbrel.local:3001/auth/qbo/callback`. Whether Intuit accepts a
+non-HTTPS, non-public redirect URI for a production app is still open, and it
+decides whether Umbrel users can connect real books or only run the demo.
+Answerable in minutes against a real Intuit app registration.
