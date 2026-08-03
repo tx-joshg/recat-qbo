@@ -887,42 +887,6 @@ describe('AutopilotQueueStatus', () => {
     }
   });
 
-  it('refetches at the server-reported UTC boundary so a skewed clock cannot suppress the cap', async () => {
-    // The notice must never depend on the workstation agreeing with Postgres
-    // about the date. The local clock only schedules the refresh.
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.setSystemTime(new Date('2026-08-03T23:59:30.000Z'));
-    mocks.get.mockResolvedValueOnce({
-      ...overview,
-      liveWrites: { utcDay: '2026-08-03', used: 25, limit: 25 },
-    });
-    mocks.get.mockResolvedValueOnce({
-      ...overview,
-      liveWrites: { utcDay: '2026-08-04', used: 0, limit: 25 },
-    });
-
-    try {
-      render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
-
-      const [before] = await screen.findAllByText('Daily live-write limit reached');
-      expect(before).toBeVisible();
-
-      await act(async () => {
-        vi.setSystemTime(new Date('2026-08-04T00:00:02.000Z'));
-        await vi.advanceTimersByTimeAsync(35_000);
-      });
-
-      await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
-      await waitFor(() => {
-        for (const node of screen.queryAllByText('Daily live-write limit reached')) {
-          expect(node).not.toBeVisible();
-        }
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it('shows the cap when the workstation clock disagrees with the server date', async () => {
     // The exact reported failure: comparing server utcDay to the browser date
     // hid the notice for a whole day whenever the two disagreed.

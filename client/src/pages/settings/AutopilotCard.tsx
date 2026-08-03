@@ -968,27 +968,8 @@ export function AutopilotQueueStatus({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [expanded, setExpanded] = useState(surface === 'audit');
-  const [refreshNonce, setRefreshNonce] = useState(0);
   const detailsId = useId();
   const generationRef = useRef(0);
-
-  // The cap resets on the server's UTC day, so refetch at that boundary rather
-  // than asking the browser whether the snapshot is stale — a skewed
-  // workstation clock would otherwise suppress a live cap for a whole day.
-  // Anchor on the day the server reported; the local clock only decides when
-  // to refresh, never whether the notice is correct. A clock already past the
-  // boundary clamps to an immediate refresh.
-  const reportedUtcDay = state?.liveWrites.utcDay ?? null;
-  useEffect(() => {
-    if (reportedUtcDay === null) return;
-    const boundary = Date.parse(`${reportedUtcDay}T00:00:00.000Z`);
-    if (Number.isNaN(boundary)) return;
-    const timer = setTimeout(
-      () => setRefreshNonce((current) => current + 1),
-      Math.max(0, boundary + 86_400_000 - Date.now()) + 1_000,
-    );
-    return () => clearTimeout(timer);
-  }, [reportedUtcDay, refreshNonce]);
 
 
   // A paused live mode, or a run that stopped before writing, has to reach the
@@ -1002,6 +983,13 @@ export function AutopilotQueueStatus({
     // an event log: it includes in-progress rows and shadow runs, neither of
     // which says anything about live-write availability, and paging back
     // through it can surface failures that were resolved days ago.
+    //
+    // Deliberately does no clock arithmetic. The cap resets on the server's UTC
+    // day, and the browser is not an authority on that, so a session left open
+    // across the rollover shows the notice until the next fetch. Expiring it
+    // locally needs a server-supplied relative duration; see the follow-up
+    // issue. Showing a stale stop is the safe direction — the alternative
+    // attempts traded it for suppressing a live cap or polling in a loop.
     if (state && state.liveWrites.used >= state.liveWrites.limit) {
       return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
     }
@@ -1037,7 +1025,7 @@ export function AutopilotQueueStatus({
       cancelled = true;
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [companyId, surface, refreshNonce]);
+  }, [companyId, surface]);
 
   const loadOlder = async () => {
     if (nextCursor === null || loadingOlder) return;
