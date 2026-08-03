@@ -7,6 +7,29 @@ import { useApp } from '../../state/AppContext';
 
 type Timeframe = '30' | '90' | 'all';
 
+// localStorage here stores a view preference, never anything authoritative, so
+// every path degrades to "no saved preference" rather than taking the page
+// down. Optional chaining alone is not enough: it guards localStorage being
+// absent, but the property can also throw on access under strict privacy
+// settings, and can be a partial stub without getItem/setItem. Safari in
+// private mode additionally rejects writes, and any browser rejects them once
+// the quota is full.
+function readPreference(key: string): string | null {
+  try {
+    return globalThis.localStorage?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writePreference(key: string, value: string): void {
+  try {
+    globalThis.localStorage?.setItem(key, value);
+  } catch {
+    // A rejected write must not block the timeframe from changing on screen.
+  }
+}
+
 function rangeFor(timeframe: Timeframe): { dateFrom?: string; dateTo?: string } {
   if (timeframe === 'all') return {};
   const end = new Date();
@@ -36,9 +59,7 @@ export default function ReceiptDashboard() {
     : null;
   const [timeframe, setTimeframe] = useState<Timeframe>(() => {
     const value = activeCompanyId
-      ? globalThis.localStorage?.getItem(
-          `recat_receipt_dashboard_timeframe:${activeCompanyId}`,
-        )
+      ? readPreference(`recat_receipt_dashboard_timeframe:${activeCompanyId}`)
       : null;
     return value === '90' || value === 'all' ? value : '30';
   });
@@ -106,7 +127,7 @@ export default function ReceiptDashboard() {
           onChange={(event) => {
             const next = event.target.value as Timeframe;
             setTimeframe(next);
-            if (storageKey) globalThis.localStorage?.setItem(storageKey, next);
+            if (storageKey) writePreference(storageKey, next);
           }}
         >
           <option value="30">Last 30 days</option>
