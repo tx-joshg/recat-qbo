@@ -64,6 +64,7 @@ export default function ApiAccessCard({
 }) {
   const { toast } = useApp();
 
+  const [appUrl, setAppUrl] = useState(settings.appUrl);
   const [clientId, setClientId] = useState(settings.intuitClientId);
   const [clientSecret, setClientSecret] = useState('');
   const [whToken, setWhToken] = useState('');
@@ -77,6 +78,10 @@ export default function ApiAccessCard({
 
   const save = () => {
     const body: Parameters<typeof instanceSettings.patch>[0] = {};
+    // Env-managed values are rejected by the server; do not even offer them.
+    if (!settings.appUrlEnvManaged && appUrl.trim() !== '' && appUrl.trim() !== settings.appUrl) {
+      body.appUrl = appUrl.trim();
+    }
     if (clientId.trim() !== settings.intuitClientId && clientId.trim() !== '') {
       body.intuitClientId = clientId.trim();
     }
@@ -88,6 +93,7 @@ export default function ApiAccessCard({
       .patch(body)
       .then((updated) => {
         onSettings(updated);
+        setAppUrl(updated.appUrl);
         setClientId(updated.intuitClientId);
         setClientSecret('');
         setWhToken('');
@@ -140,6 +146,33 @@ export default function ApiAccessCard({
             style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}
           />
         </div>
+      </div>
+      <div style={{ marginTop: 14 }}>
+        <label style={fieldLabel} htmlFor="recat-public-url">
+          Public URL
+          <InfoDot tip="The address people use to reach this Recat. The redirect URI below is built from it, and QuickBooks requires https for anything other than localhost — so if you reach Recat through a TLS front such as Tailscale or a reverse proxy, set that address here and register the redirect URI it produces." />
+        </label>
+        <input
+          id="recat-public-url"
+          className="input"
+          value={appUrl}
+          disabled={settings.appUrlEnvManaged}
+          onChange={(e) => setAppUrl(e.target.value)}
+          placeholder="https://recat.example.com"
+          style={{
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '9px 12px',
+            fontSize: 13.5,
+            fontFamily: 'monospace',
+            opacity: settings.appUrlEnvManaged ? 0.6 : 1,
+          }}
+        />
+        {settings.appUrlEnvManaged && (
+          <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 6 }}>
+            Set by the APP_URL environment variable — change it there instead.
+          </div>
+        )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 14, minWidth: 0 }}>
         <span style={rowLabel}>Redirect URI</span>

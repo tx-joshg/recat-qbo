@@ -84,8 +84,8 @@ describe('issueMagicLink', () => {
     expect(mocks.sendMail).not.toHaveBeenCalled();
   });
 
-  it('builds the callback URL off APP_URL', () => {
-    expect(magicLinkUrl('tok123')).toMatch(/\/auth\/callback\?token=tok123$/);
+  it('builds the callback URL off the resolved public address', async () => {
+    await expect(magicLinkUrl('tok123')).resolves.toMatch(/\/auth\/callback\?token=tok123$/);
   });
 });
 

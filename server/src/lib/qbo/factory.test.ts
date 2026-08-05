@@ -38,7 +38,7 @@ vi.mock('../prisma.js', () => ({
 
 vi.mock('../../env.js', () => ({
   env: mocks.env,
-  redirectUri: 'https://recat.example/auth/qbo/callback',
+  appUrlEnvManaged: false,
 }));
 
 import {

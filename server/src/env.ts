@@ -33,6 +33,9 @@ export const attachmentPolicyEnvManaged = Object.freeze({
   retentionDays: process.env.ATTACHMENT_RETENTION_DAYS !== undefined,
 });
 
+/** When APP_URL is set, the stored public URL is ignored and cannot be edited. */
+export const appUrlEnvManaged = process.env.APP_URL !== undefined;
+
 const DEV_SESSION_SECRET = 'dev-only-session-secret-change-me';
 const DEV_ENCRYPTION_KEY = '0'.repeat(64);
 
@@ -159,8 +162,7 @@ if (isProd) {
 // devLink policy lives in services/devLogin.ts (async — it depends on whether
 // a real company is connected, not on env alone).
 
-/** OAuth callback registered with Intuit — the wizard shows this exact URL. */
-export const redirectUri = `${env.APP_URL}/auth/qbo/callback`;
-
-/** Webhook endpoint registered with Intuit — shown on the wizard's Sync step. */
-export const webhookUrl = `${env.APP_URL}/webhooks/qbo`;
+// The OAuth callback and webhook URLs used to be constants derived from
+// APP_URL at import. They are now resolved at call time from the configurable
+// public address — see services/publicUrl.ts — because a packaged deployment
+// cannot know at build time what address its users will reach it on.

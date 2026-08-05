@@ -40,9 +40,9 @@ vi.mock('../env.js', () => ({
     SMTP_PASS: '',
     SMTP_FROM: 'Recat <noreply@example.com>',
     ENCRYPTION_KEY: '0'.repeat(64),
+    APP_URL: 'http://localhost:5173',
   },
-  redirectUri: 'http://localhost:5173/auth/qbo/callback',
-  webhookUrl: 'http://localhost:5173/webhooks/qbo',
+  appUrlEnvManaged: false,
 }));
 
 vi.mock('../lib/prisma.js', () => ({

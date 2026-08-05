@@ -17,7 +17,8 @@ import type {
   QboRevocationSource,
   QboTokenSet,
 } from './types.js';
-import { env, redirectUri } from '../../env.js';
+import { env } from '../../env.js';
+import { redirectUriSync } from '../../services/publicUrl.js';
 import { prisma } from '../prisma.js';
 import { QboAuthError } from './types.js';
 import {
@@ -50,6 +51,10 @@ interface IntuitCreds {
 // precedence anyway) and refresh it in the background on module load and on
 // every factory call that can await.
 let cachedCreds: IntuitCreds = { clientId: env.QBO_CLIENT_ID, clientSecret: env.QBO_CLIENT_SECRET };
+// The redirect URI comes from the same settings read rather than a second one:
+// the preflight is the screen an operator copies it from, so it must be current,
+// and the extra round trip would be pure waste.
+let cachedRedirectUri = `${env.APP_URL}/auth/qbo/callback`;
 
 async function refreshCreds(): Promise<IntuitCreds> {
   try {
@@ -59,6 +64,11 @@ async function refreshCreds(): Promise<IntuitCreds> {
       clientId: env.QBO_CLIENT_ID || s.intuitClientId || '',
       clientSecret: env.QBO_CLIENT_SECRET || s.intuitClientSecret || '',
     };
+    // Assigned after the credentials, and defensively: a malformed public URL
+    // must not send this through the catch and discard a good credential read.
+    if (typeof s.appUrl === 'string' && s.appUrl !== '') {
+      cachedRedirectUri = `${s.appUrl.replace(/\/+$/, '')}/auth/qbo/callback`;
+    }
   } catch {
     // instance settings unavailable (first boot, DB down) — keep env values
   }
@@ -91,7 +101,7 @@ export async function getIntuitCredentialPreflight(): Promise<QboPreflightDto> {
     clientIdConfigured,
     clientSecretConfigured,
     environment,
-    redirectUri,
+    redirectUri: cachedRedirectUri,
     requiresOAuth: true,
   };
 }
@@ -199,7 +209,7 @@ export const qboFactory: QboClientFactory = {
     // Kick a background refresh so the *next* call sees wizard-entered creds;
     // env-configured deployments are always correct on the first call.
     void refreshCreds();
-    return intuitAuthorizeUrl({ clientId: cachedCreds.clientId, redirectUri, state });
+    return intuitAuthorizeUrl({ clientId: cachedCreds.clientId, redirectUri: redirectUriSync(), state });
   },
 
   async exchangeCode(code: string, _realmId: string, mode: QboConnectMode): Promise<QboTokenSet> {
@@ -209,7 +219,14 @@ export const qboFactory: QboClientFactory = {
       return mockTokenSet();
     }
     const creds = await refreshCreds();
-    return exchangeAuthCode({ clientId: creds.clientId, clientSecret: creds.clientSecret, redirectUri, code });
+    // Same source as authorizeUrl: OAuth requires both halves to send an
+    // identical redirect_uri.
+    return exchangeAuthCode({
+      clientId: creds.clientId,
+      clientSecret: creds.clientSecret,
+      redirectUri: redirectUriSync(),
+      code,
+    });
   },
 
   async forCompany(companyId: string): Promise<QboClient> {

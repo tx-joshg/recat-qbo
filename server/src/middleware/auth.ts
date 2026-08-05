@@ -8,6 +8,7 @@ import { env, isProd } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
+import { allowedOrigins } from '../services/publicUrl.js';
 
 export const SESSION_COOKIE = 'recat_session';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -155,8 +156,9 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /**
  * CSRF hardening: on mutating requests, an Origin header (when present) must
- * match the deployment's APP_URL origin. Requests without an Origin header
- * (curl, same-origin GET-initiated fetches in old browsers) pass through.
+ * match one of the deployment's accepted origins — the environment's APP_URL
+ * and the configured public address. Requests without an Origin header (curl,
+ * same-origin GET-initiated fetches in old browsers) pass through.
  */
 export const originCheck: RequestHandler = (req, _res, next) => {
   if (!MUTATING_METHODS.has(req.method)) {
@@ -168,21 +170,24 @@ export const originCheck: RequestHandler = (req, _res, next) => {
     next();
     return;
   }
-  let allowed: string;
   let actual: string | null;
-  try {
-    allowed = new URL(env.APP_URL).origin;
-  } catch {
-    allowed = env.APP_URL;
-  }
   try {
     actual = new URL(origin).origin;
   } catch {
     actual = null;
   }
-  if (actual !== allowed) {
-    next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
-    return;
-  }
-  next();
+  // The configured public address is one of several accepted origins, never the
+  // only one — see allowedOrigins(). A wrong value must not be able to reject
+  // the very request that would correct it.
+  allowedOrigins()
+    .then((allowed) => {
+      if (actual === null || !allowed.has(actual)) {
+        next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
+        return;
+      }
+      next();
+    })
+    .catch(() => {
+      next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
+    });
 };

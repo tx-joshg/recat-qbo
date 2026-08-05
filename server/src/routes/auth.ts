@@ -21,6 +21,7 @@ import {
   sessionTokenFromRequest,
 } from '../middleware/auth.js';
 import { consumeMagicLink, issueMagicLink } from '../services/magicLink.js';
+import { resolvePublicUrl } from '../services/publicUrl.js';
 
 export function toUserDto(user: User & { memberships: Membership[] }): UserDto {
   return {
@@ -77,12 +78,12 @@ authRouter.get(
     const token = typeof req.query.token === 'string' ? req.query.token : '';
     const user = token !== '' ? await consumeMagicLink(token) : null;
     if (!user) {
-      res.redirect(`${env.APP_URL}/?auth=invalid`);
+      res.redirect(`${await resolvePublicUrl()}/?auth=invalid`);
       return;
     }
     const session = await createSession(user.id);
     res.cookie(SESSION_COOKIE, session.token, sessionCookieOptions);
-    res.redirect(`${env.APP_URL}/`);
+    res.redirect(`${await resolvePublicUrl()}/`);
   }),
 );
 

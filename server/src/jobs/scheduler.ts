@@ -17,6 +17,7 @@ import { syncCompany, type SyncKind } from '../services/sync.js';
 import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
+import { resolvePublicUrl } from '../services/publicUrl.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -126,7 +127,7 @@ async function digestTick(now: Date): Promise<void> {
   }
   if (lines.length === 0) return;
 
-  const text = `${lines.join('\n')}\n\nCategorize them: ${env.APP_URL}`;
+  const text = `${lines.join('\n')}\n\nCategorize them: ${await resolvePublicUrl()}`;
 
   // Email every active (non-pending-invite) user. Skip silently without SMTP —
   // the console-fallback mailer would just be log noise every morning.

@@ -7,11 +7,12 @@ import { env } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import { resolvePublicUrl } from './publicUrl.js';
 
 export const MAGIC_LINK_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-export function magicLinkUrl(token: string): string {
-  return `${env.APP_URL}/auth/callback?token=${encodeURIComponent(token)}`;
+export async function magicLinkUrl(token: string): Promise<string> {
+  return `${await resolvePublicUrl()}/auth/callback?token=${encodeURIComponent(token)}`;
 }
 
 export interface IssueMagicLinkOptions {
@@ -37,7 +38,7 @@ export async function issueMagicLink(
       expiresAt: new Date(Date.now() + MAGIC_LINK_TTL_MS),
     },
   });
-  const link = magicLinkUrl(token);
+  const link = await magicLinkUrl(token);
   const subject = options.invite ? "You've been invited to Recat" : 'Sign in to Recat';
   const intro = options.invite
     ? "You've been invited to Recat. Open this link to sign in:"

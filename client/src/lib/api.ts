@@ -397,6 +397,8 @@ export interface BsReportParams {
 }
 
 export interface InstanceSettingsPatchBody {
+  /** Public address of this deployment; rejected when APP_URL is env-managed. */
+  appUrl?: string;
   intuitClientId?: string;
   intuitClientSecret?: string;
   webhookVerifierToken?: string;

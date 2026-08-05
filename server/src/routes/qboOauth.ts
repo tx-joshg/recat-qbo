@@ -29,6 +29,7 @@ import {
 import { MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR, resolveMockRealmId } from '../lib/qbo/mock.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { installDemoFinancials } from '../services/demoFinancials.js';
+import { resolvePublicUrl } from '../services/publicUrl.js';
 
 // ---------------------------------------------------------------------------
 // OAuth state (CSRF) tokens — each carries the connect flow's choices.
@@ -113,7 +114,7 @@ qboOauthRouter.get(
 
     const choice = state !== '' ? consumeOauthState(state) : null;
     if (!choice) {
-      res.redirect(qboFailureRedirect(env.APP_URL, 'STATE_EXPIRED'));
+      res.redirect(qboFailureRedirect(await resolvePublicUrl(), 'STATE_EXPIRED'));
       return;
     }
     if (intuitError !== '') {
@@ -124,7 +125,7 @@ qboOauthRouter.get(
           error_description: intuitErrorDescription,
         }),
       );
-      res.redirect(qboFailureRedirect(env.APP_URL, publicCode));
+      res.redirect(qboFailureRedirect(await resolvePublicUrl(), publicCode));
       return;
     }
 
@@ -158,10 +159,10 @@ qboOauthRouter.get(
         environment: companyEnv,
         mode: choice.mode,
         tokens: exchangedTokens,
-      }).catch((err: unknown) => {
+      }).catch(async (err: unknown) => {
         console.error('[qbo-oauth] CompanyInfo validation failed:', err);
         res.redirect(
-          qboFailureRedirect(env.APP_URL, classifyQboFailure(err, 'company_info')),
+          qboFailureRedirect(await resolvePublicUrl(), classifyQboFailure(err, 'company_info')),
         );
         return null;
       });
@@ -232,10 +233,10 @@ qboOauthRouter.get(
         });
       }
 
-      res.redirect(`${env.APP_URL}/setup?connected=${company.id}`);
+      res.redirect(`${await resolvePublicUrl()}/setup?connected=${company.id}`);
     } catch (err) {
       console.error('[qbo-oauth] connect failed:', err);
-      res.redirect(qboFailureRedirect(env.APP_URL, classifyQboFailure(err, 'oauth')));
+      res.redirect(qboFailureRedirect(await resolvePublicUrl(), classifyQboFailure(err, 'oauth')));
     }
   }),
 );
