@@ -58,23 +58,25 @@ Worth considering upstream: let the first-run wizard adopt `LOCAL_ADMIN_EMAIL`
 as the default administrator address, which would remove the coordination
 entirely.
 
-### APP_URL and the QuickBooks redirect
+### Connecting real QuickBooks needs an HTTPS address
 
-`APP_URL` is hardcoded to `http://umbrel.local:3009`. Umbrel does not expose the
-device address as a compose variable — neither Immich nor Vaultwarden reference
-one — so it cannot be derived.
+**Confirmed against a real Intuit registration: Intuit will not accept a
+non-HTTPS redirect URI for a production app.** `http://umbrel.local:3009` is
+neither HTTPS nor public, so an Umbrel user cannot register it.
 
-It is the base for the QuickBooks OAuth redirect URI, so anyone reaching their
-Umbrel by another name (a custom domain, a Tailscale address) must change it to
-match what they register in the Intuit developer portal.
+The public URL is therefore configurable at runtime (#38). An operator who
+fronts their Umbrel with TLS — Tailscale Serve and Cloudflare Tunnel both issue
+real certificates — sets that address in the first-run wizard's credentials step
+or later under Settings → QuickBooks API access, and registers the redirect URI
+it produces.
 
-**Unverified and worth settling before submission:** Intuit requires HTTPS
-redirect URIs for production apps, and `http://umbrel.local:3009` is neither
-HTTPS nor a public hostname. If Intuit rejects it, Umbrel users can run the
-built-in demo QuickBooks but may not be able to connect real books without
-fronting the app with TLS. Confirm against a real Intuit app registration before
-listing, because it decides whether the package delivers the product or only a
-demo of it.
+`APP_URL` in the compose file is the **starting value and the seed for origin
+checking**, not a lock. Once an address is saved it wins. `APP_URL_LOCKED=true`
+pins it for deployments that want the environment authoritative.
+
+Without a TLS front, the built-in demo QuickBooks works fully; real books do not.
+That is worth stating plainly in the store description rather than letting users
+discover it at the Intuit step.
 
 ## Notes on specific choices
 
@@ -133,8 +135,13 @@ point rather than only after step 2.
 
 ### Still unverified
 
-`GET /api/setup/status` reports the redirect URI the app will use:
-`http://umbrel.local:3009/auth/qbo/callback`. Whether Intuit accepts a
-non-HTTPS, non-public redirect URI for a production app is still open, and it
-decides whether Umbrel users can connect real books or only run the demo.
-Answerable in minutes against a real Intuit app registration.
+No container has been started **since** the public URL became configurable. The
+package itself was boot-verified before that change, and the setting was
+verified end to end against a running server, but not the two together. Boot it
+on a real Umbrel before submitting.
+
+Two known limitations are tracked and affect anyone using a TLS front:
+[#39](https://github.com/tx-joshg/recat-qbo/issues/39), the OAuth callback can
+land on an origin without the session cookie, and
+[#40](https://github.com/tx-joshg/recat-qbo/issues/40), the MCP host guard still
+binds to the environment address.

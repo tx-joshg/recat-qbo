@@ -8,11 +8,17 @@ services:
     image: ghcr.io/tx-joshg/recat-qbo:sha-63f04f5@sha256:b431315cffa2c88fe63281e49ea097378c92ca66db16e4c470779342596b5bab
     restart: on-failure
     environment:
-      # Umbrel does not inject the device address, so this is the default
-      # umbrel.local URL. It is the base for the QuickBooks OAuth redirect, so
-      # anyone reaching their Umbrel by another name — a custom domain, a
-      # Tailscale address — must change this to match what they register in the
-      # Intuit developer portal. See README-umbrel.md.
+      # The install's starting address, and the seed for origin checking — not
+      # a lock. An admin changes the public URL from the setup wizard or
+      # Settings, and the stored value then wins; see instanceSettings.appUrl.
+      #
+      # Do not remove this line. Without it the app falls back to its own
+      # localhost default, which is not an origin any Umbrel browser sends, so
+      # the CSRF check rejects the setup wizard itself and the install cannot
+      # be completed. Verified: POST /api/setup/admin returns 403.
+      #
+      # Set APP_URL_LOCKED=true instead if this deployment should pin the
+      # address and refuse edits from the UI.
       APP_URL: http://umbrel.local:3009
       PORT: 3001
       DATABASE_URL: postgresql://recat:${APP_RECAT_DB_PASSWORD}@recat_db_1:5432/recat
