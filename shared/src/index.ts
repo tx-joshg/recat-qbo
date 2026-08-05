@@ -953,6 +953,8 @@ export interface InstanceSettingsDto {
   intuitClientId: string; // masked when read
   intuitClientSecretSet: boolean;
   redirectUri: string;
+  /** Webhook endpoint derived from appUrl, not from the browser's location. */
+  webhookUrl: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
   suggestionProvider: SuggestionProvider;

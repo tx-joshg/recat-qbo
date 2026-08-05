@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   appUrl: 'http://umbrel.local:3009',
   stored: 'http://umbrel.local:3009',
+  previous: '',
   throws: false,
 }));
 
@@ -18,7 +19,7 @@ vi.mock('../env.js', () => ({
 vi.mock('./instanceSettings.js', () => ({
   getInstanceSettings: async () => {
     if (mocks.throws) throw new Error('database unavailable');
-    return { appUrl: mocks.stored };
+    return { appUrl: mocks.stored, previousAppUrl: mocks.previous };
   },
 }));
 
@@ -32,6 +33,7 @@ import {
 beforeEach(() => {
   mocks.appUrl = 'http://umbrel.local:3009';
   mocks.stored = 'http://umbrel.local:3009';
+  mocks.previous = '';
   mocks.throws = false;
   invalidatePublicUrl();
 });
@@ -83,6 +85,23 @@ describe('allowedOrigins', () => {
     mocks.stored = 'https://typo.example';
     const allowed = await allowedOrigins();
     expect(allowed.has('http://umbrel.local:3009')).toBe(true);
+  });
+
+  it('keeps the address in use before the last change', async () => {
+    // The typo case the environment origin alone does not cover: an operator on
+    // a packaged install may only ever reach the instance through the address
+    // they configured, so dropping it on save would strand them.
+    mocks.previous = 'https://working.example.ts.net';
+    mocks.stored = 'https://typo.example';
+    const allowed = await allowedOrigins();
+    expect(allowed.has('https://working.example.ts.net')).toBe(true);
+    expect(allowed.has('https://typo.example')).toBe(true);
+  });
+
+  it('ignores an empty previous address', async () => {
+    mocks.previous = '';
+    const allowed = await allowedOrigins();
+    expect(allowed.has('')).toBe(false);
   });
 
   it('keeps the environment origin even when settings cannot be read', async () => {

@@ -137,8 +137,15 @@ instanceRouter.patch(
       );
     }
     const aiApiKey = body.aiApiKey ?? body.aiKey;
+    // Remember the address being replaced. originCheck keeps accepting it, so
+    // an operator who saves a typo while browsing on the old address can still
+    // send the request that corrects it.
+    const previousAppUrl = body.appUrl === undefined
+      ? undefined
+      : (await getInstanceSettings()).appUrl;
     await updateInstanceSettings({
       ...(body.appUrl !== undefined ? { appUrl: body.appUrl.replace(/\/+$/, '') } : {}),
+      ...(previousAppUrl !== undefined ? { previousAppUrl } : {}),
       ...(body.intuitClientId !== undefined ? { intuitClientId: body.intuitClientId } : {}),
       ...(body.intuitClientSecret !== undefined ? { intuitClientSecret: body.intuitClientSecret } : {}),
       ...(body.webhookVerifierToken !== undefined ? { webhookVerifierToken: body.webhookVerifierToken } : {}),
@@ -267,6 +274,11 @@ const credentialsBody = z.object({
   clientId: z.string().trim().min(1),
   clientSecret: z.string().trim().min(1),
   env: z.enum(['sandbox', 'production']),
+  // Optional, and accepted here rather than only in Settings: this is the step
+  // where an admin copies the callback to register with Intuit, and Settings is
+  // not reachable until a company exists. Without it, a first-run install behind
+  // a TLS front would register a redirect URI that can never work.
+  appUrl: appUrlValue.optional(),
 });
 
 export const setupRouter = Router();
@@ -322,10 +334,23 @@ setupRouter.post(
   requireInstanceAdmin,
   asyncHandler(async (req, res) => {
     const body = validate(credentialsBody)(req.body);
+    if (body.appUrl !== undefined && appUrlEnvManaged) {
+      throw new HttpError(
+        409,
+        'The public URL is managed by the APP_URL environment variable.',
+        'APP_URL_ENV_MANAGED',
+      );
+    }
+    const previousAppUrl = body.appUrl === undefined
+      ? undefined
+      : (await getInstanceSettings()).appUrl;
     await updateInstanceSettings({
       intuitClientId: body.clientId,
       intuitClientSecret: body.clientSecret,
+      ...(body.appUrl !== undefined ? { appUrl: body.appUrl.replace(/\/+$/, '') } : {}),
+      ...(previousAppUrl !== undefined ? { previousAppUrl } : {}),
     });
+    invalidatePublicUrl();
     await prisma.appConfig.upsert({
       where: { key: 'qboEnvDefault' },
       update: { value: body.env, encrypted: false },

@@ -523,7 +523,7 @@ export type QboRevocationCapability = () => Promise<void>;
 export interface QboClientFactory {
   /** Consent URL for the connect flow (state = CSRF token). mode 'demo' →
    * the built-in fake consent page; 'real' → the Intuit authorize URL. */
-  authorizeUrl(state: string, mode: QboConnectMode): string;
+  authorizeUrl(state: string, mode: QboConnectMode): Promise<string>;
   /** Exchange an auth code for tokens (mode must match authorizeUrl's). */
   exchangeCode(code: string, realmId: string, mode: QboConnectMode): Promise<QboTokenSet>;
   /** Client for a connected company; dispatches mock vs real on the

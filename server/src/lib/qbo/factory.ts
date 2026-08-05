@@ -18,7 +18,6 @@ import type {
   QboTokenSet,
 } from './types.js';
 import { env } from '../../env.js';
-import { redirectUriSync } from '../../services/publicUrl.js';
 import { prisma } from '../prisma.js';
 import { QboAuthError } from './types.js';
 import {
@@ -204,12 +203,13 @@ export async function inspectAuthorizedConnection(args: {
 // ---------------------------------------------------------------------------
 
 export const qboFactory: QboClientFactory = {
-  authorizeUrl(state: string, mode: QboConnectMode): string {
+  async authorizeUrl(state: string, mode: QboConnectMode): Promise<string> {
     if (mode === 'demo') return mockAuthorizeUrl(state);
-    // Kick a background refresh so the *next* call sees wizard-entered creds;
-    // env-configured deployments are always correct on the first call.
-    void refreshCreds();
-    return intuitAuthorizeUrl({ clientId: cachedCreds.clientId, redirectUri: redirectUriSync(), state });
+    // Await rather than serving a cached value: the redirect_uri sent here must
+    // match the one sent at exchange, and a stale read would send Intuit the
+    // default URL on the first connect after a restart or a settings change.
+    const creds = await refreshCreds();
+    return intuitAuthorizeUrl({ clientId: creds.clientId, redirectUri: cachedRedirectUri, state });
   },
 
   async exchangeCode(code: string, _realmId: string, mode: QboConnectMode): Promise<QboTokenSet> {
@@ -224,7 +224,7 @@ export const qboFactory: QboClientFactory = {
     return exchangeAuthCode({
       clientId: creds.clientId,
       clientSecret: creds.clientSecret,
-      redirectUri: redirectUriSync(),
+      redirectUri: cachedRedirectUri,
       code,
     });
   },

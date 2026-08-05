@@ -10,6 +10,7 @@ import { runSerializableTransaction } from '../lib/serializableTransaction.js';
 
 const SETTING_KEYS = [
   'appUrl',
+  'previousAppUrl',
   'intuitClientId',
   'intuitClientSecret',
   'webhookVerifierToken',
@@ -66,6 +67,8 @@ export interface InstanceSettingsDb {
 export interface InstanceSettings {
   /** Public address users reach this deployment at; base for OAuth and links. */
   appUrl: string;
+  /** The address before the last change, still accepted for origin checks. */
+  previousAppUrl: string;
   intuitClientId: string;
   intuitClientSecret: string;
   webhookVerifierToken: string;
@@ -90,6 +93,7 @@ export interface InstanceSettings {
 
 export interface InstanceSettingsPatch {
   appUrl?: string;
+  previousAppUrl?: string;
   intuitClientId?: string;
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
@@ -156,7 +160,10 @@ export async function getInstanceSettings(
   return {
     // env vars take precedence over DB values
     // APP_URL unset → the stored value wins, falling back to env's own default.
-    appUrl: appUrlEnvManaged ? env.APP_URL : (stored.appUrl || env.APP_URL),
+    // Normalized here so the displayed redirect URI and the one sent to
+    // Intuit cannot differ by a trailing slash.
+    appUrl: (appUrlEnvManaged ? env.APP_URL : (stored.appUrl || env.APP_URL)).replace(/\/+$/, ''),
+    previousAppUrl: (stored.previousAppUrl ?? '').replace(/\/+$/, ''),
     intuitClientId: env.QBO_CLIENT_ID !== '' ? env.QBO_CLIENT_ID : (stored.intuitClientId ?? ''),
     intuitClientSecret: env.QBO_CLIENT_SECRET !== '' ? env.QBO_CLIENT_SECRET : (stored.intuitClientSecret ?? ''),
     webhookVerifierToken:
@@ -210,6 +217,7 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
     intuitClientId: maskClientId(settings.intuitClientId),
     intuitClientSecretSet: settings.intuitClientSecret !== '',
     redirectUri: `${settings.appUrl}/auth/qbo/callback`,
+    webhookUrl: `${settings.appUrl}/webhooks/qbo`,
     webhookVerifierTokenSet: settings.webhookVerifierToken !== '',
     suggestionSource: settings.suggestionSource,
     suggestionProvider: settings.suggestionProvider,

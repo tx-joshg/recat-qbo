@@ -102,7 +102,10 @@ export default function ApiAccessCard({
       .catch((err) => toast(errMsg(err)));
   };
 
-  const webhookEndpoint = `${window.location.origin}/webhooks/qbo`;
+  // From the server, not window.location: an admin configuring a Tailscale or
+  // reverse-proxy address while browsing on the local one would otherwise
+  // register the wrong endpoint with QuickBooks.
+  const webhookEndpoint = settings.webhookUrl;
 
   return (
     <div

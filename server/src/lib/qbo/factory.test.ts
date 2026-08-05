@@ -143,11 +143,11 @@ describe('qboFactory.forCompany dispatch', () => {
 });
 
 describe('qboFactory connect helpers honor the per-request mode', () => {
-  it('authorizeUrl(demo) is the fake consent page; authorizeUrl(real) is Intuit', () => {
-    const demoUrl = qboFactory.authorizeUrl('state123', 'demo');
+  it('authorizeUrl(demo) is the fake consent page; authorizeUrl(real) is Intuit', async () => {
+    const demoUrl = await qboFactory.authorizeUrl('state123', 'demo');
     expect(demoUrl).toBe('/auth/qbo/mock-consent?state=state123');
 
-    const realUrl = qboFactory.authorizeUrl('state123', 'real');
+    const realUrl = await qboFactory.authorizeUrl('state123', 'real');
     expect(realUrl).toContain('appcenter.intuit.com');
     expect(realUrl).toContain('state=state123');
   });

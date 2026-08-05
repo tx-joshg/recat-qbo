@@ -136,7 +136,7 @@ const connectHandler = asyncHandler(async (req, res) => {
   };
   const parsed = parseConnectRequest(input, await hasIntuitCredentials());
   const state = createOauthState({ mode: parsed.mode, env: parsed.env });
-  res.json({ url: qboFactory.authorizeUrl(state, parsed.mode) });
+  res.json({ url: await qboFactory.authorizeUrl(state, parsed.mode) });
 });
 companiesRouter.get('/connect-url', requireInstanceAdmin, connectHandler);
 companiesRouter.post('/connect', requireInstanceAdmin, connectHandler);
