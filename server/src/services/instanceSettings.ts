@@ -162,7 +162,7 @@ export async function getInstanceSettings(
     // APP_URL unset → the stored value wins, falling back to env's own default.
     // Normalized here so the displayed redirect URI and the one sent to
     // Intuit cannot differ by a trailing slash.
-    appUrl: (appUrlEnvManaged ? env.APP_URL : (stored.appUrl || env.APP_URL)).replace(/\/+$/, ''),
+    appUrl: (appUrlEnvManaged ? env.APP_URL : (stored.appUrl || env.APP_URL)).replace(/\/+$/, ''),  // stored wins unless APP_URL_LOCKED
     previousAppUrl: (stored.previousAppUrl ?? '').replace(/\/+$/, ''),
     intuitClientId: env.QBO_CLIENT_ID !== '' ? env.QBO_CLIENT_ID : (stored.intuitClientId ?? ''),
     intuitClientSecret: env.QBO_CLIENT_SECRET !== '' ? env.QBO_CLIENT_SECRET : (stored.intuitClientSecret ?? ''),

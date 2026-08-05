@@ -33,8 +33,18 @@ export const attachmentPolicyEnvManaged = Object.freeze({
   retentionDays: process.env.ATTACHMENT_RETENTION_DAYS !== undefined,
 });
 
-/** When APP_URL is set, the stored public URL is ignored and cannot be edited. */
-export const appUrlEnvManaged = process.env.APP_URL !== undefined;
+/**
+ * Whether the public URL is pinned to the environment and cannot be edited.
+ *
+ * Deliberately NOT "APP_URL is set". The shipped compose files both supply an
+ * APP_URL — a default for the deployment shape, not an operator decision — so
+ * keying on its presence would make the field read-only for every Docker and
+ * Umbrel install, which are precisely the ones that need to change it. APP_URL
+ * is the fallback; a stored value wins. Set APP_URL_LOCKED=true for
+ * infrastructure-as-code deployments that want the environment to be
+ * authoritative.
+ */
+export const appUrlEnvManaged = process.env.APP_URL_LOCKED === 'true';
 
 const DEV_SESSION_SECRET = 'dev-only-session-secret-change-me';
 const DEV_ENCRYPTION_KEY = '0'.repeat(64);
@@ -52,6 +62,7 @@ function byteLimit(defaultValue: bigint, minimum: bigint, maximum: bigint) {
 
 const schema = z.object({
   APP_URL: z.string().url().default('http://localhost:5173'),
+  APP_URL_LOCKED: z.enum(['true', 'false']).optional(),
   PORT: z.coerce.number().default(3001),
   SESSION_SECRET: z.string().min(16).default(DEV_SESSION_SECRET),
   // 32-byte key as 64 hex chars; dev fallback is deterministic so local restarts keep working.
