@@ -8,7 +8,26 @@ type McpGuardMiddleware = RequestHandler | ErrorRequestHandler;
 interface McpHttpGuardOptions {
   appUrl: string;
   additionalHosts?: readonly string[];
+  /**
+   * Extra origins admitted per request, on top of appUrl — the configured
+   * public URL, which an operator can change after boot.
+   *
+   * Resolved rather than fixed because appUrl is only the deployment's starting
+   * address now. It *adds* to the allowed set and never replaces it: keeping
+   * the boot-time origin means a misconfiguration degrades to "MCP does not
+   * work on my new host yet" instead of severing a client that works today.
+   * Failures here are swallowed for the same reason. See #40.
+   */
+  resolveExtraOrigins?: () => Promise<readonly string[]>;
   maxBodyBytes: number;
+}
+
+function hostOf(origin: string): string | null {
+  try {
+    return new URL(origin).host;
+  } catch {
+    return null;
+  }
 }
 
 function deploymentUrl(appUrl: string): URL | null {
@@ -115,24 +134,42 @@ export function createMcpHttpGuards(
     throw new Error('appUrl must be an absolute URL');
   }
 
-  const hostGuard: RequestHandler = (req, res, next) => {
-    if (!isAllowedMcpHost(
-      req.headers.host,
-      options.appUrl,
-      options.additionalHosts,
-    )) {
-      sendError(421, 'invalid_host')(req, res, next);
-      return;
+  async function extraOrigins(): Promise<readonly string[]> {
+    if (options.resolveExtraOrigins === undefined) return [];
+    try {
+      return await options.resolveExtraOrigins();
+    } catch {
+      // Never let an unresolvable extra origin reject a request that the
+      // boot-time appUrl already admits.
+      return [];
     }
-    next();
+  }
+
+  const hostGuard: RequestHandler = (req, res, next) => {
+    void extraOrigins().then((extra) => {
+      const hosts = [
+        ...(options.additionalHosts ?? []),
+        ...extra.map(hostOf).filter((host): host is string => host !== null),
+      ];
+      if (!isAllowedMcpHost(req.headers.host, options.appUrl, hosts)) {
+        sendError(421, 'invalid_host')(req, res, next);
+        return;
+      }
+      next();
+    });
   };
   const originGuard: RequestHandler = (req, res, next) => {
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
-    if (!isAllowedMcpOrigin(origin, options.appUrl)) {
-      sendError(403, 'invalid_origin')(req, res, next);
-      return;
-    }
-    next();
+    void extraOrigins().then((extra) => {
+      if (
+        !isAllowedMcpOrigin(origin, options.appUrl) &&
+        !extra.some((allowed) => isAllowedMcpOrigin(origin, allowed))
+      ) {
+        sendError(403, 'invalid_origin')(req, res, next);
+        return;
+      }
+      next();
+    });
   };
   const entityGuard: RequestHandler = (req, res, next) => {
     if (req.method.toUpperCase() !== 'POST') {

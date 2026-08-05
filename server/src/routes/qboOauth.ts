@@ -101,10 +101,19 @@ function queryString(value: unknown): string {
 
 export const qboOauthRouter = Router();
 
+// Authorized by the state token rather than the session, which is where OAuth
+// puts the binding. The token is minted only by /api/companies/connect-url,
+// itself behind requireInstanceAdmin, so an unexpired one proves an instance
+// admin started this flow within the last ten minutes; it is single-use and 16
+// random bytes, and an absent or stale one fails closed below before anything
+// is read. Neither this route nor mock-consent ever reads req.user.
+//
+// A session gate here is also actively wrong now the public URL is
+// configurable: the cookie is host-only, so a callback landing on a TLS-fronted
+// address arrives without it and would be rejected before the state is ever
+// consumed. See #39.
 qboOauthRouter.get(
   '/auth/qbo/callback',
-  requireUser,
-  requireInstanceAdmin,
   asyncHandler(async (req, res) => {
     const code = queryString(req.query.code);
     const state = queryString(req.query.state);
@@ -245,10 +254,10 @@ qboOauthRouter.get(
 // nothing real — it is clearly labelled as the Recat demo. Always mounted
 // (demo is every deployment's evaluation path); reaching the callback still
 // requires the single-use state token minted by a mode=demo connect flow.
+// Same authorization model as the real callback above: the single-use state
+// token, not the session.
 qboOauthRouter.get(
   '/auth/qbo/mock-consent',
-  requireUser,
-  requireInstanceAdmin,
   asyncHandler(async (req, res) => {
     const state = queryString(req.query.state);
     const link = (code: string, realmId: string): string =>

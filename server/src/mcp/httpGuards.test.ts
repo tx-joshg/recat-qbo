@@ -9,6 +9,46 @@ import {
 } from './httpGuards.js';
 
 describe('MCP HTTP guards', () => {
+  it('admits the configured public origin without dropping the boot-time one', async () => {
+    // #40: appUrl is only the deployment's starting address now. /mcp must
+    // follow the address an operator configures, while the original keeps
+    // working so a misconfiguration cannot sever a client that works today.
+    const app = express();
+    app.use(
+      '/mcp',
+      ...createMcpHttpGuards({
+        appUrl: 'https://recat.example',
+        resolveExtraOrigins: async () => ['https://recat.tail1234.ts.net'],
+        maxBodyBytes: 64,
+      }),
+    );
+    app.use(express.json({ limit: '1kb' }));
+    app.post('/mcp', (_req, res) => res.status(204).end());
+
+    await request(app).post('/mcp').set('Host', 'recat.tail1234.ts.net')
+      .set('Origin', 'https://recat.tail1234.ts.net').send({}).expect(204);
+    await request(app).post('/mcp').set('Host', 'recat.example').send({}).expect(204);
+    await request(app).post('/mcp').set('Host', 'evil.example').send({}).expect(421);
+    await request(app).post('/mcp').set('Host', 'recat.example')
+      .set('Origin', 'https://evil.example').send({}).expect(403);
+  });
+
+  it('keeps serving the boot-time origin when the resolver fails', async () => {
+    const app = express();
+    app.use(
+      '/mcp',
+      ...createMcpHttpGuards({
+        appUrl: 'https://recat.example',
+        resolveExtraOrigins: async () => { throw new Error('settings unavailable'); },
+        maxBodyBytes: 64,
+      }),
+    );
+    app.use(express.json({ limit: '1kb' }));
+    app.post('/mcp', (_req, res) => res.status(204).end());
+
+    await request(app).post('/mcp').set('Host', 'recat.example').send({}).expect(204);
+  });
+
   it('allows only the configured deployment hostname and rejects DNS-rebinding hosts', () => {
     expect(isAllowedMcpHost('recat.example:443', 'https://recat.example')).toBe(true);
     expect(isAllowedMcpHost('recat.example', 'https://recat.example')).toBe(true);

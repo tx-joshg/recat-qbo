@@ -50,6 +50,7 @@ import {
 } from './mcp/rateLimit.js';
 import { createRecatMcpRequestHandler } from './mcp/server.js';
 import { MCP_SCHEMA_BOUNDS } from './mcp/schemaBounds.js';
+import { allowedOrigins } from './services/publicUrl.js';
 
 const app = express();
 app.set('trust proxy', compileTrustedProxy(env.TRUSTED_PROXY_IPS));
@@ -71,6 +72,9 @@ app.use(
   '/mcp',
   ...createMcpHttpGuards({
     appUrl: env.APP_URL,
+    // The configured public URL, added to the boot-time one rather than
+    // replacing it, so /mcp follows the address the rest of the app serves.
+    resolveExtraOrigins: async () => [...(await allowedOrigins())],
     additionalHosts: isProd
       ? []
       : [`${new URL(env.APP_URL).hostname}:${env.PORT}`],

@@ -142,6 +142,48 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe('QuickBooks OAuth callback authorization', () => {
+  // Every other test in this file sends x-test-user, which the mocked
+  // requireUser demands. These deliberately do not: without a session the
+  // callback must still be reachable, because the cookie is host-only and a
+  // TLS-fronted deployment receives the redirect on a different origin. The
+  // single-use state token carries the authorization instead — it is minted
+  // only behind requireInstanceAdmin. See #39.
+  async function callbackWithoutSession(path: string): Promise<Response> {
+    const server = testApp().listen(0, '127.0.0.1');
+    servers.push(server);
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Test server did not bind');
+    return fetch(`http://127.0.0.1:${address.port}${path}`, { redirect: 'manual' });
+  }
+
+  it('accepts a valid state with no session rather than 401', async () => {
+    const state = createOauthState({ mode: 'real', env: 'production' });
+    const response = await callbackWithoutSession(
+      `/auth/qbo/callback?state=${state}&error=access_denied`,
+    );
+
+    // Reaches the flow and redirects on the Intuit error. A 401 here would mean
+    // the session gate is back and TLS-fronted callbacks are broken again.
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toBe(
+      'https://recat.example/setup?qbo_error=ACCESS_DENIED',
+    );
+  });
+
+  it('still refuses an unknown state with no session', async () => {
+    const response = await callbackWithoutSession(
+      '/auth/qbo/callback?state=never-issued&code=x&realmId=y',
+    );
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toBe(
+      'https://recat.example/setup?qbo_error=STATE_EXPIRED',
+    );
+  });
+});
+
 describe('QuickBooks OAuth callback failure redirects', () => {
   it('consumes state before mapping access_denied to a sanitized redirect', async () => {
     const state = createOauthState({ mode: 'real', env: 'production' });
