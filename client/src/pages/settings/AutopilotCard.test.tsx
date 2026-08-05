@@ -121,6 +121,7 @@ const overview: AutopilotOverviewDto = {
     utcDay: '2026-08-02',
     used: 0,
     limit: 100,
+    resetsInMs: 6 * 60 * 60 * 1000,
   },
   queue: {
     queued: 3,
@@ -901,6 +902,90 @@ describe('AutopilotQueueStatus', () => {
       render(<AutopilotQueueStatus companyId="company-1" />);
       const [notice] = await screen.findAllByText('Daily live-write limit reached');
       expect(notice).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the cap notice by refetching when the server says it resets', async () => {
+    // #32. resetsInMs is relative and server-derived, so nothing here compares
+    // the browser clock to PostgreSQL's — the comparison that broke both
+    // earlier attempts.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25, resetsInMs: 60_000 },
+    });
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 0, limit: 25, resetsInMs: 86_400_000 },
+    });
+
+    try {
+      render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
+      const [before] = await screen.findAllByText('Daily live-write limit reached');
+      expect(before).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(70_000);
+      });
+
+      await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+      await waitFor(() => {
+        for (const node of screen.queryAllByText('Daily live-write limit reached')) {
+          expect(node).not.toBeVisible();
+        }
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('floors the refresh delay so a bad resetsInMs cannot poll in a loop', async () => {
+    // A zero or negative value would otherwise re-arm immediately and hammer
+    // three endpoints continuously.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mocks.get.mockResolvedValue({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25, resetsInMs: 0 },
+    });
+
+    try {
+      render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
+      await screen.findByText(/queued/);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(25_000);
+      });
+
+      // Still inside the 30s floor — exactly one fetch, not a storm.
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the card rendered when a scheduled refresh fails', async () => {
+    // The loading effect used to clear state before fetching; on a transient
+    // failure the catch restored nothing and the whole panel vanished.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mocks.get.mockResolvedValueOnce({
+      ...overview,
+      liveWrites: { ...overview.liveWrites, used: 25, limit: 25, resetsInMs: 60_000 },
+    });
+    mocks.get.mockRejectedValueOnce(new Error('transient'));
+
+    try {
+      render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
+      await screen.findByText(/queued/);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(70_000);
+      });
+
+      await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+      // The previous snapshot survives rather than the panel disappearing.
+      expect(screen.getByText(/queued/)).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }

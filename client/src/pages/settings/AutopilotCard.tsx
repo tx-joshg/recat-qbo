@@ -968,6 +968,7 @@ export function AutopilotQueueStatus({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [expanded, setExpanded] = useState(surface === 'audit');
+  const [capNonce, setCapNonce] = useState(0);
   const detailsId = useId();
   const generationRef = useRef(0);
 
@@ -984,27 +985,44 @@ export function AutopilotQueueStatus({
     // which says anything about live-write availability, and paging back
     // through it can surface failures that were resolved days ago.
     //
-    // Deliberately does no clock arithmetic. The cap resets on the server's UTC
-    // day, and the browser is not an authority on that, so a session left open
-    // across the rollover shows the notice until the next fetch. Expiring it
-    // locally needs a server-supplied relative duration; see the follow-up
-    // issue. Showing a stale stop is the safe direction — the alternative
-    // attempts traded it for suppressing a live cap or polling in a loop.
+    // Still no clock arithmetic here. The notice reflects the snapshot; a
+    // separate timer refreshes that snapshot when the server says the cap
+    // resets, so this never has to reason about whose clock is right.
     if (state && state.liveWrites.used >= state.liveWrites.limit) {
       return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
     }
     return null;
   })();
 
+  // Refresh when the server says the cap resets. resetsInMs is relative and
+  // server-derived, so this never compares the browser clock to PostgreSQL's —
+  // the comparison that broke both earlier attempts. The floor matters: without
+  // it a zero or negative value re-arms immediately and turns this into a
+  // polling loop against three endpoints.
+  const resetsInMs = state?.liveWrites.resetsInMs ?? null;
+  useEffect(() => {
+    if (resetsInMs === null) return;
+    const timer = setTimeout(
+      () => setCapNonce((current) => current + 1),
+      Math.max(30_000, Math.min(resetsInMs + 1_000, 86_400_000)),
+    );
+    return () => clearTimeout(timer);
+  }, [resetsInMs, capNonce]);
+
   useEffect(() => {
     const generation = ++generationRef.current;
     let cancelled = false;
-    setState(null);
-    setReadiness(null);
-    setRuns([]);
-    setNextCursor(null);
-    setLoadingOlder(false);
-    setExpanded(surface === 'audit');
+    // A scheduled refresh must not blank the card: clearing state here and
+    // failing in the catch below would drop the whole panel, paused-live
+    // warning included, until the component remounted.
+    if (capNonce === 0) setState(null);
+    if (capNonce === 0) {
+      setReadiness(null);
+      setRuns([]);
+      setNextCursor(null);
+      setLoadingOlder(false);
+      setExpanded(surface === 'audit');
+    }
     Promise.all([
       autopilot.get(companyId),
       autopilot.listRuns(companyId, { limit: 5 })
@@ -1025,7 +1043,7 @@ export function AutopilotQueueStatus({
       cancelled = true;
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [companyId, surface]);
+  }, [companyId, surface, capNonce]);
 
   const loadOlder = async () => {
     if (nextCursor === null || loadingOlder) return;

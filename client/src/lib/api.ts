@@ -296,6 +296,9 @@ export interface AutopilotOverviewDto {
     utcDay: string;
     used: number;
     limit: number;
+    /** Server-derived milliseconds until the cap resets. Relative on purpose:
+     *  the browser is not an authority on PostgreSQL's UTC day. */
+    resetsInMs: number;
   };
   queue: AutopilotQueueHealthDto;
   evidence: AutopilotEvidenceDto;

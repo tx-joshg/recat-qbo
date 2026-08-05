@@ -675,9 +675,27 @@ interface LiveWriteUsageDb {
 }
 
 async function liveWriteUsage(companyId: string, limit: number, db: LiveWriteUsageDb) {
-  const rows = await db.$queryRawUnsafe<{ utcDay: string; used: bigint }[]>(
+  // resetsInMs is computed here, in the same statement and off the same
+  // database clock as the day itself. It is deliberately *relative*: the cap
+  // resets on PostgreSQL's UTC day, and a browser is not an authority on that.
+  // Any scheme comparing the two absolute clocks fails under skew — suppressing
+  // a live cap for a whole day one way, refreshing late by the full offset the
+  // other. Elapsed time measured locally is reliable; agreement on wall-clock
+  // is not. See #32.
+  const rows = await db.$queryRawUnsafe<{
+    utcDay: string;
+    used: bigint;
+    resetsInMs: bigint;
+  }[]>(
     `SELECT to_char((clock_timestamp() AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS "utcDay",
-            COUNT(permit.*)::bigint AS "used"
+            COUNT(permit.*)::bigint AS "used",
+            GREATEST(
+              0,
+              CEIL(EXTRACT(EPOCH FROM (
+                ((clock_timestamp() AT TIME ZONE 'UTC')::date + INTERVAL '1 day')
+                  - (clock_timestamp() AT TIME ZONE 'UTC')
+              )) * 1000)
+            )::bigint AS "resetsInMs"
        FROM "LiveWritePermit" permit
       WHERE permit."companyId" = $1
         AND permit."utcDay" = (clock_timestamp() AT TIME ZONE 'UTC')::date`,
@@ -687,6 +705,9 @@ async function liveWriteUsage(companyId: string, limit: number, db: LiveWriteUsa
     utcDay: rows[0]?.utcDay ?? new Date().toISOString().slice(0, 10),
     used: Number(rows[0]?.used ?? 0n),
     limit,
+    // A day is the ceiling: a nonsensical value must not schedule a refresh
+    // years out, and the floor lives on the client so a bad one cannot loop.
+    resetsInMs: Math.min(Number(rows[0]?.resetsInMs ?? 86_400_000n), 86_400_000),
   };
 }
 
