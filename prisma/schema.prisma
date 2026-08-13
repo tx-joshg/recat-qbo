@@ -627,6 +627,8 @@ model LogTag {
   company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
   /// "<qboType>:<qboId>" — canonical entity type (Purchase | Deposit |
   /// JournalEntry) where known, else the report's type string verbatim.
+  /// Rows QBO returned without an entity id instead carry the synthetic
+  /// "row:<hash>" key from reports.ts fallbackLogKey, so they stay taggable.
   qboKey    String
   tagId     String
   tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)

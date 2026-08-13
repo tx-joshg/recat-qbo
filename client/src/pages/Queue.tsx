@@ -81,7 +81,10 @@ const SORT_LABELS: Record<SortKey, string> = {
   status: 'Status',
 };
 
-const GRID_COLS = '38px 80px minmax(180px,1fr) 104px 118px minmax(200px,240px) 110px';
+// The date track holds fmtDate's widest output. That is 'May 28, 2024' (~90px at
+// --rfs 14.5) now that fmtDate appends the year outside the current year — 80px
+// fit the year-less form only and wrapped these onto a second line.
+const GRID_COLS = '38px 96px minmax(180px,1fr) 104px 118px minmax(200px,240px) 110px';
 
 const SHORTCUT_TIP =
   '↑↓ or j/k — move between rows · x — select · c — open category picker · t — open tags · Enter — post the active row. Inside a picker: ↑↓ navigate, Enter select, Esc close.';
