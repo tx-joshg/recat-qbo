@@ -106,7 +106,8 @@ definitions ran exactly as they ship.
 - All three digests pull and resolve on arm64
 - Containers start, Postgres and the extractor report healthy, the server waits
   on both
-- **All 26 migrations apply** against an empty database on first boot
+- **All 28 migrations apply** against an empty database on first boot, and do
+  not re-run on the next boot
 - The app serves; `/auth/methods` reports `localAdmin: true`
 - The extractor is reachable from the server container over the app network
   (`/healthz` → 200) and is not published to the host
@@ -135,13 +136,24 @@ point rather than only after step 2.
 
 ### Still unverified
 
-No container has been started **since** the public URL became configurable. The
-package itself was boot-verified before that change, and the setting was
-verified end to end against a running server, but not the two together. Boot it
-on a real Umbrel before submitting.
+The v0.1.0 pin **has** been booted, including a container start since the public
+URL became configurable — the server read `APP_URL` and logged the host-facing
+address, which is what the earlier note asked for. What that boot did not cover:
 
-Two known limitations are tracked and affect anyone using a TLS front:
-[#39](https://github.com/tx-joshg/recat-qbo/issues/39), the OAuth callback can
-land on an origin without the session cookie, and
-[#40](https://github.com/tx-joshg/recat-qbo/issues/40), the MCP host guard still
-binds to the environment address.
+**No TLS front, and no real Umbrel device.** The run above used a direct port
+publish on a developer machine, not `app_proxy` on Umbrel hardware. So the two
+limitations that affected anyone fronting Recat with TLS are fixed and shipping
+in this pin — [#39](https://github.com/tx-joshg/recat-qbo/issues/39), the OAuth
+callback landing on an origin without the session cookie, and
+[#40](https://github.com/tx-joshg/recat-qbo/issues/40), the MCP host guard
+binding to the environment address, both closed in
+[#42](https://github.com/tx-joshg/recat-qbo/pull/42) — but neither has been
+exercised *through* a TLS front. They rest on their own tests and a non-proxied
+server.
+
+**The first-run wizard was not re-run against this pin.** The flow recorded
+above (wizard creates `admin@recat.local`, local sign-in then returns 200, and
+the same credentials return `401` before step 2) was verified on the earlier
+build and has not been repeated here.
+
+Boot it on a real Umbrel behind a TLS front before submitting.
