@@ -41,22 +41,25 @@ docker buildx imagetools inspect ghcr.io/tx-joshg/recat-qbo/receipt-extractor:vX
 Both images must list `linux/amd64` and `linux/arm64` — a large share of Umbrel
 devices are ARM, and a single-arch image simply fails to pull there.
 
-## Two things that will generate support questions
+## One thing that will generate support questions
 
-### The setup wizard's admin email must match
+### The setup wizard's admin email — handled upstream as of v0.1.1
 
 `LOCAL_ADMIN_EMAIL` is `admin@recat.local`, surfaced to users as
 `defaultUsername`. Local sign-in **only authenticates a user that already
 exists and is an instance admin** — `authenticateLocalAdmin` looks the account
-up, it never creates one. So the wizard has to create that exact address as the
-first administrator, or the password Umbrel displays will not log anyone in.
+up, it never creates one. So the wizard has to create that exact address, or the
+password Umbrel displays logs nobody in. With no outbound mail there is no magic
+link either, which made it a dead end rather than an inconvenience.
 
-This matters more on Umbrel than elsewhere: there is no outbound mail, so
-magic-link sign-in cannot deliver, and local sign-in is the only way back in.
+The wizard now defaults to that address
+([#47](https://github.com/tx-joshg/recat-qbo/pull/47)), so the displayed password
+works as soon as setup finishes. **This is why the package must pin v0.1.1 or
+later** — the v0.1.0 pin predates the fix and still strands users.
 
-Worth considering upstream: let the first-run wizard adopt `LOCAL_ADMIN_EMAIL`
-as the default administrator address, which would remove the coordination
-entirely.
+A user can still type a different address, and the wizard now warns that password
+sign-in will not apply to it. That is the remaining support case, and it is a
+deliberate choice rather than a trap.
 
 ### Connecting real QuickBooks needs an HTTPS address
 
@@ -114,46 +117,51 @@ definitions ran exactly as they ship.
 - `ReceiptCompanyConfig.enabled` defaults to `false` in the created schema, so
   extraction is off until an operator turns it on
 - Postgres data lands in the `APP_DATA_DIR` bind mount, and **survives a full
-  `down` / `up` cycle** — the admin account and its session both persisted,
-  which is what Umbrel does on update
+  `down` / `up` cycle** — the admin account persisted and local sign-in still
+  returned 200 afterwards, which is what Umbrel does on update
+- `/api/setup/status` offers `localAdminEmail`, confirming the wizard fix is in
+  the shipped image and not only in the source tree
 
 ### First-run flow, end to end
 
-1. Fresh install reports `needsSetup: true`
-2. The wizard creates the first instance admin; with no SMTP it returns
+Re-run against the v0.1.1 pin, on a fresh database:
+
+1. Fresh install reports `needsSetup: true` **and offers
+   `localAdminEmail: admin@recat.local`** — the wizard fills it in
+2. The wizard creates that administrator; with no SMTP it returns
    `delivered: false` plus a one-click link rather than failing
-3. Local sign-in with the password Umbrel displays then returns HTTP 200
+3. Local sign-in with the password Umbrel displays returns **HTTP 200**
+4. `/api/setup/status` stops offering the address once an admin exists
 
-**The order matters.** Before step 2 those same credentials return
-`401 INVALID_CREDENTIALS` — reproduced, not inferred. `authenticateLocalAdmin`
+**The order still matters.** Before step 2 those same credentials return
+`401` — reproduced against this pin, not inferred. `authenticateLocalAdmin`
 authenticates an existing instance admin and never creates one, so the account
-must exist first. A user who tries the displayed password before finishing the
-wizard will be told it is wrong.
-
-That is the strongest argument for having the wizard default its admin address
-to `LOCAL_ADMIN_EMAIL`: it would make the displayed credential correct at every
-point rather than only after step 2.
+must exist first. What changed is that a user who follows the wizard now lands on
+the right address by default instead of having to know to type it.
 
 ### Still unverified
 
-The v0.1.0 pin **has** been booted, including a container start since the public
-URL became configurable — the server read `APP_URL` and logged the host-facing
-address, which is what the earlier note asked for. What that boot did not cover:
+The v0.1.1 pin has been booted and the full first-run flow re-run against it, so
+the gap the v0.1.0 notes recorded is closed. What remains:
 
-**No TLS front, and no real Umbrel device.** The run above used a direct port
-publish on a developer machine, not `app_proxy` on Umbrel hardware. So the two
+**No TLS front, and no real Umbrel device.** Every run so far used a direct port
+publish on a developer machine, not `app_proxy` on Umbrel hardware. The two
 limitations that affected anyone fronting Recat with TLS are fixed and shipping
 in this pin — [#39](https://github.com/tx-joshg/recat-qbo/issues/39), the OAuth
 callback landing on an origin without the session cookie, and
 [#40](https://github.com/tx-joshg/recat-qbo/issues/40), the MCP host guard
 binding to the environment address, both closed in
-[#42](https://github.com/tx-joshg/recat-qbo/pull/42) — but neither has been
-exercised *through* a TLS front. They rest on their own tests and a non-proxied
+[#42](https://github.com/tx-joshg/recat-qbo/pull/42) — but **neither has been
+exercised through a TLS front.** They rest on their own tests and a non-proxied
 server.
 
-**The first-run wizard was not re-run against this pin.** The flow recorded
-above (wizard creates `admin@recat.local`, local sign-in then returns 200, and
-the same credentials return `401` before step 2) was verified on the earlier
-build and has not been repeated here.
+That matters more than it sounds: connecting real QuickBooks *requires* a TLS
+front (see above), so the one path an operator must take to use real books is the
+one path never tested end to end.
 
-Boot it on a real Umbrel behind a TLS front before submitting.
+**No real QuickBooks connection has been made from this package.** The boots
+verify the app serves, migrates, persists and signs in — not that an Intuit OAuth
+round trip completes from an Umbrel install.
+
+Boot it on a real Umbrel behind a TLS front, and connect a real company, before
+submitting.

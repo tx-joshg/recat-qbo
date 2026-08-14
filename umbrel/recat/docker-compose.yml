@@ -5,7 +5,7 @@ services:
       APP_PORT: 3001
 
   server:
-    image: ghcr.io/tx-joshg/recat-qbo:0.1.0@sha256:a69f89e5afc988d01eaac9b6686ce945c773e8f6af8f34ce19c9bb560a8f5304
+    image: ghcr.io/tx-joshg/recat-qbo:0.1.1@sha256:8fd63648929403e1377532777c4afac4b892223ad32884e18b6040208cec1e0e
     restart: on-failure
     environment:
       # The install's starting address, and the seed for origin checking — not
@@ -65,7 +65,7 @@ services:
       retries: 10
 
   receipt-extractor:
-    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.0@sha256:ceb75693a84203f66794de00f42a3f18e5e8ef4fb81412e522b23d23264ff7cc
+    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.1@sha256:87c27a04532211e3e3932d2a3a2a0a6dbfbcbb542eaf96975b0858572bc29659
     restart: on-failure
     environment:
       RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}

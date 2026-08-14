@@ -27,13 +27,15 @@ description: >-
   QuickBooks if you want to try it before connecting real books.
 
 
-  Note on first run: when the setup wizard asks you to create the administrator
-  account, use the username shown below so the built-in local sign-in works.
-  Umbrel installs have no outbound email configured, so magic-link sign-in will
-  not deliver until you add SMTP in Settings.
-version: "0.1.0"
+  Note on first run: the setup wizard already fills in the administrator address
+  shown below, so the password on this page signs you in. Change that address and
+  the password stops working — Umbrel installs have no outbound email, so
+  magic-link sign-in cannot deliver until you add SMTP in Settings.
+version: "0.1.1"
 releaseNotes: >-
-  First Umbrel release.
+  First Umbrel release. The setup wizard now defaults to the administrator
+  address that local sign-in authenticates, so the password Umbrel displays
+  works as soon as setup finishes.
 developer: Josh Goble
 website: https://github.com/tx-joshg/recat-qbo
 repo: https://github.com/tx-joshg/recat-qbo
