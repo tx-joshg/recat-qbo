@@ -452,6 +452,12 @@ export interface SetupStatus {
   redirectUri: string;
   /** `${APP_URL}/webhooks/qbo` — shown on the Sync step when webhooks are picked. */
   webhookUrl?: string;
+  /**
+   * `LOCAL_ADMIN_EMAIL`, present only while `needsSetup` and local sign-in is
+   * enabled. The wizard must create this exact address or the password the
+   * deployment displays authenticates nobody — see the Admin step.
+   */
+  localAdminEmail?: string;
 }
 
 /** Connect-flow choices for GET /api/companies/connect-url. */

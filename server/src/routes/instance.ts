@@ -4,7 +4,7 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { appUrlEnvManaged, attachmentPolicyEnvManaged } from '../env.js';
+import { appUrlEnvManaged, attachmentPolicyEnvManaged, localAdminConfig } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
@@ -289,14 +289,27 @@ setupRouter.get(
   asyncHandler(async (_req, res) => {
     const adminCount = await prisma.user.count({ where: { isInstanceAdmin: true } });
     const settings = await getInstanceSettings();
+    const needsSetup = adminCount === 0;
     res.json({
-      needsSetup: adminCount === 0,
+      needsSetup,
       // Real Intuit credentials only — the demo needs none and is always
       // available (it's a per-connection choice in the wizard, not a mode).
       credentialsSet: settings.intuitClientId !== '',
       smtpConfigured: settings.smtpHost !== '',
       redirectUri: `${settings.appUrl}/auth/qbo/callback`,
       webhookUrl: `${settings.appUrl}/webhooks/qbo`,
+      // Local sign-in authenticates an EXISTING instance admin at this exact
+      // address — it never creates one. If the wizard creates a different
+      // address, the password the deployment displays (Umbrel's ${APP_PASSWORD})
+      // authenticates nobody, and with no SMTP there is no magic link either.
+      // So the wizard defaults to it.
+      //
+      // Only while the instance is un-set-up, and only when local sign-in is
+      // on. This route is public, and after setup the address is a real account
+      // identifier worth not handing out; before setup there is no account yet.
+      ...(needsSetup && localAdminConfig.enabled
+        ? { localAdminEmail: localAdminConfig.email }
+        : {}),
     });
   }),
 );

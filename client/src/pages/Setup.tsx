@@ -344,7 +344,13 @@ export default function Setup() {
     api
       .get<SetupStatus>('/api/setup/status')
       .then((s) => {
-        if (!cancelled) setStatus(s);
+        if (cancelled) return;
+        setStatus(s);
+        // Deployments with local sign-in (Umbrel) display a password that only
+        // works for this exact address, and have no SMTP to fall back on. Default
+        // to it, but never overwrite a restored or already-typed value.
+        const local = s.localAdminEmail;
+        if (local) setAdminEmail((cur) => (cur === '' ? local : cur));
       })
       .catch(() => {
         // status unavailable — the wizard still works with defaults
@@ -897,6 +903,33 @@ export default function Setup() {
                 <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 10 }}>
                   We'll verify it with a magic link — no password to create.
                 </div>
+                {status?.localAdminEmail && (
+                  <div
+                    style={{
+                      fontSize: 13,
+                      color: 'var(--fnt)',
+                      marginTop: 10,
+                      paddingLeft: 10,
+                      borderLeft: '2px solid var(--bd)',
+                    }}
+                  >
+                    {adminEmail.trim().toLowerCase() === status.localAdminEmail ? (
+                      <>
+                        This deployment has local sign-in enabled for{' '}
+                        <b style={{ color: 'var(--ink)' }}>{status.localAdminEmail}</b>, so the
+                        password it shows you signs in to this account. Keep the address to use
+                        that password.
+                      </>
+                    ) : (
+                      <>
+                        Heads up: this deployment's password sign-in only works for{' '}
+                        <b style={{ color: 'var(--ink)' }}>{status.localAdminEmail}</b>. Create a
+                        different address and you'll need the magic link instead — which needs
+                        SMTP configured.
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             ) : (
               <div>
