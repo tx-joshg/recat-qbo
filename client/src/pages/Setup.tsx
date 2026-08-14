@@ -923,9 +923,11 @@ export default function Setup() {
                     ) : (
                       <>
                         Heads up: this deployment's password sign-in only works for{' '}
-                        <b style={{ color: 'var(--ink)' }}>{status.localAdminEmail}</b>. Create a
-                        different address and you'll need the magic link instead — which needs
-                        SMTP configured.
+                        <b style={{ color: 'var(--ink)' }}>{status.localAdminEmail}</b>. You can
+                        finish setup on a different address and you'll be signed in now — but
+                        once you connect real QuickBooks, one-click sign-in turns off and this
+                        password won't work. Without SMTP for the magic link, that locks you
+                        out.
                       </>
                     )}
                   </div>
