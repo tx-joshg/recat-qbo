@@ -19,16 +19,22 @@ recat/
 request, which does not exist until you open it. Umbrel will reject the
 manifest with `PENDING` in place.
 
-**`port: 3009`** — checked against the full App Store index (391 apps, current
-as of 2026-08-03). `3001` was taken by `ride-the-lightning`; `3009` is the
-nearest free port and nothing else references it. The app id `recat` is also
-unclaimed. Re-check before submitting, since the store moves.
+**`port: 3009`** — re-checked against the App Store index on 2026-08-15 (394
+apps, up from 391 twelve days earlier): no package references `3009`, and the app
+id `recat` is still unclaimed. `3001` was taken by `ride-the-lightning`. Re-check
+again immediately before submitting, since the store moves.
 
 Note the split: `port` is the host-facing app_proxy port and must be unique,
 while `APP_PORT` and the container's `PORT` stay `3001` — that is Recat's own
 listen port and is not visible to the host. `APP_URL` follows the *host-facing*
 port, because it is what a browser hits and what the QuickBooks redirect URI is
 built from.
+
+**`gallery: []` is correct — do not fill it in.** Umbrel's packaging guidance
+says new packages ship an empty gallery and the Umbrel team creates and hosts the
+App Store assets before merge. Screenshots and the logo belong in the upstream PR
+body, not committed here. The same applies to `icon`, which official packages omit
+entirely.
 
 **Images are pinned by digest** and must be re-pinned on every release:
 
@@ -54,8 +60,9 @@ link either, which made it a dead end rather than an inconvenience.
 
 The wizard now defaults to that address
 ([#47](https://github.com/tx-joshg/recat-qbo/pull/47)), so the displayed password
-works as soon as setup finishes. **This is why the package must pin v0.1.1 or
-later** — the v0.1.0 pin predates the fix and still strands users.
+works as soon as setup finishes. **The package must pin v0.1.2 or later** —
+v0.1.0 predates this fix and strands users, and v0.1.1 predates the first-run
+claim guard described below.
 
 A user can still type a different address, and the wizard now warns that password
 sign-in will not apply to it. That is the remaining support case, and it is a
@@ -166,6 +173,10 @@ definitions ran exactly as they ship.
   returned 200 afterwards, which is what Umbrel does on update
 - `/api/setup/status` offers `localAdminEmail`, confirming the wizard fix is in
   the shipped image and not only in the source tree
+- **The first-run claim guard is in the shipped image** (re-verified against the
+  v0.1.2 pin): a claim with no password and a claim with the wrong one both return
+  `401` with no sign-in link in the body, the instance stays un-set-up, and the
+  password Umbrel displays then creates the admin and signs in
 
 ### First-run flow, end to end
 
@@ -184,7 +195,7 @@ authenticates an existing instance admin and never creates one, so the account
 must exist first. What changed is that a user who follows the wizard now lands on
 the right address by default instead of having to know to type it.
 
-### Verified on real hardware
+### Verified on real hardware (v0.1.1)
 
 [@salmonumbrella](https://github.com/salmonumbrella) ran the package on an actual
 Umbrel device, which closes the gap every earlier note recorded as outstanding.
@@ -207,16 +218,14 @@ and the MCP host guard, both closed in
 
 ### Still unverified
 
-**The maintainer has no Umbrel device**, so everything above is a contributor's
-report rather than something reproduced here. It is specific and measured, which
-is why it was acted on, but it is one person on one device.
+**The maintainer has no Umbrel device**, so the hardware report above is a
+contributor's rather than something reproduced here. It is specific and measured,
+which is why it was acted on, but it is one person on one device.
 
-**The `PROXY_AUTH_ADD` fix itself has not been re-tested on hardware.** It is the
-change that report asked for, and the reasoning is sound, but the corrected package
-has not been round-tripped back through a device.
+**Nothing since that report has been tested on hardware.** The `PROXY_AUTH_ADD`
+fix, the first-run claim guard, and the v0.1.2 pin have all been verified only on
+a developer machine. The corrected package has never been round-tripped back
+through a device.
 
-**`gallery: []` is empty** and `submission:` is still `PENDING` — the latter cannot
-be filled until the upstream pull request exists.
-
-**`port: 3009` and the app id `recat`** were checked against the full App Store
-index on 2026-08-03. Re-check before submitting; the store moves.
+**`submission:` is still `PENDING`** — it cannot be filled until the upstream pull
+request exists. (`gallery: []` is *not* an outstanding item; see above.)

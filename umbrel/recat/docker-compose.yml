@@ -25,7 +25,7 @@ services:
       PROXY_AUTH_ADD: 'false'
 
   server:
-    image: ghcr.io/tx-joshg/recat-qbo:0.1.1@sha256:8fd63648929403e1377532777c4afac4b892223ad32884e18b6040208cec1e0e
+    image: ghcr.io/tx-joshg/recat-qbo:0.1.2@sha256:433aa626f637cb2c5364eca9afda25f4938414e34d12dc3814dc00e7c653afd4
     restart: on-failure
     environment:
       # The install's starting address, and the seed for origin checking — not
@@ -85,7 +85,7 @@ services:
       retries: 10
 
   receipt-extractor:
-    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.1@sha256:87c27a04532211e3e3932d2a3a2a0a6dbfbcbb542eaf96975b0858572bc29659
+    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.2@sha256:29540d848e6ce784ec6851ac935f75585052ef4fa468e7df33e8b986e4632a47
     restart: on-failure
     environment:
       RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}
