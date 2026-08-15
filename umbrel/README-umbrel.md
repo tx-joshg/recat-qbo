@@ -81,6 +81,47 @@ Without a TLS front, the built-in demo QuickBooks works fully; real books do not
 That is worth stating plainly in the store description rather than letting users
 discover it at the Intuit step.
 
+### Umbrel's dashboard auth must be off, and that has a consequence
+
+`PROXY_AUTH_ADD` defaults to `true`, which fronts the app with Umbrel dashboard
+authentication. That works from the dashboard origin, where the browser carries
+the session cookie. Behind a TLS front it does not: `app_proxy` redirects to
+`http://127.0.0.1:2000`, an address nothing outside the box can reach.
+
+Measured on a real device by [@salmonumbrella](https://github.com/salmonumbrella)
+against the package as shipped: **200 on loopback, 502 through Tailscale Serve,
+502 on `/auth/qbo/callback`.** So the Intuit callback can never land, and real
+QuickBooks cannot be connected at all.
+
+Whitelisting only the callback with `PROXY_AUTH_WHITELIST` does not solve it —
+every UI request would still redirect to the unreachable address, leaving the app
+unusable through the very front it needs. The package therefore sets
+`PROXY_AUTH_ADD: 'false'` and relies on Recat's own authentication: sessions,
+magic links, the rate-limited local admin password, and per-company roles.
+
+**The consequence, stated plainly.** Removing Umbrel's layer means Recat's own
+auth is the only gate — and there is one window where Recat has no gate to offer.
+Before the first administrator exists, `POST /api/setup/admin` is unauthenticated
+by necessity (somebody has to be able to create that first account), and with no
+SMTP it returns a one-click sign-in link directly in the response. **Anyone who
+can reach an un-set-up instance can claim it.**
+
+That window is harmless on a private address and serious on a public one. The
+practical guidance:
+
+- **Finish the first-run wizard before exposing the app publicly.** Open it from
+  the Umbrel dashboard on your LAN, create the admin, then set up the TLS front.
+- **Prefer a private front.** Tailscale Serve keeps the app on your tailnet;
+  Tailscale Funnel and Cloudflare Tunnel publish to the open internet. Both
+  satisfy Intuit's HTTPS requirement, but only one of them limits who can reach
+  the setup window.
+- If an instance is ever exposed before setup completes, assume it may have been
+  claimed and reinstall rather than reasoning about it.
+
+This is not introduced by turning the proxy auth off — the same window exists on
+any Recat deployment reachable before setup — but the proxy auth was what
+happened to cover it on Umbrel, so removing it makes the ordering matter.
+
 ## Notes on specific choices
 
 **No `TRUSTED_PROXY_IPS`.** The `app_proxy` container's address is assigned by
@@ -139,29 +180,39 @@ authenticates an existing instance admin and never creates one, so the account
 must exist first. What changed is that a user who follows the wizard now lands on
 the right address by default instead of having to know to type it.
 
+### Verified on real hardware
+
+[@salmonumbrella](https://github.com/salmonumbrella) ran the package on an actual
+Umbrel device, which closes the gap every earlier note recorded as outstanding.
+Their report, against `umbrel/recat/` as shipped:
+
+1. **Installs and boots clean** from the package directory
+2. **The wizard completes and the displayed password signs you in** — tested
+   against an empty database, before restoring anything
+3. **QuickBooks connects** — with the `PROXY_AUTH_ADD` fix below
+
+Finding (3) is what produced that fix: without it, `app_proxy` redirects to
+`http://127.0.0.1:2000` and the Intuit callback returns 502 through a TLS front.
+The measurements are in the HTTPS section above.
+
+This also means [#39](https://github.com/tx-joshg/recat-qbo/issues/39) and
+[#40](https://github.com/tx-joshg/recat-qbo/issues/40) — the OAuth callback origin
+and the MCP host guard, both closed in
+[#42](https://github.com/tx-joshg/recat-qbo/pull/42) — have finally been exercised
+*through* a real TLS front rather than resting on their own tests.
+
 ### Still unverified
 
-The v0.1.1 pin has been booted and the full first-run flow re-run against it, so
-the gap the v0.1.0 notes recorded is closed. What remains:
+**The maintainer has no Umbrel device**, so everything above is a contributor's
+report rather than something reproduced here. It is specific and measured, which
+is why it was acted on, but it is one person on one device.
 
-**No TLS front, and no real Umbrel device.** Every run so far used a direct port
-publish on a developer machine, not `app_proxy` on Umbrel hardware. The two
-limitations that affected anyone fronting Recat with TLS are fixed and shipping
-in this pin — [#39](https://github.com/tx-joshg/recat-qbo/issues/39), the OAuth
-callback landing on an origin without the session cookie, and
-[#40](https://github.com/tx-joshg/recat-qbo/issues/40), the MCP host guard
-binding to the environment address, both closed in
-[#42](https://github.com/tx-joshg/recat-qbo/pull/42) — but **neither has been
-exercised through a TLS front.** They rest on their own tests and a non-proxied
-server.
+**The `PROXY_AUTH_ADD` fix itself has not been re-tested on hardware.** It is the
+change that report asked for, and the reasoning is sound, but the corrected package
+has not been round-tripped back through a device.
 
-That matters more than it sounds: connecting real QuickBooks *requires* a TLS
-front (see above), so the one path an operator must take to use real books is the
-one path never tested end to end.
+**`gallery: []` is empty** and `submission:` is still `PENDING` — the latter cannot
+be filled until the upstream pull request exists.
 
-**No real QuickBooks connection has been made from this package.** The boots
-verify the app serves, migrates, persists and signs in — not that an Intuit OAuth
-round trip completes from an Umbrel install.
-
-Boot it on a real Umbrel behind a TLS front, and connect a real company, before
-submitting.
+**`port: 3009` and the app id `recat`** were checked against the full App Store
+index on 2026-08-03. Re-check before submitting; the store moves.

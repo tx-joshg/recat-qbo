@@ -4,6 +4,26 @@ services:
       APP_HOST: recat_server_1
       APP_PORT: 3001
 
+      # Umbrel's dashboard auth defaults on (PROXY_AUTH_ADD defaults to true),
+      # and it only works from the dashboard origin, where the browser carries
+      # that session cookie. Behind a TLS front app_proxy 302s to
+      # http://127.0.0.1:2000, which nothing outside the box can reach.
+      # Measured on the device: 200 on loopback, 502 through Tailscale Serve,
+      # and 502 on /auth/qbo/callback — so the Intuit callback can never land
+      # and real QuickBooks cannot be connected at all.
+      #
+      # Whitelisting just the callback does not help: every UI request would
+      # still 302 to an unreachable address, leaving the app unusable through
+      # the front it needs for real books.
+      #
+      # Recat authenticates its own requests — sessions, magic links, the
+      # rate-limited local admin password, per-company roles — so Umbrel's
+      # layer is redundant here rather than protective. ONE EXCEPTION, see
+      # README-umbrel.md: before the first admin exists, POST /api/setup/admin
+      # is unauthenticated by necessity, so finish the wizard before exposing
+      # the app on a public address.
+      PROXY_AUTH_ADD: 'false'
+
   server:
     image: ghcr.io/tx-joshg/recat-qbo:0.1.1@sha256:8fd63648929403e1377532777c4afac4b892223ad32884e18b6040208cec1e0e
     restart: on-failure
