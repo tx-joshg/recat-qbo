@@ -11,6 +11,8 @@ import { prisma } from '../lib/prisma.js';
 import { getIntuitCredentialPreflight } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { devLoginAllowed } from '../services/devLogin.js';
+import { localAdminPasswordMatches } from '../services/localAdminAuth.js';
+import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
 import {
   getInstanceSettings,
   getInstanceSettingsDto,
@@ -268,7 +270,25 @@ instanceRouter.post(
 // /api/setup — the first-run wizard (pre-auth where it must be)
 // ---------------------------------------------------------------------------
 
-const adminBody = z.object({ email: z.string().trim().toLowerCase().email() });
+const adminBody = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  // Required only when local sign-in is configured — see the claim guard on
+  // POST /admin. Absent on deployments that have no such password to check.
+  password: z.string().optional(),
+});
+
+// First-run is necessarily unauthenticated: somebody has to create the first
+// account. On a deployment reachable before setup completes, that lets whoever
+// arrives first claim the instance — and with no SMTP the response hands them a
+// one-click sign-in link. Umbrel makes this concrete: its dashboard auth is off
+// (see umbrel/recat/docker-compose.yml) and operators are steered toward public
+// TLS fronts.
+//
+// When a local admin password is configured we can close the window without
+// inventing a new secret: the deployment already shows that password to its
+// owner (Umbrel prints ${APP_PASSWORD} on the app page), so requiring it proves
+// the caller can see the device. Deployments with no local admin are unchanged.
+const setupClaimLimiter = new LocalLoginLimiter();
 
 const credentialsBody = z.object({
   clientId: z.string().trim().min(1),
@@ -307,6 +327,11 @@ setupRouter.get(
       // Only while the instance is un-set-up, and only when local sign-in is
       // on. This route is public, and after setup the address is a real account
       // identifier worth not handing out; before setup there is no account yet.
+      //
+      // Its presence is also what tells the wizard to ask for the deployment's
+      // password: POST /admin gates on the same `needsSetup && enabled`, so the
+      // two cannot disagree. The server is authoritative either way — a client
+      // that omits the password gets a 401.
       ...(needsSetup && localAdminConfig.enabled
         ? { localAdminEmail: localAdminConfig.email }
         : {}),
@@ -319,10 +344,30 @@ setupRouter.get(
 setupRouter.post(
   '/admin',
   asyncHandler(async (req, res) => {
-    const { email } = validate(adminBody)(req.body);
+    const { email, password } = validate(adminBody)(req.body);
     const adminCount = await prisma.user.count({ where: { isInstanceAdmin: true } });
     if (adminCount > 0) {
       throw new HttpError(409, 'Setup is already complete — an admin account exists.', 'ALREADY_SETUP');
+    }
+
+    // Prove the caller can see the deployment's own password before letting
+    // them claim the instance. Rate limited because an un-set-up instance on a
+    // public address is otherwise a free brute-force target.
+    if (localAdminConfig.enabled) {
+      const source = req.ip || req.socket.remoteAddress || 'unknown';
+      const limit = setupClaimLimiter.acquire(source);
+      if (!limit.allowed) {
+        res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+        throw new HttpError(429, 'Too many attempts — try again later', 'RATE_LIMITED');
+      }
+      if (password === undefined || !localAdminPasswordMatches(password, localAdminConfig.password)) {
+        throw new HttpError(
+          401,
+          'Incorrect password. Use the app password this deployment shows you.',
+          'INVALID_CREDENTIALS',
+        );
+      }
+      setupClaimLimiter.clear(source);
     }
     const user = await prisma.user.upsert({
       where: { email },

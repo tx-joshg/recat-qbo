@@ -99,28 +99,32 @@ unusable through the very front it needs. The package therefore sets
 `PROXY_AUTH_ADD: 'false'` and relies on Recat's own authentication: sessions,
 magic links, the rate-limited local admin password, and per-company roles.
 
-**The consequence, stated plainly.** Removing Umbrel's layer means Recat's own
-auth is the only gate — and there is one window where Recat has no gate to offer.
-Before the first administrator exists, `POST /api/setup/admin` is unauthenticated
-by necessity (somebody has to be able to create that first account), and with no
-SMTP it returns a one-click sign-in link directly in the response. **Anyone who
-can reach an un-set-up instance can claim it.**
+**The consequence, and what closes it.** Removing Umbrel's layer means Recat's
+own auth is the only gate — and first-run is necessarily ungated, because
+somebody has to be able to create the first account. Before that account exists
+`POST /api/setup/admin` takes any email, and with no SMTP it returns a one-click
+sign-in link directly in the response. Left alone, anyone who could reach an
+un-set-up instance could claim it.
 
-That window is harmless on a private address and serious on a public one. The
-practical guidance:
+**The wizard now requires the app password Umbrel displays** before it will
+create that first administrator
+([#53](https://github.com/tx-joshg/recat-qbo/issues/53)). No new secret: the
+deployment already shows `${APP_PASSWORD}` on the Recat app page, so requiring it
+proves the caller can see the device. Attempts are rate limited, so a public
+instance is not a free brute-force target. Deployments with no `LOCAL_ADMIN_*`
+configured are unaffected and still set up without a password.
 
-- **Finish the first-run wizard before exposing the app publicly.** Open it from
-  the Umbrel dashboard on your LAN, create the admin, then set up the TLS front.
+Still worth doing, because defence in depth costs nothing here:
+
 - **Prefer a private front.** Tailscale Serve keeps the app on your tailnet;
-  Tailscale Funnel and Cloudflare Tunnel publish to the open internet. Both
-  satisfy Intuit's HTTPS requirement, but only one of them limits who can reach
-  the setup window.
-- If an instance is ever exposed before setup completes, assume it may have been
-  claimed and reinstall rather than reasoning about it.
+  Tailscale Funnel and Cloudflare Tunnel publish to the open internet. All
+  satisfy Intuit's HTTPS requirement, but only one limits who can reach the box
+  at all.
+- **Finish the wizard early**, from the dashboard on your LAN.
 
-This is not introduced by turning the proxy auth off — the same window exists on
-any Recat deployment reachable before setup — but the proxy auth was what
-happened to cover it on Umbrel, so removing it makes the ordering matter.
+The window was never introduced by turning proxy auth off — it exists on any
+Recat deployment reachable before setup — but proxy auth was what happened to
+cover it on Umbrel, which is what made closing it properly worth doing.
 
 ## Notes on specific choices
 

@@ -260,6 +260,9 @@ export default function Setup() {
   const [env, setEnv] = useState<QboEnv>(initial.env);
   const [syncMode, setSyncMode] = useState<SyncMode>(initial.syncMode);
   const [adminEmail, setAdminEmail] = useState(initial.adminEmail);
+  // Never persisted to sessionStorage with the rest of the wizard progress —
+  // it is the deployment's own password, not navigation state.
+  const [adminPassword, setAdminPassword] = useState('');
   const [adminSent, setAdminSent] = useState(initial.adminSent);
   const [companyId, setCompanyId] = useState<string | null>(initial.companyId);
 
@@ -468,9 +471,20 @@ export default function Setup() {
       toast('Enter your email first');
       return;
     }
+    // Deployments with local sign-in gate first-run on the password they
+    // already display, so an instance reachable before setup can't be claimed
+    // by whoever finds it. The server enforces this; sending it is not optional.
+    const claimPassword = status?.localAdminEmail ? adminPassword : '';
+    if (status?.localAdminEmail && claimPassword === '') {
+      toast('Enter the app password shown by your server');
+      return;
+    }
     setBusy(true);
     try {
-      const res = await api.post<AdminResponse>('/api/setup/admin', { email });
+      const res = await api.post<AdminResponse>('/api/setup/admin', {
+        email,
+        ...(claimPassword !== '' ? { password: claimPassword } : {}),
+      });
       setDevLink(res.devLink ?? null);
       setLinkDelivered(res.delivered ?? true);
       setAdminSent(true);
@@ -901,8 +915,28 @@ export default function Setup() {
                   type="email"
                 />
                 <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 10 }}>
-                  We'll verify it with a magic link — no password to create.
+                  {status?.localAdminEmail
+                    ? "We'll verify it with a magic link — you won't create an account password."
+                    : "We'll verify it with a magic link — no password to create."}
                 </div>
+                {status?.localAdminEmail && (
+                  <>
+                    <label style={{ ...fieldLabel, marginTop: 16 }}>App password</label>
+                    <input
+                      className="input-lg"
+                      value={adminPassword}
+                      onChange={(e) => setAdminPassword(e.target.value)}
+                      placeholder="shown on your server's app page"
+                      type="password"
+                      autoComplete="off"
+                    />
+                    <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 10 }}>
+                      Your server displays this password — on Umbrel it's on the Recat app page.
+                      It confirms you're the one setting this up, so nobody else can claim the
+                      instance first.
+                    </div>
+                  </>
+                )}
                 {status?.localAdminEmail && (
                   <div
                     style={{

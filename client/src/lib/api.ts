@@ -1064,7 +1064,8 @@ export const team = {
 export const setup = {
   status: () => api.get<SetupStatus>('/api/setup/status'),
   /** Wizard step 1 — create the admin account (verified by magic link). */
-  admin: (email: string) => api.post<void>('/api/setup/admin', { email }),
+  admin: (email: string, password?: string) =>
+    api.post<void>('/api/setup/admin', password === undefined ? { email } : { email, password }),
   /** Wizard step 2 — Intuit app credentials (stored encrypted; env vars take precedence). */
   credentials: (body: { clientId: string; clientSecret: string; env: QboEnv }) =>
     api.post<void>('/api/setup/credentials', body),

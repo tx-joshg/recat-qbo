@@ -5,13 +5,29 @@ import { errorMiddleware } from '../lib/http.js';
 
 const mocks = vi.hoisted(() => ({
   userCount: vi.fn(),
+  userUpsert: vi.fn(),
   getInstanceSettings: vi.fn(),
+  issueMagicLink: vi.fn(),
+  isSmtpConfigured: vi.fn(),
+  devLoginAllowed: vi.fn(),
   localAdminConfig: { enabled: false, email: '', password: '' },
 }));
 
 vi.mock('../lib/prisma.js', () => ({
-  prisma: { user: { count: mocks.userCount } },
+  prisma: { user: { count: mocks.userCount, upsert: mocks.userUpsert } },
 }));
+
+vi.mock('../services/magicLink.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/magicLink.js')>();
+  return { ...actual, issueMagicLink: mocks.issueMagicLink };
+});
+
+vi.mock('../lib/mailer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/mailer.js')>();
+  return { ...actual, isSmtpConfigured: mocks.isSmtpConfigured };
+});
+
+vi.mock('../services/devLogin.js', () => ({ devLoginAllowed: mocks.devLoginAllowed }));
 
 // Only localAdminConfig is swapped; the rest of env is real, because
 // instance.ts transitively pulls in the QBO factory, which reads it.
@@ -40,9 +56,15 @@ function testApp(): Express {
   return app;
 }
 
+const PASSWORD = 'umbrel-shown-password';
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.localAdminConfig = { enabled: false, email: '', password: '' };
+  mocks.userUpsert.mockResolvedValue({ id: 'u1', email: 'admin@recat.local' });
+  mocks.issueMagicLink.mockResolvedValue({ link: 'http://localhost/auth/callback?token=t' });
+  mocks.isSmtpConfigured.mockResolvedValue(false);
+  mocks.devLoginAllowed.mockResolvedValue(true);
   mocks.getInstanceSettings.mockResolvedValue({
     intuitClientId: '',
     smtpHost: '',
@@ -83,5 +105,70 @@ describe('GET /api/setup/status — localAdminEmail', () => {
 
     expect(res.body.needsSetup).toBe(true);
     expect(res.body).not.toHaveProperty('localAdminEmail');
+  });
+});
+
+// First-run has to be unauthenticated — somebody must create the first account.
+// On a deployment reachable before setup that lets whoever arrives first claim
+// the instance, and with no SMTP the response hands them a sign-in link. Umbrel
+// makes it concrete: its dashboard auth is off so the Intuit callback can land.
+// Where a local admin password exists, requiring it proves the caller can see
+// the device without inventing a new secret.
+describe('POST /api/setup/admin — claiming the instance', () => {
+  const claim = (body: Record<string, unknown>) =>
+    request(testApp()).post('/api/setup/admin').send(body);
+
+  beforeEach(() => {
+    mocks.userCount.mockResolvedValue(0);
+  });
+
+  it('creates the admin without a password when local sign-in is off', async () => {
+    await claim({ email: 'me@example.com' }).expect(200);
+    expect(mocks.userUpsert).toHaveBeenCalled();
+  });
+
+  describe('when a local admin password is configured', () => {
+    beforeEach(() => {
+      mocks.localAdminConfig = { enabled: true, email: 'admin@recat.local', password: PASSWORD };
+    });
+
+    it('refuses a claim that omits the password', async () => {
+      const res = await claim({ email: 'attacker@example.com' }).expect(401);
+
+      expect(res.body.code).toBe('INVALID_CREDENTIALS');
+      expect(mocks.userUpsert).not.toHaveBeenCalled();
+    });
+
+    it('refuses a claim with the wrong password', async () => {
+      await claim({ email: 'attacker@example.com', password: 'guess' }).expect(401);
+      expect(mocks.userUpsert).not.toHaveBeenCalled();
+    });
+
+    it('accepts the password the deployment displays', async () => {
+      await claim({ email: 'admin@recat.local', password: PASSWORD }).expect(200);
+      expect(mocks.userUpsert).toHaveBeenCalled();
+    });
+
+    it('rate limits repeated guesses rather than allowing a free brute force', async () => {
+      const app = testApp();
+      const attempt = () =>
+        request(app).post('/api/setup/admin').send({ email: 'a@example.com', password: 'wrong' });
+
+      const codes: number[] = [];
+      for (let i = 0; i < 7; i += 1) codes.push((await attempt()).status);
+
+      // Whatever the exact allowance, it must stop before unlimited and say so.
+      expect(codes).toContain(429);
+      expect(codes.filter((c) => c === 401).length).toBeLessThan(codes.length);
+      expect(mocks.userUpsert).not.toHaveBeenCalled();
+    });
+  });
+
+  it('still refuses once an admin exists, before any password check', async () => {
+    mocks.userCount.mockResolvedValue(1);
+    mocks.localAdminConfig = { enabled: true, email: 'admin@recat.local', password: PASSWORD };
+
+    const res = await claim({ email: 'me@example.com', password: PASSWORD }).expect(409);
+    expect(res.body.code).toBe('ALREADY_SETUP');
   });
 });
