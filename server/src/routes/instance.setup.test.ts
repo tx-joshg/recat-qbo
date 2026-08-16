@@ -46,7 +46,7 @@ vi.mock('../services/instanceSettings.js', async (importOriginal) => {
   return { ...actual, getInstanceSettings: mocks.getInstanceSettings };
 });
 
-const { setupRouter } = await import('./instance.js');
+const { setupRouter, setupClaimLimiter } = await import('./instance.js');
 
 function testApp(): Express {
   const app = express();
@@ -60,6 +60,9 @@ const PASSWORD = 'umbrel-shown-password';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The limiter is module state shared by every request, as it is in
+  // production — reset it so one test's guesses do not throttle the next.
+  setupClaimLimiter.reset();
   mocks.localAdminConfig = { enabled: false, email: '', password: '' };
   mocks.userUpsert.mockResolvedValue({ id: 'u1', email: 'admin@recat.local' });
   mocks.issueMagicLink.mockResolvedValue({ link: 'http://localhost/auth/callback?token=t' });
@@ -149,17 +152,47 @@ describe('POST /api/setup/admin — claiming the instance', () => {
       expect(mocks.userUpsert).toHaveBeenCalled();
     });
 
-    // Behind a reverse proxy every request carries the proxy's address — on
-    // Umbrel TRUSTED_PROXY_IPS is unset by design — so the limiter cannot tell
-    // callers apart and a keyed lockout locks out everyone. Reported from a
-    // real device: five bad guesses froze the wizard for the owner too.
-    it('lets the owner through even after guesses have exhausted the limiter', async () => {
+    // The limiter has to stop guesses being EVALUATED, not just hide their
+    // results. If the password were compared before the bucket was consulted,
+    // an attacker could submit unlimited guesses and a correct one would still
+    // be let through — the 429s would conceal wrong answers while the real
+    // brute force continued.
+    it('stops evaluating guesses once the bucket is exhausted', async () => {
       const app = testApp();
-      const wrong = () =>
-        request(app).post('/api/setup/admin').send({ email: 'a@example.com', password: 'wrong' });
+      const guess = (password: string) =>
+        request(app).post('/api/setup/admin').send({ email: 'a@example.com', password });
 
-      for (let i = 0; i < 8; i += 1) await wrong();
+      for (let i = 0; i < 5; i += 1) await guess('wrong');
+
+      // Even the CORRECT password is refused now — proof the comparison is
+      // gated rather than merely unreported.
+      const res = await guess(PASSWORD).expect(429);
+      expect(res.headers['retry-after']).toBeDefined();
       expect(mocks.userUpsert).not.toHaveBeenCalled();
+    });
+
+    // The lockout is shared, so it must be survivable: the window is a minute,
+    // not the fifteen sign-in uses. Reported from a real device, where a
+    // fifteen-minute bucket froze the wizard for the owner as well.
+    it('bounds the shared lockout to about a minute', async () => {
+      const app = testApp();
+      for (let i = 0; i < 5; i += 1) {
+        await request(app).post('/api/setup/admin').send({ email: 'a@example.com', password: 'x' });
+      }
+
+      const res = await request(app)
+        .post('/api/setup/admin')
+        .send({ email: 'a@example.com', password: 'x' })
+        .expect(429);
+
+      expect(Number(res.headers['retry-after'])).toBeLessThanOrEqual(60);
+    });
+
+    it('forgets earlier failures once a correct password gets through', async () => {
+      const app = testApp();
+      for (let i = 0; i < 3; i += 1) {
+        await request(app).post('/api/setup/admin').send({ email: 'a@example.com', password: 'x' });
+      }
 
       await request(app)
         .post('/api/setup/admin')

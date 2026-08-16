@@ -288,7 +288,22 @@ const adminBody = z.object({
 // inventing a new secret: the deployment already shows that password to its
 // owner (Umbrel prints ${APP_PASSWORD} on the app page), so requiring it proves
 // the caller can see the device. Deployments with no local admin are unchanged.
-const setupClaimLimiter = new LocalLoginLimiter();
+// Short window on purpose. Behind a reverse proxy the limiter cannot tell
+// callers apart — on Umbrel TRUSTED_PROXY_IPS is deliberately unset, so req.ip
+// is app_proxy's address on every request and the bucket is global. A lockout
+// therefore falls on the owner as much as on an attacker, so it has to be
+// survivable: a minute of waiting, not the fifteen sign-in uses.
+//
+// It still has to be a real lockout. Five guesses a minute is ~7k a day, which
+// is nothing against the derived password Umbrel generates, and the throttle is
+// what keeps a weak hand-set LOCAL_ADMIN_PASSWORD (the floor is 12 characters)
+// from being found by brute force.
+const SETUP_CLAIM_MAX_FAILURES = 5;
+const SETUP_CLAIM_WINDOW_MS = 60 * 1000;
+export const setupClaimLimiter = new LocalLoginLimiter(
+  SETUP_CLAIM_MAX_FAILURES,
+  SETUP_CLAIM_WINDOW_MS,
+);
 
 const credentialsBody = z.object({
   clientId: z.string().trim().min(1),
@@ -354,37 +369,35 @@ setupRouter.post(
     // them claim the instance. Rate limited because an un-set-up instance on a
     // public address is otherwise a free brute-force target.
     //
-    // The password is checked BEFORE the limiter is consulted, so a correct one
-    // is never refused. Behind a reverse proxy the limiter cannot tell callers
-    // apart: on Umbrel TRUSTED_PROXY_IPS is deliberately unset (see
-    // umbrel/README-umbrel.md), so req.ip is app_proxy's address on every
-    // request and the bucket is effectively global. Gating the check on the
-    // limiter therefore let anyone's wrong guesses lock the owner out of their
-    // own first-run — reported from a real device, five bad guesses froze the
-    // wizard for everyone for fifteen minutes.
+    // The limiter gates the comparison, and must. Checking the password first
+    // and only penalising failures reads like it protects the owner from an
+    // attacker's guesses — but it means every request is compared no matter how
+    // many have come before, so the 429s only hide the RESULT of wrong guesses
+    // instead of limiting attempts. Unlimited guessing against a password whose
+    // floor is 12 characters is the takeover this guard exists to stop.
     //
-    // Penalising only failures keeps that impossible while losing nothing: an
-    // attacker has no correct password to be let through with. The check is a
-    // SHA-256 and a constant-time compare, with no database work, so doing it
-    // first cannot be used to make the server do expensive things.
+    // A shared bucket is the reason that shortcut was tempting: with
+    // TRUSTED_PROXY_IPS unset by design, req.ip is the proxy's address for
+    // everyone, so a lockout falls on the owner too. The answer is a short
+    // window (see above), not an unenforced one — the owner waits up to a
+    // minute, rather than being denied their instance for fifteen.
     if (localAdminConfig.enabled) {
       const source = req.ip || req.socket.remoteAddress || 'unknown';
-      const correct =
-        password !== undefined && localAdminPasswordMatches(password, localAdminConfig.password);
-      if (correct) {
-        setupClaimLimiter.clear(source);
-      } else {
-        const limit = setupClaimLimiter.acquire(source);
-        if (!limit.allowed) {
-          res.setHeader('Retry-After', String(limit.retryAfterSeconds));
-          throw new HttpError(429, 'Too many attempts — try again later', 'RATE_LIMITED');
-        }
+      const limit = setupClaimLimiter.acquire(source);
+      if (!limit.allowed) {
+        res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+        throw new HttpError(429, 'Too many attempts — try again in a minute', 'RATE_LIMITED');
+      }
+      if (password === undefined || !localAdminPasswordMatches(password, localAdminConfig.password)) {
         throw new HttpError(
           401,
           'Incorrect password. Use the app password this deployment shows you.',
           'INVALID_CREDENTIALS',
         );
       }
+      // A correct password costs nothing: release this attempt and forget the
+      // failures, so a legitimate claim never leaves the bucket poisoned.
+      setupClaimLimiter.clear(source);
     }
     const user = await prisma.user.upsert({
       where: { email },
