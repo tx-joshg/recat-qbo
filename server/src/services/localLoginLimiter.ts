@@ -22,13 +22,17 @@ export const LOCAL_LOGIN_SHARED_WINDOW_MS = 60 * 1000;
  * ~7k a day, negligible against a password whose floor is 12 characters, and it
  * keeps the owner's wait to seconds rather than a quarter of an hour.
  *
- * A deployment with no proxy at all also gets the short window, because nothing
- * in a request proves that (X-Forwarded-For is forgeable). That is the
- * conservative direction: a slightly weaker throttle where a stronger one would
- * have been safe, rather than a denial-of-service where it is not.
+ * Pass the answer from hasUsableTrustedProxy, which is false for a setting that
+ * looks configured but matches nothing (a CIDR, a stray comma) — those leave the
+ * key shared just as surely as an empty setting does.
+ *
+ * The short window is a fallback, not the fix: against an attacker who keeps
+ * polling it does not bound the owner's wait at all, because each freed slot is
+ * taken again immediately. The fix is making the key per-client in the first
+ * place — TRUSTED_PROXY_HOP on deployments whose only route in is a proxy.
  */
-export function loginLockoutWindowMs(trustedProxyIps: string): number {
-  return trustedProxyIps.trim() === '' ? LOCAL_LOGIN_SHARED_WINDOW_MS : LOCAL_LOGIN_WINDOW_MS;
+export function loginLockoutWindowMs(perClientKeys: boolean): number {
+  return perClientKeys ? LOCAL_LOGIN_WINDOW_MS : LOCAL_LOGIN_SHARED_WINDOW_MS;
 }
 
 export interface LocalLoginReservation {

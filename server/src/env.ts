@@ -126,6 +126,15 @@ const schema = z.object({
   LOCAL_ADMIN_EMAIL: z.string().optional().default(''),
   LOCAL_ADMIN_PASSWORD: z.string().optional().default(''),
   TRUSTED_PROXY_IPS: z.string().optional().default(''),
+  // Trust the immediate peer as a reverse proxy when it is on a private
+  // network. For deployments whose app port is not published and whose only
+  // route in is a container-network proxy — the Umbrel package. Without it,
+  // every caller behind that proxy shares one req.ip and rate limiting is
+  // deployment-wide (#57).
+  TRUSTED_PROXY_HOP: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
   DIGEST_HOUR: z.coerce.number().min(0).max(23).default(8),
   NODE_ENV: z.string().default('development'),
 });

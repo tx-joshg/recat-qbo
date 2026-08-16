@@ -53,7 +53,7 @@ import { MCP_SCHEMA_BOUNDS } from './mcp/schemaBounds.js';
 import { allowedOrigins } from './services/publicUrl.js';
 
 const app = express();
-app.set('trust proxy', compileTrustedProxy(env.TRUSTED_PROXY_IPS));
+app.set('trust proxy', compileTrustedProxy(env.TRUSTED_PROXY_IPS, env.TRUSTED_PROXY_HOP));
 app.disable('x-powered-by');
 
 app.use(cookieParser());

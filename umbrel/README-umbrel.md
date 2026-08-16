@@ -147,20 +147,30 @@ cover it on Umbrel, which is what made closing it properly worth doing.
 
 ## Notes on specific choices
 
-**No `TRUSTED_PROXY_IPS`.** The `app_proxy` container's address is assigned by
-Docker and is not exposed as a variable. Unset is the safe failure mode:
-`X-Forwarded-For` is ignored, so per-IP rate limiting counts the proxy rather
-than the client. Trusting a guessed CIDR would instead let a client spoof its
-source address.
+**`TRUSTED_PROXY_HOP`, not `TRUSTED_PROXY_IPS`.** The `app_proxy` container's
+address is assigned by Docker and is not exposed as a variable, so there is
+nothing to list — and `compileTrustedProxy` is an exact-match allowlist, so a
+guessed CIDR would never match anything.
 
-The cost is that every rate-limit bucket is deployment-wide, so a lockout falls
-on the owner as much as on an attacker. Recat compensates by shortening the
-lockouts it cannot key per client: sign-in and first-run both lock for a minute
-here rather than the fifteen a per-client key would justify
-([#57](https://github.com/tx-joshg/recat-qbo/issues/57)). Five guesses a minute
-is negligible against the generated `${APP_PASSWORD}`, and it means anonymous
-traffic cannot hold the owner out of an install whose only way in is that
-password.
+`TRUSTED_PROXY_HOP=true` instead trusts the immediate peer as a reverse proxy,
+**but only when that peer is on a private network**. That is sound here because
+this package declares no `ports:` for the server: `app_proxy`, on the app
+network, is the only route to it.
+
+This matters more than it sounds. Rate limiters key on `req.ip`. Without a
+per-client address every caller behind the proxy shares one bucket, so a lockout
+falls on the owner as much as on an attacker — and five wrong passwords from
+anyone locks local sign-in for everyone, renewed indefinitely for as long as the
+attacker keeps going. On an install with no SMTP that is the only way in, so it
+was a permanent denial of access ([#57](https://github.com/tx-joshg/recat-qbo/issues/57)).
+Shortening the lockout does not help: measured against a persistent attacker,
+the owner gets in **zero** times an hour at every attacker rate. The key has to
+identify one client.
+
+The private-address requirement is the safety net. If the port ever does become
+directly reachable, a public client's forwarded headers are ignored and it is
+limited on its own real address — the failure mode degrades to the old shared
+behaviour rather than to believing a stranger's claim about who they are.
 
 **Bind mount, not a named volume.** Umbrel backs up and restores
 `${APP_DATA_DIR}` and recreates containers on update; a named volume would sit

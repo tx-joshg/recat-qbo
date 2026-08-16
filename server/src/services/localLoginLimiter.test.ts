@@ -5,6 +5,7 @@ import {
   LocalLoginLimiter,
   loginLockoutWindowMs,
 } from './localLoginLimiter.js';
+import { hasUsableTrustedProxy } from './trustedProxy.js';
 
 describe('LocalLoginLimiter', () => {
   it('synchronously reserves five attempts and blocks the sixth with Retry-After', () => {
@@ -61,18 +62,24 @@ describe('LocalLoginLimiter', () => {
 // address, so a fifteen-minute bucket lets anyone deny local sign-in for
 // everyone, indefinitely. On a no-SMTP deployment that is the only way in. (#57)
 describe('loginLockoutWindowMs', () => {
-  it('keeps the full lockout when a trusted proxy makes keys per-client', () => {
-    expect(loginLockoutWindowMs('10.0.0.5')).toBe(LOCAL_LOGIN_WINDOW_MS);
-    expect(loginLockoutWindowMs('127.0.0.1,::1')).toBe(LOCAL_LOGIN_WINDOW_MS);
+  it('keeps the full lockout when keys identify one client', () => {
+    expect(loginLockoutWindowMs(true)).toBe(LOCAL_LOGIN_WINDOW_MS);
   });
 
-  it('shortens it when nothing proves callers can be told apart', () => {
-    expect(loginLockoutWindowMs('')).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
-    expect(loginLockoutWindowMs('   ')).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
-  });
-
-  it('bounds the shared lockout to a minute, well under the full one', () => {
+  // The short window is a fallback, not a fix: against an attacker who keeps
+  // polling it does not bound the owner's wait, because each freed slot is
+  // taken again immediately. It only limits the damage of a misconfiguration.
+  it('shortens it when the key is shared, to limit the blast radius', () => {
+    expect(loginLockoutWindowMs(false)).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
     expect(LOCAL_LOGIN_SHARED_WINDOW_MS).toBeLessThan(LOCAL_LOGIN_WINDOW_MS);
-    expect(LOCAL_LOGIN_SHARED_WINDOW_MS).toBeLessThanOrEqual(60_000);
+  });
+
+  it('treats a proxy setting that matches nothing as shared', () => {
+    // CIDR entries are never matched by compileTrustedProxy, so a deployment
+    // configured that way still shares one key (#57, codex review on #60).
+    expect(loginLockoutWindowMs(hasUsableTrustedProxy('10.0.0.0/8')))
+      .toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
+    expect(loginLockoutWindowMs(hasUsableTrustedProxy('', true)))
+      .toBe(LOCAL_LOGIN_WINDOW_MS);
   });
 });

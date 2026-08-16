@@ -206,43 +206,32 @@ describe('local auth routes', () => {
     }
   });
 
-  // The shared-bucket case (#57): with no trusted proxy every caller keys to the
-  // same address, so the lockout must expire fast enough that an attacker
-  // cannot hold the owner out of the only sign-in a no-SMTP deployment has.
-  it('recovers within the shared window after anonymous traffic exhausts the bucket', async () => {
-    // Only Date is faked — faking timers would freeze supertest's own HTTP.
-    vi.useFakeTimers({ toFake: ['Date'] });
-    const startedAt = Date.now();
-    try {
-      const authenticate = vi
-        .fn<LocalAuthDependencies['authenticate']>()
-        .mockResolvedValue(null);
-      const limiter = new LocalLoginLimiter(
-        LOCAL_LOGIN_MAX_FAILURES,
-        loginLockoutWindowMs(''), // no TRUSTED_PROXY_IPS → shared bucket
-      );
-      const instance = app(dependencies({ authenticate, limiter }));
+  // With a per-client key — which TRUSTED_PROXY_HOP gives the Umbrel package —
+  // a lockout only reaches the client that earned it. That is the actual fix
+  // for #57; the shorter shared window below is only damage limitation.
+  it('locks out the guessing client without touching another client', async () => {
+    const authenticate = vi.fn<LocalAuthDependencies['authenticate']>().mockResolvedValue(null);
+    const instance = app(dependencies({ authenticate }), TEST_PROXY_IPS);
 
-      // An attacker burns the deployment-wide budget.
-      for (let attempt = 0; attempt < LOCAL_LOGIN_MAX_FAILURES; attempt += 1) {
-        await request(instance).post('/auth/local').send({ email: ADMIN.email, password: 'wrong' });
-      }
+    for (let attempt = 0; attempt < LOCAL_LOGIN_MAX_FAILURES; attempt += 1) {
       await request(instance)
         .post('/auth/local')
-        .send({ email: ADMIN.email, password: 'correct horse battery staple' })
-        .expect(429);
-
-      // The owner is not locked out for a quarter of an hour — a minute later
-      // the same credentials work.
-      vi.setSystemTime(startedAt + LOCAL_LOGIN_SHARED_WINDOW_MS + 1_000);
-      authenticate.mockResolvedValue(ADMIN);
-      await request(instance)
-        .post('/auth/local')
-        .send({ email: ADMIN.email, password: 'correct horse battery staple' })
-        .expect(200);
-    } finally {
-      vi.useRealTimers();
+        .set('X-Forwarded-For', '198.51.100.9')
+        .send({ email: ADMIN.email, password: 'wrong' });
     }
+    await request(instance)
+      .post('/auth/local')
+      .set('X-Forwarded-For', '198.51.100.9')
+      .send({ email: ADMIN.email, password: 'wrong' })
+      .expect(429);
+
+    // The owner, on a different address, is unaffected.
+    authenticate.mockResolvedValue(ADMIN);
+    await request(instance)
+      .post('/auth/local')
+      .set('X-Forwarded-For', '203.0.113.4')
+      .send({ email: ADMIN.email, password: 'correct horse battery staple' })
+      .expect(200);
   });
 
   it('blocks a direct untrusted peer that rotates X-Forwarded-For values', async () => {

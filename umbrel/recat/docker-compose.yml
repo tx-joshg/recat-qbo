@@ -52,12 +52,23 @@ services:
       LOCAL_ADMIN_EMAIL: admin@recat.local
       LOCAL_ADMIN_PASSWORD: ${APP_PASSWORD}
 
-      # TRUSTED_PROXY_IPS is deliberately unset. The app_proxy container's
-      # address is assigned by Docker and is not exposed as an Umbrel variable,
-      # and the default of trusting nothing is the safe failure mode:
-      # X-Forwarded-For is ignored, so per-IP rate limiting counts the proxy
-      # rather than the client. Trusting a guessed CIDR would instead let a
-      # client spoof its own source address.
+      # TRUSTED_PROXY_IPS stays unset — app_proxy's address is assigned by
+      # Docker and is not exposed as an Umbrel variable, so there is nothing to
+      # list, and a guessed CIDR would never match (compileTrustedProxy is an
+      # exact-match allowlist by design).
+      #
+      # TRUSTED_PROXY_HOP covers it instead: trust the immediate peer as a
+      # reverse proxy when that peer is on a private network. Safe here because
+      # this compose declares no `ports:` for the server, so app_proxy on the
+      # app network is the only route to it. Should that ever change, a public
+      # client's forwarded headers are ignored — the private-address check
+      # makes the failure mode "no worse than before" rather than "believes a
+      # stranger".
+      #
+      # Without it every caller shares app_proxy's address, so every rate limit
+      # is deployment-wide and anyone can lock the owner out of local sign-in
+      # indefinitely — the only way in on an install with no SMTP (#57).
+      TRUSTED_PROXY_HOP: 'true'
 
       RECEIPT_EXTRACTOR_URL: http://recat_receipt-extractor_1:8485
       RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}

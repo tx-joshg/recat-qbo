@@ -19,6 +19,7 @@ import {
   LocalLoginLimiter,
   loginLockoutWindowMs,
 } from '../services/localLoginLimiter.js';
+import { hasUsableTrustedProxy } from '../services/trustedProxy.js';
 import { toUserDto } from './auth.js';
 
 const localLoginBody = z.object({
@@ -43,7 +44,7 @@ const realDependencies: LocalAuthDependencies = {
   // is deployment-wide, so a long lockout denies the owner, not the attacker.
   limiter: new LocalLoginLimiter(
     LOCAL_LOGIN_MAX_FAILURES,
-    loginLockoutWindowMs(env.TRUSTED_PROXY_IPS),
+    loginLockoutWindowMs(hasUsableTrustedProxy(env.TRUSTED_PROXY_IPS, env.TRUSTED_PROXY_HOP)),
   ),
   cookieOptions: sessionCookieOptions,
 };
