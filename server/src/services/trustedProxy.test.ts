@@ -88,6 +88,12 @@ describe('isPrivateAddress', () => {
     }
   });
 
+  it('rejects malformed values rather than pattern-matching them', () => {
+    for (const v of [':', '2001:::1', 'fd-not-an-address', '', 'fe']) {
+      expect(isPrivateAddress(v), v).toBe(false);
+    }
+  });
+
   it('sees through IPv4-mapped IPv6', () => {
     expect(isPrivateAddress('::ffff:10.0.0.1')).toBe(true);
     expect(isPrivateAddress('::ffff:8.8.8.8')).toBe(false);
@@ -110,5 +116,10 @@ describe('hasUsableTrustedProxy', () => {
     expect(hasUsableTrustedProxy('10.0.0.0/8')).toBe(false); // CIDR is never matched
     expect(hasUsableTrustedProxy('not-an-ip')).toBe(false);
     expect(hasUsableTrustedProxy('999.1.1.1')).toBe(false);
+    // Shape checks alone accept these; only a real parser rejects them.
+    expect(hasUsableTrustedProxy(':')).toBe(false);
+    expect(hasUsableTrustedProxy('2001:::1')).toBe(false);
+    expect(hasUsableTrustedProxy('::ffff:')).toBe(false);
+    expect(hasUsableTrustedProxy('1.2.3')).toBe(false);
   });
 });

@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 export type TrustProxyCallback = (ip: string, hop: number) => boolean;
 
 function normalizeIp(ip: string): string {
@@ -5,13 +7,14 @@ function normalizeIp(ip: string): string {
   return trimmed.toLowerCase().startsWith('::ffff:') ? trimmed.slice('::ffff:'.length) : trimmed;
 }
 
-/** Rejects CIDR, empty and malformed entries — see hasUsableTrustedProxy. */
+/**
+ * A real address, via the standard parser. Hand-rolled shape checks are too
+ * permissive to decide this: ':' and '2001:::1' look like IPv6 to a regex but
+ * can never equal a socket peer, so treating them as usable would select the
+ * long lockout while compileTrustedProxy still trusted nothing.
+ */
 function isIpAddress(value: string): boolean {
-  if (value === '' || value.includes('/')) return false;
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
-    return value.split('.').every((part) => Number(part) <= 255);
-  }
-  return value.includes(':') && /^[0-9a-f:.]+$/i.test(value);
+  return isIP(value) !== 0;
 }
 
 /**
@@ -22,7 +25,8 @@ function isIpAddress(value: string): boolean {
  */
 export function isPrivateAddress(ip: string): boolean {
   const addr = normalizeIp(ip).toLowerCase();
-  if (addr === '::1' || addr === 'localhost') return true;
+  if (isIP(addr) === 0) return false;
+  if (addr === '::1') return true;
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(addr)) {
     const [a = 0, b = 0] = addr.split('.').map(Number);
     if (a === 10 || a === 127) return true;
