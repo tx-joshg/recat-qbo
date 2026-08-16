@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { LocalLoginLimiter, LOCAL_LOGIN_WINDOW_MS } from './localLoginLimiter.js';
+import {
+  LOCAL_LOGIN_SHARED_WINDOW_MS,
+  LOCAL_LOGIN_WINDOW_MS,
+  LocalLoginLimiter,
+  loginLockoutWindowMs,
+} from './localLoginLimiter.js';
 
 describe('LocalLoginLimiter', () => {
   it('synchronously reserves five attempts and blocks the sixth with Retry-After', () => {
@@ -47,5 +52,27 @@ describe('LocalLoginLimiter', () => {
     expect(limiter.acquire('ip', 11).allowed).toBe(false);
     limiter.release(second.reservation);
     expect(limiter.acquire('ip', 12).allowed).toBe(true);
+  });
+});
+
+// A lockout is only safe to make long when its key identifies one client.
+// Behind a reverse proxy with TRUSTED_PROXY_IPS unset — the default, and what
+// the Umbrel package deliberately ships — every caller shares the proxy's
+// address, so a fifteen-minute bucket lets anyone deny local sign-in for
+// everyone, indefinitely. On a no-SMTP deployment that is the only way in. (#57)
+describe('loginLockoutWindowMs', () => {
+  it('keeps the full lockout when a trusted proxy makes keys per-client', () => {
+    expect(loginLockoutWindowMs('10.0.0.5')).toBe(LOCAL_LOGIN_WINDOW_MS);
+    expect(loginLockoutWindowMs('127.0.0.1,::1')).toBe(LOCAL_LOGIN_WINDOW_MS);
+  });
+
+  it('shortens it when nothing proves callers can be told apart', () => {
+    expect(loginLockoutWindowMs('')).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
+    expect(loginLockoutWindowMs('   ')).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
+  });
+
+  it('bounds the shared lockout to a minute, well under the full one', () => {
+    expect(LOCAL_LOGIN_SHARED_WINDOW_MS).toBeLessThan(LOCAL_LOGIN_WINDOW_MS);
+    expect(LOCAL_LOGIN_SHARED_WINDOW_MS).toBeLessThanOrEqual(60_000);
   });
 });

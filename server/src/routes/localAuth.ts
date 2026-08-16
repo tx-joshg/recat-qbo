@@ -2,7 +2,7 @@ import type { CookieOptions } from 'express';
 import { Router } from 'express';
 import { z } from 'zod';
 import type { AuthMethodsDto, SessionDto } from '@recat/shared';
-import { localAdminConfig } from '../env.js';
+import { env, localAdminConfig } from '../env.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
 import {
   createSession,
@@ -14,7 +14,11 @@ import {
   type LocalAdminUser,
 } from '../services/localAdminAuth.js';
 import type { LocalAdminConfig } from '../services/localAdminConfig.js';
-import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
+import {
+  LOCAL_LOGIN_MAX_FAILURES,
+  LocalLoginLimiter,
+  loginLockoutWindowMs,
+} from '../services/localLoginLimiter.js';
 import { toUserDto } from './auth.js';
 
 const localLoginBody = z.object({
@@ -34,7 +38,13 @@ const realDependencies: LocalAuthDependencies = {
   config: localAdminConfig,
   authenticate: (email, password) => authenticateLocalAdmin(email, password),
   createSession,
-  limiter: new LocalLoginLimiter(),
+  // Window follows whether req.ip can actually tell callers apart — see
+  // loginLockoutWindowMs. Behind a proxy with no TRUSTED_PROXY_IPS the bucket
+  // is deployment-wide, so a long lockout denies the owner, not the attacker.
+  limiter: new LocalLoginLimiter(
+    LOCAL_LOGIN_MAX_FAILURES,
+    loginLockoutWindowMs(env.TRUSTED_PROXY_IPS),
+  ),
   cookieOptions: sessionCookieOptions,
 };
 

@@ -2,7 +2,12 @@ import express from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { errorMiddleware } from '../lib/http.js';
-import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
+import {
+  LOCAL_LOGIN_MAX_FAILURES,
+  LOCAL_LOGIN_SHARED_WINDOW_MS,
+  LocalLoginLimiter,
+  loginLockoutWindowMs,
+} from '../services/localLoginLimiter.js';
 import { compileTrustedProxy } from '../services/trustedProxy.js';
 import { createLocalAuthRouter, type LocalAuthDependencies } from './localAuth.js';
 
@@ -198,6 +203,45 @@ describe('local auth routes', () => {
         .expect(429);
     } finally {
       consoleError.mockRestore();
+    }
+  });
+
+  // The shared-bucket case (#57): with no trusted proxy every caller keys to the
+  // same address, so the lockout must expire fast enough that an attacker
+  // cannot hold the owner out of the only sign-in a no-SMTP deployment has.
+  it('recovers within the shared window after anonymous traffic exhausts the bucket', async () => {
+    // Only Date is faked — faking timers would freeze supertest's own HTTP.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const startedAt = Date.now();
+    try {
+      const authenticate = vi
+        .fn<LocalAuthDependencies['authenticate']>()
+        .mockResolvedValue(null);
+      const limiter = new LocalLoginLimiter(
+        LOCAL_LOGIN_MAX_FAILURES,
+        loginLockoutWindowMs(''), // no TRUSTED_PROXY_IPS → shared bucket
+      );
+      const instance = app(dependencies({ authenticate, limiter }));
+
+      // An attacker burns the deployment-wide budget.
+      for (let attempt = 0; attempt < LOCAL_LOGIN_MAX_FAILURES; attempt += 1) {
+        await request(instance).post('/auth/local').send({ email: ADMIN.email, password: 'wrong' });
+      }
+      await request(instance)
+        .post('/auth/local')
+        .send({ email: ADMIN.email, password: 'correct horse battery staple' })
+        .expect(429);
+
+      // The owner is not locked out for a quarter of an hour — a minute later
+      // the same credentials work.
+      vi.setSystemTime(startedAt + LOCAL_LOGIN_SHARED_WINDOW_MS + 1_000);
+      authenticate.mockResolvedValue(ADMIN);
+      await request(instance)
+        .post('/auth/local')
+        .send({ email: ADMIN.email, password: 'correct horse battery staple' })
+        .expect(200);
+    } finally {
+      vi.useRealTimers();
     }
   });
 

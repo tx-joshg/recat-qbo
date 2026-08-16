@@ -153,6 +153,15 @@ Docker and is not exposed as a variable. Unset is the safe failure mode:
 than the client. Trusting a guessed CIDR would instead let a client spoof its
 source address.
 
+The cost is that every rate-limit bucket is deployment-wide, so a lockout falls
+on the owner as much as on an attacker. Recat compensates by shortening the
+lockouts it cannot key per client: sign-in and first-run both lock for a minute
+here rather than the fifteen a per-client key would justify
+([#57](https://github.com/tx-joshg/recat-qbo/issues/57)). Five guesses a minute
+is negligible against the generated `${APP_PASSWORD}`, and it means anonymous
+traffic cannot hold the owner out of an install whose only way in is that
+password.
+
 **Bind mount, not a named volume.** Umbrel backs up and restores
 `${APP_DATA_DIR}` and recreates containers on update; a named volume would sit
 outside that.

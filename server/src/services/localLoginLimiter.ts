@@ -1,5 +1,35 @@
 export const LOCAL_LOGIN_MAX_FAILURES = 5;
 export const LOCAL_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+/** Used when the limiter's keys cannot distinguish callers — see below. */
+export const LOCAL_LOGIN_SHARED_WINDOW_MS = 60 * 1000;
+
+/**
+ * How long a lockout should last, given the deployment's trusted-proxy setting.
+ *
+ * The limiter keys on `req.ip`. That is a per-client key only when Express can
+ * trust a forwarded address — which requires TRUSTED_PROXY_IPS to name the
+ * proxy. Unset (the default, and what the Umbrel package ships, deliberately,
+ * so a client cannot spoof its own address) every request behind a reverse
+ * proxy carries the proxy's address, and the bucket is deployment-wide.
+ *
+ * A fifteen-minute lockout on a per-client key only ever punishes the client
+ * doing the guessing. On a shared key it punishes everyone, and an attacker can
+ * renew it indefinitely — permanently denying local sign-in, which on a
+ * no-SMTP deployment is the only way in (#57).
+ *
+ * So the window follows what the key can prove: the full lockout when clients
+ * are distinguishable, a minute when they are not. Five guesses a minute is
+ * ~7k a day, negligible against a password whose floor is 12 characters, and it
+ * keeps the owner's wait to seconds rather than a quarter of an hour.
+ *
+ * A deployment with no proxy at all also gets the short window, because nothing
+ * in a request proves that (X-Forwarded-For is forgeable). That is the
+ * conservative direction: a slightly weaker throttle where a stronger one would
+ * have been safe, rather than a denial-of-service where it is not.
+ */
+export function loginLockoutWindowMs(trustedProxyIps: string): number {
+  return trustedProxyIps.trim() === '' ? LOCAL_LOGIN_SHARED_WINDOW_MS : LOCAL_LOGIN_WINDOW_MS;
+}
 
 export interface LocalLoginReservation {
   readonly source: string;
