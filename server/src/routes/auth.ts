@@ -10,7 +10,8 @@ import { env } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
-import { devLoginAllowed } from '../services/devLogin.js';
+import { devLoginAllowed, localAdminLockdown } from '../services/devLogin.js';
+import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
 import {
   clearCookieOptions,
   createSession,
@@ -36,20 +37,40 @@ export function toUserDto(user: User & { memberships: Membership[] }): UserDto {
 
 const magicLinkBody = z.object({ email: z.string().trim().toLowerCase().email() });
 
+// Every request writes a token row and a mail (or log line), so issuance is
+// throttled per source. Behind a reverse proxy the bucket is shared (see the
+// setup limiter in routes/instance.ts for why) — five a minute is plenty for a
+// human signing in and bounds what an anonymous caller can grow the token
+// table and server log by. Exported so tests can reset the shared state.
+export const magicLinkLimiter = new LocalLoginLimiter(5, 60 * 1000);
+
 export const authRouter = Router();
 
 // Always 200 {ok:true} — no user enumeration. First run (zero users in the
-// DB) creates the requester as admin on the fly.
+// DB) creates the requester as admin on the fly, EXCEPT on local-admin
+// deployments — see localAdminLockdown.
 authRouter.post(
   '/auth/magic-link',
   asyncHandler(async (req, res) => {
+    const source = req.ip || req.socket.remoteAddress || 'unknown';
+    const limit = magicLinkLimiter.acquire(source);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      throw new HttpError(429, 'Too many requests — try again in a minute', 'RATE_LIMITED');
+    }
+
     const { email } = validate(magicLinkBody)(req.body);
 
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
       const totalUsers = await prisma.user.count();
-      if (totalUsers === 0) {
-        // First-ever user bootstraps the instance as its instance admin.
+      // First-ever user bootstraps the instance as its instance admin — but
+      // never when a local admin password is configured. That password gates
+      // first-run via POST /api/setup/admin; letting this unauthenticated
+      // route create the account instead would hand the instance to whoever
+      // reached it first, or at minimum let them squat the first-admin slot
+      // so the owner's wizard 409s. (#53)
+      if (totalUsers === 0 && !localAdminLockdown()) {
         user = await prisma.user.create({
           data: { email, isInstanceAdmin: true, invitePending: false },
         });
@@ -63,9 +84,13 @@ authRouter.post(
     if (user) {
       const { link } = await issueMagicLink(user);
       // Dev convenience: no SMTP configured → let the UI offer "open the
-      // magic link →" directly. Auto-locked the moment a real (non-demo)
-      // company is connected, unless ALLOW_DEV_LOGIN=true forces it.
-      if (!smtp && (await devLoginAllowed())) devLink = link;
+      // magic link →" directly. Never on a local-admin deployment: this route
+      // is unauthenticated and the admin address is published (Umbrel's
+      // defaultUsername), so a response-body link is an admin session for the
+      // asking. The link still reaches the server log for the operator, which
+      // the login screen points to. Otherwise auto-locked the moment a real
+      // (non-demo) company is connected, unless ALLOW_DEV_LOGIN=true forces it.
+      if (!smtp && !localAdminLockdown() && (await devLoginAllowed())) devLink = link;
     }
 
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });

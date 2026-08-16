@@ -31,6 +31,18 @@ export async function issueMagicLink(
   options: IssueMagicLinkOptions = {},
 ): Promise<{ link: string }> {
   const token = randomToken(32);
+  // Housekeeping: drop this user's spent and expired tokens first, so repeated
+  // unauthenticated requests (the login screen's magic-link button is public)
+  // cannot grow the table without bound. Tokens are only ever created for
+  // existing users, so live rows stay bounded by users × the issuance rate
+  // within one TTL. Spent rows are safe to drop — consumption is recorded by
+  // flipping usedAt, and a used token is invalid whether or not the row exists.
+  await prisma.magicLinkToken.deleteMany({
+    where: {
+      userId: user.id,
+      OR: [{ usedAt: { not: null } }, { expiresAt: { lt: new Date() } }],
+    },
+  });
   await prisma.magicLinkToken.create({
     data: {
       tokenHash: sha256Hex(token),

@@ -121,6 +121,18 @@ proves the caller can see the device. Attempts are rate limited, so a public
 instance is not a free brute-force target. Deployments with no `LOCAL_ADMIN_*`
 configured are unaffected and still set up without a password.
 
+**And `POST /auth/magic-link` is locked down on local-admin deployments** —
+the first version of the guard was bypassable through it, caught by codex review
+after v0.1.2 shipped. That unauthenticated route used to bootstrap the first
+admin for whoever asked, and to return the sign-in link in the response body
+whenever SMTP was absent and no real company was connected — an admin session
+for the asking, since the admin address is published right in this manifest.
+When `LOCAL_ADMIN_*` is configured it now does neither: the password-gated
+wizard is the only bootstrap, and issued links reach the server log only (which
+the login screen already points to). Issuance is also rate limited and expired
+tokens are pruned, so anonymous traffic cannot grow the database or logs
+without bound. `ALLOW_DEV_LOGIN=true` restores dev behavior explicitly.
+
 Still worth doing, because defence in depth costs nothing here:
 
 - **Prefer a private front.** Tailscale Serve keeps the app on your tailnet;

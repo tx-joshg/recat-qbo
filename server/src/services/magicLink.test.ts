@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   magicLinkToken: {
     create: vi.fn(),
+    deleteMany: vi.fn(),
     findUnique: vi.fn(),
     updateMany: vi.fn(),
   },
@@ -34,6 +35,7 @@ const USER = { id: 'u1', email: 'josh@example.com' };
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.magicLinkToken.create.mockResolvedValue({});
+  mocks.magicLinkToken.deleteMany.mockResolvedValue({ count: 0 });
   mocks.magicLinkToken.updateMany.mockResolvedValue({ count: 1 });
   mocks.user.update.mockResolvedValue({ id: USER.id, email: USER.email, invitePending: false });
 });
@@ -45,6 +47,19 @@ function tokenFromLink(link: string): string {
 }
 
 describe('issueMagicLink', () => {
+  it("prunes only this user's spent and expired tokens before issuing", async () => {
+    await issueMagicLink(USER);
+
+    // The request route is public, so issuance must not grow the table
+    // without bound — but it must never touch live tokens or other users.
+    const del = mocks.magicLinkToken.deleteMany.mock.calls[0]?.[0] as {
+      where: { userId: string; OR: unknown[] };
+    };
+    expect(del.where.userId).toBe(USER.id);
+    expect(del.where.OR).toHaveLength(2);
+    expect(mocks.magicLinkToken.create).toHaveBeenCalledOnce();
+  });
+
   it('stores only the sha256 hash of the token, with a 15-minute expiry', async () => {
     const before = Date.now();
     const { link } = await issueMagicLink(USER);
