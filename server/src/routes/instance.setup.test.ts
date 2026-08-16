@@ -149,6 +149,25 @@ describe('POST /api/setup/admin — claiming the instance', () => {
       expect(mocks.userUpsert).toHaveBeenCalled();
     });
 
+    // Behind a reverse proxy every request carries the proxy's address — on
+    // Umbrel TRUSTED_PROXY_IPS is unset by design — so the limiter cannot tell
+    // callers apart and a keyed lockout locks out everyone. Reported from a
+    // real device: five bad guesses froze the wizard for the owner too.
+    it('lets the owner through even after guesses have exhausted the limiter', async () => {
+      const app = testApp();
+      const wrong = () =>
+        request(app).post('/api/setup/admin').send({ email: 'a@example.com', password: 'wrong' });
+
+      for (let i = 0; i < 8; i += 1) await wrong();
+      expect(mocks.userUpsert).not.toHaveBeenCalled();
+
+      await request(app)
+        .post('/api/setup/admin')
+        .send({ email: 'admin@recat.local', password: PASSWORD })
+        .expect(200);
+      expect(mocks.userUpsert).toHaveBeenCalled();
+    });
+
     it('rate limits repeated guesses rather than allowing a free brute force', async () => {
       const app = testApp();
       const attempt = () =>

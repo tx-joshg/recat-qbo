@@ -353,21 +353,38 @@ setupRouter.post(
     // Prove the caller can see the deployment's own password before letting
     // them claim the instance. Rate limited because an un-set-up instance on a
     // public address is otherwise a free brute-force target.
+    //
+    // The password is checked BEFORE the limiter is consulted, so a correct one
+    // is never refused. Behind a reverse proxy the limiter cannot tell callers
+    // apart: on Umbrel TRUSTED_PROXY_IPS is deliberately unset (see
+    // umbrel/README-umbrel.md), so req.ip is app_proxy's address on every
+    // request and the bucket is effectively global. Gating the check on the
+    // limiter therefore let anyone's wrong guesses lock the owner out of their
+    // own first-run — reported from a real device, five bad guesses froze the
+    // wizard for everyone for fifteen minutes.
+    //
+    // Penalising only failures keeps that impossible while losing nothing: an
+    // attacker has no correct password to be let through with. The check is a
+    // SHA-256 and a constant-time compare, with no database work, so doing it
+    // first cannot be used to make the server do expensive things.
     if (localAdminConfig.enabled) {
       const source = req.ip || req.socket.remoteAddress || 'unknown';
-      const limit = setupClaimLimiter.acquire(source);
-      if (!limit.allowed) {
-        res.setHeader('Retry-After', String(limit.retryAfterSeconds));
-        throw new HttpError(429, 'Too many attempts — try again later', 'RATE_LIMITED');
-      }
-      if (password === undefined || !localAdminPasswordMatches(password, localAdminConfig.password)) {
+      const correct =
+        password !== undefined && localAdminPasswordMatches(password, localAdminConfig.password);
+      if (correct) {
+        setupClaimLimiter.clear(source);
+      } else {
+        const limit = setupClaimLimiter.acquire(source);
+        if (!limit.allowed) {
+          res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+          throw new HttpError(429, 'Too many attempts — try again later', 'RATE_LIMITED');
+        }
         throw new HttpError(
           401,
           'Incorrect password. Use the app password this deployment shows you.',
           'INVALID_CREDENTIALS',
         );
       }
-      setupClaimLimiter.clear(source);
     }
     const user = await prisma.user.upsert({
       where: { email },
