@@ -129,6 +129,11 @@ model MagicLinkToken {
   expiresAt DateTime
   usedAt    DateTime?
   createdAt DateTime  @default(now())
+
+  /// Issuance prunes this user's spent and expired tokens before creating a
+  /// new one. Without this the cleanup scans the whole table on every public
+  /// magic-link request; Postgres does not index foreign keys automatically.
+  @@index([userId, expiresAt])
 }
 
 model Session {

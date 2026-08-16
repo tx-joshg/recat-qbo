@@ -11,7 +11,7 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
 import { devLoginAllowed, localAdminLockdown } from '../services/devLogin.js';
-import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
+import { BoundedRateLimiter } from '../mcp/rateLimit.js';
 import {
   clearCookieOptions,
   createSession,
@@ -38,11 +38,25 @@ export function toUserDto(user: User & { memberships: Membership[] }): UserDto {
 const magicLinkBody = z.object({ email: z.string().trim().toLowerCase().email() });
 
 // Every request writes a token row and a mail (or log line), so issuance is
-// throttled per source. Behind a reverse proxy the bucket is shared (see the
-// setup limiter in routes/instance.ts for why) — five a minute is plenty for a
-// human signing in and bounds what an anonymous caller can grow the token
-// table and server log by. Exported so tests can reset the shared state.
-export const magicLinkLimiter = new LocalLoginLimiter(5, 60 * 1000);
+// throttled — but keyed by EMAIL, never by req.ip. Behind a reverse proxy with
+// TRUSTED_PROXY_IPS unset (the Umbrel default) every caller shares one address,
+// so an IP key is a deployment-wide bucket that any anonymous client can hold
+// empty, blocking sign-in for everyone. Keyed by address, an attacker can only
+// affect the address they target, and the per-user token growth this exists to
+// bound is per-address anyway.
+//
+// BoundedRateLimiter rather than LocalLoginLimiter: this route is anonymously
+// reachable with a caller-chosen key, so the key space needs a hard cap and
+// O(1) admission. maxKeys evicts least-recently-used.
+//
+// Residual, accepted: an attacker can keep one known address throttled. On a
+// local-admin deployment the password path is unaffected; elsewhere it is a
+// bounded delay on one account, which is the normal cost of per-account limits.
+export const magicLinkLimiter = new BoundedRateLimiter({
+  limit: 5,
+  windowMs: 60 * 1_000,
+  maxKeys: 10_000,
+});
 
 export const authRouter = Router();
 
@@ -52,14 +66,15 @@ export const authRouter = Router();
 authRouter.post(
   '/auth/magic-link',
   asyncHandler(async (req, res) => {
-    const source = req.ip || req.socket.remoteAddress || 'unknown';
-    const limit = magicLinkLimiter.acquire(source);
+    // Parsed first so the throttle can key on the address. A malformed body
+    // does no work — no lookup, no token, no mail — so it needs no slot.
+    const { email } = validate(magicLinkBody)(req.body);
+
+    const limit = magicLinkLimiter.acquire(email);
     if (!limit.allowed) {
       res.setHeader('Retry-After', String(limit.retryAfterSeconds));
       throw new HttpError(429, 'Too many requests — try again in a minute', 'RATE_LIMITED');
     }
-
-    const { email } = validate(magicLinkBody)(req.body);
 
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {

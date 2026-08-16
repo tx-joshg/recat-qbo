@@ -49,7 +49,7 @@ vi.mock('../env.js', async (importOriginal) => {
   };
 });
 
-const { authRouter, magicLinkLimiter } = await import('./auth.js');
+const { authRouter } = await import('./auth.js');
 
 function testApp(): Express {
   const app = express();
@@ -63,9 +63,8 @@ const ADMIN = { id: 'u1', email: 'admin@recat.local', isInstanceAdmin: true };
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Module state shared by every request, as in production — reset between
-  // cases so one test's requests do not throttle the next.
-  magicLinkLimiter.reset();
+  // The limiter is module state shared across the file. It keys on the email,
+  // so each test uses a distinct address rather than reaching into it.
   mocks.localAdminConfig = { enabled: false, email: '', password: '' };
   mocks.allowDevLogin = false;
   mocks.userFindUnique.mockResolvedValue(null);
@@ -90,7 +89,7 @@ describe('POST /auth/magic-link — local-admin lockdown', () => {
     });
 
     it('does not bootstrap the first admin on a fresh instance', async () => {
-      const res = await post(testApp(), 'attacker@evil.com').expect(200);
+      const res = await post(testApp(), 'attacker-a@evil.com').expect(200);
 
       expect(mocks.userCreate).not.toHaveBeenCalled();
       expect(res.body).toEqual({ ok: true, delivered: false }); // no devLink, no enumeration change
@@ -110,7 +109,7 @@ describe('POST /auth/magic-link — local-admin lockdown', () => {
     it('ALLOW_DEV_LOGIN=true restores dev behavior explicitly', async () => {
       mocks.allowDevLogin = true;
 
-      const res = await post(testApp(), 'dev@example.com').expect(200);
+      const res = await post(testApp(), 'dev-c@example.com').expect(200);
 
       expect(mocks.userCreate).toHaveBeenCalled(); // bootstrap allowed again
       expect(res.body.devLink).toBeDefined();
@@ -119,23 +118,29 @@ describe('POST /auth/magic-link — local-admin lockdown', () => {
 
   describe('without a local admin (dev / quick-start)', () => {
     it('still bootstraps the first admin and returns the link', async () => {
-      const res = await post(testApp(), 'me@example.com').expect(200);
+      const res = await post(testApp(), 'me-d@example.com').expect(200);
 
       expect(mocks.userCreate).toHaveBeenCalledWith({
-        data: { email: 'me@example.com', isInstanceAdmin: true, invitePending: false },
+        data: { email: 'me-d@example.com', isInstanceAdmin: true, invitePending: false },
       });
       expect(res.body.devLink).toBeDefined();
     });
   });
 
-  it('throttles issuance per source', async () => {
+  // Keyed by address, never by req.ip: behind a proxy with TRUSTED_PROXY_IPS
+  // unset every caller shares one address, so an IP key would let any anonymous
+  // client hold a deployment-wide bucket empty and block sign-in for everyone.
+  it('throttles one address without touching any other', async () => {
     const app = testApp();
     mocks.userFindUnique.mockResolvedValue(ADMIN);
 
-    for (let i = 0; i < 5; i += 1) await post(app, 'admin@recat.local').expect(200);
-    const res = await post(app, 'admin@recat.local').expect(429);
+    for (let i = 0; i < 5; i += 1) await post(app, 'target@example.com').expect(200);
+    const res = await post(app, 'target@example.com').expect(429);
 
     expect(res.headers['retry-after']).toBeDefined();
     expect(Number(res.headers['retry-after'])).toBeLessThanOrEqual(60);
+
+    // Same client, same connection — a different address must still work.
+    await post(app, 'bystander@example.com').expect(200);
   });
 });
