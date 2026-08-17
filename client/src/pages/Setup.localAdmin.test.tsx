@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   apiGet: vi.fn(),
+  apiPost: vi.fn(),
   navigate: vi.fn(),
 }));
 
@@ -32,7 +33,7 @@ vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>();
   return {
     ...actual,
-    api: { get: mocks.apiGet, post: vi.fn(), patch: vi.fn(), del: vi.fn() },
+    api: { get: mocks.apiGet, post: mocks.apiPost, patch: vi.fn(), del: vi.fn() },
     auth: { session: vi.fn().mockResolvedValue(null) },
     companies: { accounts: vi.fn(), connectUrl: vi.fn(), setHoldingAccounts: vi.fn(), setSyncMode: vi.fn() },
     instanceSettings: { patch: vi.fn(), testEmail: vi.fn() },
@@ -62,6 +63,7 @@ async function gotoAdminStep(user: ReturnType<typeof userEvent.setup>): Promise<
 beforeEach(() => {
   vi.clearAllMocks();
   sessionStorage.clear();
+  mocks.apiPost.mockResolvedValue({ ok: true, delivered: false });
 });
 
 // The wizard must land on the address local sign-in authenticates. If it
@@ -113,6 +115,30 @@ describe('Setup · Admin step · local sign-in address', () => {
       expect(screen.getByLabelText(/app password/i)).toBeInTheDocument();
     }, { timeout: 5_000 });
     expect(screen.getByRole('textbox')).toHaveValue('admin@recat.local');
+  });
+
+  // statusUnavailable only becomes true after every retry. While the request is
+  // still in flight the requirement is equally unknown, and a restored email
+  // makes it easy to reach Continue first (codex on #61).
+  it('refuses to submit while the status request is still in flight', async () => {
+    let resolveStatus: (value: unknown) => void = () => {};
+    mocks.apiGet.mockReturnValue(new Promise((resolve) => { resolveStatus = resolve; }));
+    sessionStorage.setItem(
+      'recat.setupWizard.v3',
+      JSON.stringify({ stepId: 'admin', mode: 'demo', adminEmail: 'restored@example.com' }),
+    );
+    const user = userEvent.setup();
+    render(<Setup />);
+    await screen.findByText('Create the admin account');
+
+    await user.click(screen.getByRole('button', { name: /Continue/ }));
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+
+    // Once it resolves, the same click works.
+    resolveStatus({ ...BASE_STATUS });
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('restored@example.com'));
+    await user.click(screen.getByRole('button', { name: /Continue/ }));
+    await waitFor(() => expect(mocks.apiPost).toHaveBeenCalled());
   });
 
   it('leaves the field empty and shows no note when local sign-in is off', async () => {

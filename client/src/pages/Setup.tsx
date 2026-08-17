@@ -494,10 +494,17 @@ export default function Setup() {
       return;
     }
     // Without a status answer we cannot know whether this deployment requires
-    // its password. Submitting blind would fail and burn rate-limit budget, so
-    // say so instead of guessing.
-    if (statusUnavailable) {
-      toast("Can't reach the server to check setup requirements — retry in a moment");
+    // its password, so never submit on one. Gating on statusUnavailable alone
+    // would miss the window while the request is still in flight or between
+    // retries — a restored email makes it easy to reach Continue first, and the
+    // post then fails for want of a password and spends rate-limit budget that
+    // the retry exists to protect.
+    if (status === null) {
+      toast(
+        statusUnavailable
+          ? "Can't reach the server to check setup requirements — retry in a moment"
+          : 'Checking what this deployment needs — one moment',
+      );
       return;
     }
     // Deployments with local sign-in gate first-run on the password they
