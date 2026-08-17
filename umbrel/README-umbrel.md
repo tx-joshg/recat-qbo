@@ -60,9 +60,10 @@ link either, which made it a dead end rather than an inconvenience.
 
 The wizard now defaults to that address
 ([#47](https://github.com/tx-joshg/recat-qbo/pull/47)), so the displayed password
-works as soon as setup finishes. **The package must pin v0.1.2 or later** —
-v0.1.0 predates this fix and strands users, and v0.1.1 predates the first-run
-claim guard described below.
+works as soon as setup finishes. **The package must pin v0.1.3 or later.**
+Earlier pins are not merely missing features: v0.1.0 strands users at first run,
+v0.1.1 predates the claim guard, and v0.1.2's guard is bypassable through
+`/auth/magic-link` ([#53](https://github.com/tx-joshg/recat-qbo/issues/53)).
 
 A user can still type a different address, and the wizard now warns that password
 sign-in will not apply to it. That is the remaining support case, and it is a
@@ -199,7 +200,7 @@ definitions ran exactly as they ship.
 - All three digests pull and resolve on arm64
 - Containers start, Postgres and the extractor report healthy, the server waits
   on both
-- **All 28 migrations apply** against an empty database on first boot, and do
+- **All migrations apply** against an empty database on first boot, and do
   not re-run on the next boot
 - The app serves; `/auth/methods` reports `localAdmin: true`
 - The extractor is reachable from the server container over the app network
@@ -212,9 +213,18 @@ definitions ran exactly as they ship.
 - `/api/setup/status` offers `localAdminEmail`, confirming the wizard fix is in
   the shipped image and not only in the source tree
 - **The first-run claim guard is in the shipped image** (re-verified against the
-  v0.1.2 pin): a claim with no password and a claim with the wrong one both return
+  v0.1.3 pin): a claim with no password and a claim with the wrong one both return
   `401` with no sign-in link in the body, the instance stays un-set-up, and the
   password Umbrel displays then creates the admin and signs in
+- **The magic-link bypass is closed in the shipped image**: `POST
+  /auth/magic-link` neither bootstraps an admin on a fresh install nor returns a
+  `devLink`, including for the published `admin@recat.local`
+  ([#53](https://github.com/tx-joshg/recat-qbo/issues/53))
+- **Sign-in limits are per client**: an attacker forwarded as `198.51.100.9` is
+  locked out at the sixth attempt while the owner, forwarded as `203.0.113.4`,
+  signs in during that lockout — `TRUSTED_PROXY_HOP` working end to end
+  ([#57](https://github.com/tx-joshg/recat-qbo/issues/57))
+- All **29** migrations apply, including the index supporting magic-link cleanup
 
 ### First-run flow, end to end
 

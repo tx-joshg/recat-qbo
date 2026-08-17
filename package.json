@@ -2,7 +2,7 @@
   "name": "recat-qbo",
   "description": "Self-hosted transaction categorization and review queue for QuickBooks Online. An open-source alternative to Uncat.",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "AGPL-3.0-only",
   "workspaces": [
     "shared",

@@ -18,14 +18,18 @@ services:
       #
       # Recat authenticates its own requests — sessions, magic links, the
       # rate-limited local admin password, per-company roles — so Umbrel's
-      # layer is redundant here rather than protective. ONE EXCEPTION, see
-      # README-umbrel.md: before the first admin exists, POST /api/setup/admin
-      # is unauthenticated by necessity, so finish the wizard before exposing
-      # the app on a public address.
+      # layer is redundant here rather than protective.
+      #
+      # First-run used to be the exception: it is unauthenticated by necessity,
+      # since somebody has to create the first account. As of v0.1.3 that is
+      # closed. Creating the first administrator requires the app password this
+      # page displays, and /auth/magic-link neither bootstraps an account nor
+      # returns a sign-in link in its response while LOCAL_ADMIN_* is set —
+      # issued links reach this app's logs only (#53).
       PROXY_AUTH_ADD: 'false'
 
   server:
-    image: ghcr.io/tx-joshg/recat-qbo:0.1.2@sha256:433aa626f637cb2c5364eca9afda25f4938414e34d12dc3814dc00e7c653afd4
+    image: ghcr.io/tx-joshg/recat-qbo:0.1.3@sha256:b2da595b60bff50916c9e98eb2a8520220ed6b437af8ba7fc8d0471fa873ecfe
     restart: on-failure
     environment:
       # The install's starting address, and the seed for origin checking — not
@@ -96,7 +100,7 @@ services:
       retries: 10
 
   receipt-extractor:
-    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.2@sha256:29540d848e6ce784ec6851ac935f75585052ef4fa468e7df33e8b986e4632a47
+    image: ghcr.io/tx-joshg/recat-qbo/receipt-extractor:0.1.3@sha256:0e82b42c0d4a6b173c39e21d9a9fda0ce2fd010ad6c4779c9c9e6a3d541dcb99
     restart: on-failure
     environment:
       RECEIPT_EXTRACTOR_TOKEN: ${APP_RECAT_EXTRACTOR_TOKEN}
