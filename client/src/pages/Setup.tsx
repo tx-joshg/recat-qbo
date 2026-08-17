@@ -72,6 +72,9 @@ function stepsFor(mode: StartMode): StepId[] {
 // bump keeps stale numeric step progress from resuming on the wrong step.
 const PROGRESS_KEY = 'recat.setupWizard.v3';
 
+/** Retries for GET /api/setup/status before the Admin step refuses to guess. */
+const STATUS_RETRIES = 3;
+
 // ---------------------------------------------------------------------------
 // Server shapes not pinned down in lib/api.ts (typed locally).
 // ---------------------------------------------------------------------------
@@ -263,6 +266,9 @@ export default function Setup() {
   // Never persisted to sessionStorage with the rest of the wizard progress —
   // it is the deployment's own password, not navigation state.
   const [adminPassword, setAdminPassword] = useState('');
+  // True only after every retry failed: we do not know whether this deployment
+  // requires a password, so the Admin step refuses to guess.
+  const [statusUnavailable, setStatusUnavailable] = useState(false);
   const [adminSent, setAdminSent] = useState(initial.adminSent);
   const [companyId, setCompanyId] = useState<string | null>(initial.companyId);
 
@@ -342,22 +348,38 @@ export default function Setup() {
   }, [stepId, mode, env, syncMode, adminEmail, adminSent, companyId, connectEntry]);
 
   // Setup status (needsSetup / credentialsSet / redirectUri).
+  //
+  // Retried, because this answer decides whether the Admin step must collect
+  // the deployment's password. A single transient failure — the SPA loading
+  // while the server is still starting is the ordinary case — would otherwise
+  // leave status null forever, hide the field, and submit without a password
+  // that the server requires, spending the caller's rate-limit budget on
+  // requests that cannot succeed.
   useEffect(() => {
     let cancelled = false;
-    api
-      .get<SetupStatus>('/api/setup/status')
-      .then((s) => {
-        if (cancelled) return;
-        setStatus(s);
-        // Deployments with local sign-in (Umbrel) display a password that only
-        // works for this exact address, and have no SMTP to fall back on. Default
-        // to it, but never overwrite a restored or already-typed value.
-        const local = s.localAdminEmail;
-        if (local) setAdminEmail((cur) => (cur === '' ? local : cur));
-      })
-      .catch(() => {
-        // status unavailable — the wizard still works with defaults
-      });
+    const attempt = (remaining: number): void => {
+      api
+        .get<SetupStatus>('/api/setup/status')
+        .then((s) => {
+          if (cancelled) return;
+          setStatus(s);
+          setStatusUnavailable(false);
+          // Deployments with local sign-in (Umbrel) display a password that only
+          // works for this exact address, and have no SMTP to fall back on. Default
+          // to it, but never overwrite a restored or already-typed value.
+          const local = s.localAdminEmail;
+          if (local) setAdminEmail((cur) => (cur === '' ? local : cur));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          if (remaining > 0) {
+            window.setTimeout(() => attempt(remaining - 1), (STATUS_RETRIES - remaining + 1) * 1_000);
+            return;
+          }
+          setStatusUnavailable(true);
+        });
+    };
+    attempt(STATUS_RETRIES);
     return () => {
       cancelled = true;
     };
@@ -469,6 +491,13 @@ export default function Setup() {
     const email = adminEmail.trim();
     if (!email) {
       toast('Enter your email first');
+      return;
+    }
+    // Without a status answer we cannot know whether this deployment requires
+    // its password. Submitting blind would fail and burn rate-limit budget, so
+    // say so instead of guessing.
+    if (statusUnavailable) {
+      toast("Can't reach the server to check setup requirements — retry in a moment");
       return;
     }
     // Deployments with local sign-in gate first-run on the password they
@@ -919,10 +948,27 @@ export default function Setup() {
                     ? "We'll verify it with a magic link — you won't create an account password."
                     : "We'll verify it with a magic link — no password to create."}
                 </div>
+                {statusUnavailable && (
+                  <div
+                    style={{
+                      fontSize: 13,
+                      color: 'var(--amT)',
+                      marginTop: 10,
+                      paddingLeft: 10,
+                      borderLeft: '2px solid var(--amT)',
+                    }}
+                  >
+                    Can't reach the server to check whether this deployment needs its app
+                    password. Refresh once it's up — continuing now would fail.
+                  </div>
+                )}
                 {status?.localAdminEmail && (
                   <>
-                    <label style={{ ...fieldLabel, marginTop: 16 }}>App password</label>
+                    <label htmlFor="setup-app-password" style={{ ...fieldLabel, marginTop: 16 }}>
+                      App password
+                    </label>
                     <input
+                      id="setup-app-password"
                       className="input-lg"
                       value={adminPassword}
                       onChange={(e) => setAdminPassword(e.target.value)}
@@ -960,8 +1006,8 @@ export default function Setup() {
                         <b style={{ color: 'var(--ink)' }}>{status.localAdminEmail}</b>. You can
                         finish setup on a different address and you'll be signed in now — but
                         once you connect real QuickBooks, one-click sign-in turns off and this
-                        password won't work. Without SMTP for the magic link, that locks you
-                        out.
+                        password won't work. Without SMTP you'd then have to fetch each sign-in
+                        link from your server's logs by hand.
                       </>
                     )}
                   </div>

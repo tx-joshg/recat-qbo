@@ -80,7 +80,10 @@ describe('Setup · Admin step · local sign-in address', () => {
     expect(screen.getByText(/password it shows you signs in to this account/i)).toBeInTheDocument();
   });
 
-  it('warns about lockout after connecting real books when the address is changed', async () => {
+  // The warning must describe what actually happens. The magic link is still
+  // written to the server log when SMTP is absent, and the login page points
+  // users there — so this is manual recovery, not a lockout (codex on #50).
+  it('describes log recovery, not a lockout, when the address is changed', async () => {
     mocks.apiGet.mockResolvedValue({ ...BASE_STATUS, localAdminEmail: 'admin@recat.local' });
     const user = userEvent.setup();
     render(<Setup />);
@@ -90,13 +93,26 @@ describe('Setup · Admin step · local sign-in address', () => {
     await user.clear(screen.getByRole('textbox'));
     await user.type(screen.getByRole('textbox'), 'me@example.com');
 
-    // The trap is delayed: setup succeeds via the one-click link, and the
-    // lockout only lands once a real company disables it. Saying only "you'll
-    // need the magic link" would understate that.
     const warning = await screen.findByText(/once you connect real QuickBooks/i);
-    expect(warning).toBeInTheDocument();
-    expect(warning.textContent).toMatch(/locks you out/i);
-    expect(screen.queryByText(/signs in to this account/i)).not.toBeInTheDocument();
+    expect(warning.textContent).toMatch(/from your server's logs/i);
+    expect(warning.textContent).not.toMatch(/locks you out/i);
+  });
+
+  // A transient status failure used to hide the password field permanently and
+  // submit without it, spending rate-limit budget on requests that cannot
+  // succeed (codex on #54).
+  it('retries a failed status fetch rather than assuming no password is needed', async () => {
+    mocks.apiGet
+      .mockRejectedValueOnce(new Error('server starting'))
+      .mockResolvedValue({ ...BASE_STATUS, localAdminEmail: 'admin@recat.local' });
+    const user = userEvent.setup();
+    render(<Setup />);
+    await gotoAdminStep(user);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/app password/i)).toBeInTheDocument();
+    }, { timeout: 5_000 });
+    expect(screen.getByRole('textbox')).toHaveValue('admin@recat.local');
   });
 
   it('leaves the field empty and shows no note when local sign-in is off', async () => {

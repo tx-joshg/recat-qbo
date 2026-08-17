@@ -31,7 +31,8 @@ description: >-
   that nobody but you can set this instance up. It fills in the administrator
   address for you, and that same password signs you in afterwards. Change the
   address and the password stops working — Umbrel installs have no outbound
-  email, so magic-link sign-in cannot deliver until you add SMTP in Settings.
+  email, so until you add SMTP in Settings you would have to fetch each sign-in
+  link from this app's logs by hand.
 version: "0.1.2"
 releaseNotes: >-
   First Umbrel release. Setup now requires the app password shown on this page,
