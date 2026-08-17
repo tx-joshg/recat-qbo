@@ -461,6 +461,14 @@ export function canonicalQboType(reportType: string): string {
  * of the row's visible identity. Stable across fetches and date ranges;
  * identical rows (same date/type/doc/payee/amount) share one key, so tagging
  * one tags them all — the price of having no id to tell them apart.
+ *
+ * The tuple is JSON-encoded rather than joined on a separator. Joining let a
+ * value containing the separator move the boundary between fields, so rows that
+ * were NOT identical still hashed the same — docNum "A" with payee "B|C" and
+ * docNum "A|B" with payee "C" both produced "…|A|B|C|…". Tagging either then
+ * tagged the other, which is a different and much worse thing than the
+ * documented tradeoff above. JSON quotes and escapes each field, so no field
+ * content can be mistaken for structure.
  */
 export function fallbackLogKey(r: {
   date: string;
@@ -469,8 +477,22 @@ export function fallbackLogKey(r: {
   payee: string;
   amount: number;
 }): string {
-  const identity = [r.date, r.txnType, r.docNum ?? '', r.payee, r.amount.toFixed(2)].join('|');
+  const identity = JSON.stringify([r.date, r.txnType, r.docNum ?? '', r.payee, r.amount.toFixed(2)]);
   return `row:${createHash('sha256').update(identity).digest('hex').slice(0, 40)}`;
+}
+
+/**
+ * Postgres caps bind parameters per statement, so an unbounded `IN` list fails
+ * the whole query once a book is large enough — and the transaction log's "All
+ * time" range is exactly where that happens. Well under the limit, because the
+ * cost of a few extra round trips is nothing next to the report failing.
+ */
+const DB_IN_CHUNK = 1_000;
+
+function chunked<T>(items: readonly T[], size = DB_IN_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 /**
@@ -492,19 +514,28 @@ export async function transactionLog(
   }));
   const qboIds = [...new Set(raw.map((r) => r.qboId).filter((id): id is string => id !== undefined))];
 
-  // Queue tags: local Transaction rows for the same entities.
-  const local =
-    qboIds.length > 0
-      ? await prisma.transaction.findMany({
-          where: { companyId, qboId: { in: qboIds } },
-          select: {
-            qboId: true,
-            qboType: true,
-            txnTags: { select: { tagId: true } },
-            splitLines: { select: { tags: { select: { tagId: true } } } },
-          },
-        })
-      : [];
+  // Queue tags: local Transaction rows for the same entities. Chunked and run
+  // in sequence — a book big enough to need many batches is also one whose
+  // connection pool should not be hit with all of them at once.
+  const local: {
+    qboId: string;
+    qboType: string;
+    txnTags: { tagId: string }[];
+    splitLines: { tags: { tagId: string }[] }[];
+  }[] = [];
+  for (const batch of chunked(qboIds)) {
+    local.push(
+      ...(await prisma.transaction.findMany({
+        where: { companyId, qboId: { in: batch } },
+        select: {
+          qboId: true,
+          qboType: true,
+          txnTags: { select: { tagId: true } },
+          splitLines: { select: { tags: { select: { tagId: true } } } },
+        },
+      })),
+    );
+  }
   const queueTags = new Map<string, string[]>();
   for (const t of local) {
     const ids = new Set<string>(t.txnTags.map((x) => x.tagId));
@@ -512,10 +543,19 @@ export async function transactionLog(
     queueTags.set(`${t.qboType}:${t.qboId}`, [...ids]);
   }
 
-  // Log tags: transactions tagged directly from this screen.
-  const keys = keyed.map((k) => k.key);
-  const logTags =
-    keys.length > 0 ? await prisma.logTag.findMany({ where: { companyId, qboKey: { in: keys } } }) : [];
+  // Log tags: transactions tagged directly from this screen. Deduplicated —
+  // rows sharing a fallback key are common, and sending the same key once per
+  // row is how a wide report reaches the bind-parameter cap fastest.
+  const keys = [...new Set(keyed.map((k) => k.key))];
+  const logTags: { qboKey: string; tagId: string }[] = [];
+  for (const batch of chunked(keys)) {
+    logTags.push(
+      ...(await prisma.logTag.findMany({
+        where: { companyId, qboKey: { in: batch } },
+        select: { qboKey: true, tagId: true },
+      })),
+    );
+  }
   const logTagMap = new Map<string, string[]>();
   for (const lt of logTags) {
     const arr = logTagMap.get(lt.qboKey) ?? [];

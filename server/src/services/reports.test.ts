@@ -166,6 +166,28 @@ describe('fallbackLogKey — tag keys for report rows QBO returned without an id
     expect(fallbackLogKey(noDoc)).toBe(fallbackLogKey({ ...row, docNum: '' }));
   });
 
+  // Joining on a separator let a value containing it move the field boundary,
+  // so rows that were NOT identical hashed the same and tagging one tagged the
+  // other. That is a different failure from the documented "identical rows
+  // share a key" tradeoff, and a much worse one.
+  it('does not let a separator inside a field impersonate a field boundary', () => {
+    const a = fallbackLogKey({ ...row, docNum: 'A', payee: 'B|C' });
+    const b = fallbackLogKey({ ...row, docNum: 'A|B', payee: 'C' });
+
+    expect(a).not.toBe(b);
+  });
+
+  it('keeps distinguishing rows whatever the field content', () => {
+    // Quotes, backslashes and brackets are structure in the encoding, so they
+    // get the same scrutiny as the separator did.
+    const quoted = fallbackLogKey({ ...row, payee: 'ACME "CO"' });
+    const escaped = fallbackLogKey({ ...row, payee: 'ACME \\"CO\\"' });
+    const bracketed = fallbackLogKey({ ...row, docNum: '","', payee: '' });
+    const plain = fallbackLogKey({ ...row, docNum: '', payee: '","' });
+
+    expect(new Set([quoted, escaped, bracketed, plain]).size).toBe(4);
+  });
+
   it('never collides with a real entity key and fits the API limit', () => {
     const key = fallbackLogKey(row);
     expect(key).toMatch(/^row:[0-9a-f]{40}$/);
