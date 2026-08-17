@@ -1,110 +1,90 @@
 /**
- * READ-ONLY probe for issue #44: is this company's sales tax inclusive?
+ * READ-ONLY probe for issue #44: can this company express tax-inclusive entry?
  *
- * Answers the gating question before any write is attempted — a TaxExclusive
- * company simply cannot exercise the assumption the issue is about. Makes only
- * GET requests; nothing here mutates QuickBooks.
+ * Answers the gating question before any write is attempted — a company that
+ * cannot produce a TaxInclusive transaction cannot exercise the assumption the
+ * issue is about, and finding that out after connecting an app and migrating a
+ * database is the expensive way to learn it.
  *
  *   npm run probe-tax
  *
- * Reads the most recently connected non-demo company and its stored tokens, so
- * the app must already have that company connected.
+ * Goes through qboFactory, deliberately. An earlier version refreshed the OAuth
+ * token itself and dropped the rotated refresh token Intuit returns, which can
+ * strand the connection once the prior-token grace period lapses. The factory
+ * persists the whole rotated set, resolves credentials whether they came from
+ * env vars or the setup wizard, and talks to the environment the company was
+ * actually connected against rather than a process-level default.
  */
 import { MOCK_REALM_IDS } from '@recat/shared';
-import { env } from '../env.js';
-import { decrypt } from '../lib/crypto.js';
 import { prisma } from '../lib/prisma.js';
+import { qboFactory } from '../lib/qbo/factory.js';
 
-const BASE =
-  env.QBO_ENVIRONMENT === 'production'
-    ? 'https://quickbooks.api.intuit.com'
-    : 'https://sandbox-quickbooks.api.intuit.com';
-
-async function refreshAccessToken(refreshToken: string): Promise<string> {
-  const basic = Buffer.from(`${env.QBO_CLIENT_ID}:${env.QBO_CLIENT_SECRET}`).toString('base64');
-  const res = await fetch('https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer', {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${basic}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: 'application/json',
-    },
-    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
-  });
-  if (!res.ok) throw new Error(`token refresh failed: ${res.status} ${await res.text()}`);
-  const json = (await res.json()) as { access_token: string };
-  return json.access_token;
+function line(label: string, value: unknown): void {
+  console.log(`  ${label.padEnd(22)} ${String(value)}`);
 }
-
-async function get<T>(realmId: string, token: string, path: string): Promise<T> {
-  const res = await fetch(`${BASE}/v3/company/${realmId}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  });
-  if (!res.ok) throw new Error(`GET ${path} -> ${res.status} ${await res.text()}`);
-  return (await res.json()) as T;
-}
-
-const q = (s: string) => `/query?query=${encodeURIComponent(s)}`;
 
 async function main(): Promise<void> {
   const company = await prisma.company.findFirst({
     where: { realmId: { notIn: [...MOCK_REALM_IDS] }, disconnectedAt: null },
     orderBy: { connectedAt: 'desc' },
+    select: { id: true, realmId: true, legalName: true, env: true },
   });
-  if (!company?.refreshToken) throw new Error('no connected real company with tokens');
+  if (!company) throw new Error('no connected real company — connect one first');
 
-  const token = await refreshAccessToken(decrypt(company.refreshToken));
-  const realmId = company.realmId;
-  console.log(`company : ${company.legalName} (${realmId})`);
-  console.log(`env     : ${env.QBO_ENVIRONMENT}\n`);
+  const client = await qboFactory.forCompany(company.id);
+  const [info, taxProfile, taxCodes] = await Promise.all([
+    client.getCompanyInfo(),
+    client.getTaxProfile(),
+    client.listTaxCodes(),
+  ]);
 
-  const info = await get<{ CompanyInfo?: Record<string, unknown> }>(
-    realmId,
-    token,
-    `/companyinfo/${realmId}`,
-  );
-  const ci = info.CompanyInfo ?? {};
-  console.log('--- CompanyInfo ---');
-  console.log('country            :', ci.Country ?? '(none)');
-  console.log('legal name         :', ci.LegalName ?? ci.CompanyName);
+  console.log(`\ncompany: ${info.legalName} (${company.realmId})`);
+  line('environment', company.env);
 
-  const prefs = await get<{ Preferences?: { TaxPrefs?: Record<string, unknown> } }>(
-    realmId,
-    token,
-    '/preferences',
-  );
-  const tax = prefs.Preferences?.TaxPrefs ?? {};
-  console.log('\n--- Preferences.TaxPrefs ---');
-  console.log(JSON.stringify(tax, null, 2));
+  console.log('\n--- company ---');
+  line('country', info.country ?? '(not reported)');
 
-  // GlobalTaxCalculation is per transaction, so read what this company actually
-  // stamps on its own records rather than inferring it from locale.
-  for (const type of ['Deposit', 'Purchase']) {
-    const rows = await get<{ QueryResponse?: Record<string, Array<Record<string, unknown>>> }>(
-      realmId,
-      token,
-      q(`select * from ${type} maxresults 10`),
-    );
-    const list = rows.QueryResponse?.[type] ?? [];
-    const seen = new Map<string, number>();
-    for (const r of list) {
-      const g = String(r.GlobalTaxCalculation ?? '(absent)');
-      seen.set(g, (seen.get(g) ?? 0) + 1);
-    }
-    console.log(`\n--- ${type}: GlobalTaxCalculation across ${list.length} record(s) ---`);
-    console.log(seen.size === 0 ? '  (no records)' : [...seen].map(([k, v]) => `  ${k}: ${v}`).join('\n'));
+  console.log('\n--- tax profile ---');
+  line('usingSalesTax', taxProfile.usingSalesTax ?? '(not reported)');
+  line('partnerTaxEnabled', taxProfile.partnerTaxEnabled ?? '(not reported)');
+
+  // Every code, not a sample: the relevant purchase or custom code is often not
+  // the first one QuickBooks returns, and a truncated list reads as though the
+  // configuration is missing when it was fetched all along.
+  console.log(`\n--- tax codes (${taxCodes.length}) ---`);
+  if (taxCodes.length === 0) console.log('  (none)');
+  for (const c of taxCodes) {
+    // Purchase applicability comes from the purchase rate list. `taxable` is the
+    // general flag and is true for sales-only codes too, so reporting it here
+    // would misclassify exactly the codes this probe exists to inspect.
+    const applies = c.purchaseRates.length > 0 ? 'purchase' : c.salesRates.length > 0 ? 'sales-only' : 'none';
+    line(`${c.qboId} ${c.name}`, `active=${c.active} applies=${applies}`);
   }
 
-  const codes = await get<{ QueryResponse?: { TaxCode?: Array<Record<string, unknown>> } }>(
-    realmId,
-    token,
-    q('select * from TaxCode maxresults 20'),
-  );
-  const list = codes.QueryResponse?.TaxCode ?? [];
-  console.log(`\n--- TaxCodes (${list.length}) ---`);
-  for (const c of list.slice(0, 10)) {
-    console.log(`  ${String(c.Id).padEnd(6)} ${String(c.Name).padEnd(28)} active=${c.Active} purchase=${c.Taxable}`);
+  // The verdict, and the reason it is a verdict rather than a sample.
+  //
+  // GlobalTaxCalculation is stamped per transaction, so no number of
+  // transactions read can prove a company will never carry it — absence in a
+  // sample is not evidence of absence. Country can: Intuit documents the field
+  // as valid only for non-US companies, and US companies use Automated Sales
+  // Tax instead, which has no inclusive mode to select.
+  console.log('\n--- verdict for #44 ---');
+  const country = (info.country ?? '').toUpperCase();
+  if (country === 'US') {
+    console.log('  NOT TESTABLE — a US company cannot produce a TaxInclusive transaction.');
+    console.log('  GlobalTaxCalculation is documented as non-US only, and US companies use');
+    console.log('  Automated Sales Tax, which has no inclusive mode. Use a UK, AU or CA');
+    console.log('  sandbox instead (choose the country when creating it).');
+  } else if (country === '') {
+    console.log('  UNKNOWN — QuickBooks did not report a country for this company.');
+    console.log('  Check the locale in QuickBooks before spending setup effort on it.');
+  } else {
+    console.log(`  LIKELY TESTABLE — ${country} is a non-US locale, which is where`);
+    console.log('  GlobalTaxCalculation applies. Confirm the company is set to tax-inclusive');
+    console.log('  entry, then run the #44 test: categorize a deposit whose holding line is');
+    console.log('  gross (e.g. 107.00) and check TotalAmt is unchanged and TotalTax is 7.00.');
   }
+  console.log();
 }
 
 main()

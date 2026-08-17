@@ -60,6 +60,13 @@ export interface QboTxn {
 export interface QboCompanyInfo {
   realmId: string;
   legalName: string;
+  /**
+   * ISO country of the QuickBooks company, or null when QBO omits it.
+   * GlobalTaxCalculation — and therefore tax-inclusive entry — is a non-US
+   * construct, so this is what decides whether a company can express it at
+   * all (#44).
+   */
+  country: string | null;
 }
 
 export interface QboTaxProfile {

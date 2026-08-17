@@ -1321,7 +1321,7 @@ export class MockQboClient implements QboClient {
 
   async getCompanyInfo(): Promise<QboCompanyInfo> {
     await ensureMockRealmsHydrated();
-    return { realmId: this.realmId, legalName: this.realm.legalName };
+    return { realmId: this.realmId, legalName: this.realm.legalName, country: 'US' };
   }
 
   async listAccounts(): Promise<QboAccountInfo[]> {

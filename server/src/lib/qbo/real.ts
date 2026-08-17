@@ -231,7 +231,7 @@ interface CdcBody {
 }
 
 interface CompanyInfoBody {
-  CompanyInfo?: { CompanyName?: string; LegalName?: string };
+  CompanyInfo?: { CompanyName?: string; LegalName?: string; Country?: string };
 }
 
 interface AttachableBody {
@@ -1326,6 +1326,7 @@ export class RealQboClient implements QboClient {
     return {
       realmId: this.realmId,
       legalName: firstNonEmpty(body.CompanyInfo?.LegalName, body.CompanyInfo?.CompanyName) ?? this.realmId,
+      country: firstNonEmpty(body.CompanyInfo?.Country) ?? null,
     };
   }
 

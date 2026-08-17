@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "concurrently -n server,client -c green,blue \"npm run dev -w server\" \"npm run dev -w client\"",
     "login-link": "node server/dist/cli/loginLink.js",
-    "probe-tax": "tsx server/src/cli/probeSandboxTax.ts",
+    "probe-tax": "node server/dist/cli/probeSandboxTax.js",
     "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
     "test": "npm run test -w server && npm run test -w client",
     "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",

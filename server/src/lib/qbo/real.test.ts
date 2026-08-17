@@ -2411,3 +2411,42 @@ describe('parseTransactionListReport', () => {
     expect(parseTransactionListReport({})).toEqual([]);
   });
 });
+
+// The country decides whether a company can express tax-inclusive entry at all,
+// so the probe reads it through the client rather than fetching it itself —
+// fetching it itself is what dropped Intuit's rotated refresh token (#44, #48).
+describe('getCompanyInfo — country', () => {
+  function clientWithCompanyInfo(companyInfo: Record<string, unknown>) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ CompanyInfo: companyInfo }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+    return new RealQboClient({
+      realmId: 'realm-1',
+      environment: 'sandbox',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      tokens: { accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 600_000 },
+      holdingAccountQboIds: [],
+      onTokensRefreshed: async () => undefined,
+    });
+  }
+
+  it('reports the country QuickBooks returns', async () => {
+    const info = await clientWithCompanyInfo({ LegalName: 'Acme UK', Country: 'GB' }).getCompanyInfo();
+
+    expect(info.country).toBe('GB');
+    expect(info.legalName).toBe('Acme UK');
+  });
+
+  it('reports null rather than guessing when QBO omits it', async () => {
+    const info = await clientWithCompanyInfo({ LegalName: 'Acme' }).getCompanyInfo();
+
+    expect(info.country).toBeNull();
+  });
+});
