@@ -8,16 +8,6 @@ function normalizeIp(ip: string): string {
 }
 
 /**
- * A real address, via the standard parser. Hand-rolled shape checks are too
- * permissive to decide this: ':' and '2001:::1' look like IPv6 to a regex but
- * can never equal a socket peer, so treating them as usable would select the
- * long lockout while compileTrustedProxy still trusted nothing.
- */
-function isIpAddress(value: string): boolean {
-  return isIP(value) !== 0;
-}
-
-/**
  * Addresses only reachable from inside the host or its container networks.
  * A peer outside these ranges reached us directly rather than through the
  * reverse proxy we were told to expect, so its forwarded headers are its own
@@ -64,17 +54,4 @@ export function compileTrustedProxy(setting: string, trustHop = false): TrustPro
     if (trusted.has(normalizeIp(ip))) return true;
     return trustHop && isPrivateAddress(ip);
   };
-}
-
-/**
- * Whether this configuration actually yields a per-client `req.ip`.
- *
- * Rate limiters key on that address, and a lockout is only safe to make long
- * when the key identifies one client (#57). A setting that looks configured but
- * matches nothing — a CIDR, a stray comma, a typo — leaves every caller behind
- * a proxy sharing the proxy's address, so it must count as untrusted here.
- */
-export function hasUsableTrustedProxy(setting: string, trustHop = false): boolean {
-  if (trustHop) return true;
-  return setting.split(',').map(normalizeIp).some(isIpAddress);
 }

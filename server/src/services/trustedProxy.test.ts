@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compileTrustedProxy, hasUsableTrustedProxy, isPrivateAddress } from './trustedProxy.js';
+import { compileTrustedProxy, isPrivateAddress } from './trustedProxy.js';
 
 describe('compileTrustedProxy', () => {
   it('trusts only trimmed exact IP entries and ignores empty entries', () => {
@@ -97,29 +97,5 @@ describe('isPrivateAddress', () => {
   it('sees through IPv4-mapped IPv6', () => {
     expect(isPrivateAddress('::ffff:10.0.0.1')).toBe(true);
     expect(isPrivateAddress('::ffff:8.8.8.8')).toBe(false);
-  });
-});
-
-// A setting that looks configured but matches nothing leaves the key shared,
-// so it must not be mistaken for per-client isolation when sizing a lockout.
-describe('hasUsableTrustedProxy', () => {
-  it('is true for at least one real address, or for hop trust', () => {
-    expect(hasUsableTrustedProxy('192.0.2.10')).toBe(true);
-    expect(hasUsableTrustedProxy('2001:db8::10')).toBe(true);
-    expect(hasUsableTrustedProxy('', true)).toBe(true);
-  });
-
-  it('is false for entries compileTrustedProxy can never match', () => {
-    expect(hasUsableTrustedProxy('')).toBe(false);
-    expect(hasUsableTrustedProxy('   ')).toBe(false);
-    expect(hasUsableTrustedProxy(',')).toBe(false);
-    expect(hasUsableTrustedProxy('10.0.0.0/8')).toBe(false); // CIDR is never matched
-    expect(hasUsableTrustedProxy('not-an-ip')).toBe(false);
-    expect(hasUsableTrustedProxy('999.1.1.1')).toBe(false);
-    // Shape checks alone accept these; only a real parser rejects them.
-    expect(hasUsableTrustedProxy(':')).toBe(false);
-    expect(hasUsableTrustedProxy('2001:::1')).toBe(false);
-    expect(hasUsableTrustedProxy('::ffff:')).toBe(false);
-    expect(hasUsableTrustedProxy('1.2.3')).toBe(false);
   });
 });

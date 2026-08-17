@@ -5,7 +5,6 @@ import {
   LocalLoginLimiter,
   loginLockoutWindowMs,
 } from './localLoginLimiter.js';
-import { hasUsableTrustedProxy } from './trustedProxy.js';
 
 describe('LocalLoginLimiter', () => {
   it('synchronously reserves five attempts and blocks the sixth with Retry-After', () => {
@@ -74,12 +73,11 @@ describe('loginLockoutWindowMs', () => {
     expect(LOCAL_LOGIN_SHARED_WINDOW_MS).toBeLessThan(LOCAL_LOGIN_WINDOW_MS);
   });
 
-  it('treats a proxy setting that matches nothing as shared', () => {
-    // CIDR entries are never matched by compileTrustedProxy, so a deployment
-    // configured that way still shares one key (#57, codex review on #60).
-    expect(loginLockoutWindowMs(hasUsableTrustedProxy('10.0.0.0/8')))
-      .toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
-    expect(loginLockoutWindowMs(hasUsableTrustedProxy('', true)))
-      .toBe(LOCAL_LOGIN_WINDOW_MS);
+  // Only a signal that cannot go stale earns the long window. An IP allowlist
+  // can be mistyped or outlive the proxy it names, and nothing detects that at
+  // boot, so it keeps the shared-key window (#57, codex review on #60).
+  it('gives the long window only to hop trust, never to an IP allowlist', () => {
+    expect(loginLockoutWindowMs(true)).toBe(LOCAL_LOGIN_WINDOW_MS);
+    expect(loginLockoutWindowMs(false)).toBe(LOCAL_LOGIN_SHARED_WINDOW_MS);
   });
 });

@@ -22,9 +22,17 @@ export const LOCAL_LOGIN_SHARED_WINDOW_MS = 60 * 1000;
  * ~7k a day, negligible against a password whose floor is 12 characters, and it
  * keeps the owner's wait to seconds rather than a quarter of an hour.
  *
- * Pass the answer from hasUsableTrustedProxy, which is false for a setting that
- * looks configured but matches nothing (a CIDR, a stray comma) — those leave the
- * key shared just as surely as an empty setting does.
+ * Only TRUSTED_PROXY_HOP qualifies. A TRUSTED_PROXY_IPS allowlist may be stale,
+ * mistyped, or unmatchable, and none of that is detectable at boot — the peer
+ * address is not known until a request arrives. Hop trust cannot go stale: it
+ * matches whatever private peer actually connects.
+ *
+ * The asymmetry decides it. Choosing the long window wrongly hands an attacker a
+ * renewable deployment-wide lockout; choosing the short one wrongly allows ~7k
+ * guesses a day instead of ~480, which is noise against a password whose floor
+ * is 12 characters. So the long window needs a signal that cannot be wrong, and
+ * a correctly configured allowlist still gets per-client keys — just the shorter
+ * lockout with them.
  *
  * The short window is a fallback, not the fix: against an attacker who keeps
  * polling it does not bound the owner's wait at all, because each freed slot is

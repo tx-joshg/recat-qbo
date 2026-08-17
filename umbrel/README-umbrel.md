@@ -172,6 +172,13 @@ directly reachable, a public client's forwarded headers are ignored and it is
 limited on its own real address — the failure mode degrades to the old shared
 behaviour rather than to believing a stranger's claim about who they are.
 
+Note that only `TRUSTED_PROXY_HOP` earns the full-length lockout. A
+`TRUSTED_PROXY_IPS` allowlist can be mistyped or outlive the proxy it names, and
+nothing detects that at boot, so it keeps the shorter shared-key window. Getting
+that choice wrong in the permissive direction hands an attacker a renewable
+deployment-wide lockout; getting it wrong the other way allows ~7k guesses a day
+instead of ~480, which is noise against the generated `${APP_PASSWORD}`.
+
 **Bind mount, not a named volume.** Umbrel backs up and restores
 `${APP_DATA_DIR}` and recreates containers on update; a named volume would sit
 outside that.
