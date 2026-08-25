@@ -63,7 +63,9 @@ The wizard now defaults to that address
 works as soon as setup finishes. **The package must pin v0.1.3 or later.**
 Earlier pins are not merely missing features: v0.1.0 strands users at first run,
 v0.1.1 predates the claim guard, and v0.1.2's guard is bypassable through
-`/auth/magic-link` ([#53](https://github.com/tx-joshg/recat-qbo/issues/53)).
+`/auth/magic-link` ([#53](https://github.com/tx-joshg/recat-qbo/issues/53)). The
+package currently pins v0.1.5, which additionally recognizes localized
+QuickBooks companies ([#66](https://github.com/tx-joshg/recat-qbo/pull/66)).
 
 A user can still type a different address, and the wizard now warns that password
 sign-in will not apply to it. That is the remaining support case, and it is a
@@ -212,8 +214,8 @@ definitions ran exactly as they ship.
   returned 200 afterwards, which is what Umbrel does on update
 - `/api/setup/status` offers `localAdminEmail`, confirming the wizard fix is in
   the shipped image and not only in the source tree
-- **The first-run claim guard is in the shipped image** (re-verified against the
-  v0.1.3 pin): a claim with no password and a claim with the wrong one both return
+- **The first-run claim guard is in the shipped image** (verified against the
+  v0.1.3 images): a claim with no password and a claim with the wrong one both return
   `401` with no sign-in link in the body, the instance stays un-set-up, and the
   password Umbrel displays then creates the admin and signs in
 - **The magic-link bypass is closed in the shipped image**: `POST
@@ -270,10 +272,18 @@ and the MCP host guard, both closed in
 contributor's rather than something reproduced here. It is specific and measured,
 which is why it was acted on, but it is one person on one device.
 
-**Nothing since that report has been tested on hardware.** The `PROXY_AUTH_ADD`
-fix, the first-run claim guard, and the v0.1.2 pin have all been verified only on
-a developer machine. The corrected package has never been round-tripped back
-through a device.
+**The v0.1.5 images have not themselves been booted.** The verification above ran
+against v0.1.3. Carrying it forward rests on the boot-relevant surface being
+unchanged between the two — `git diff v0.1.3 v0.1.5` is empty for
+`prisma/migrations`, `server/src/index.ts`, `server/src/env.ts`, the `Dockerfile`,
+and the auth, setup and trusted-proxy code. What changed is reporting, the probe
+CLI, holding-account matching and CSS. That is a strong argument rather than a
+run, and a boot check belongs in the submission checklist below.
+
+**@salmonumbrella has since confirmed the package works on a real device**,
+including QuickBooks connecting through a TLS front. That closes the largest gap
+the earlier notes carried, though it was against the v0.1.3-era package rather
+than this pin.
 
 **`submission:` is still `PENDING`** — it cannot be filled until the upstream pull
 request exists. (`gallery: []` is *not* an outstanding item; see above.)

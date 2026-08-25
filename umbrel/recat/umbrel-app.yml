@@ -33,14 +33,15 @@ description: >-
   address and the password stops working — Umbrel installs have no outbound
   email, so until you add SMTP in Settings you would have to fetch each sign-in
   link from this app's logs by hand.
-version: "0.1.3"
+version: "0.1.5"
 releaseNotes: >-
   First Umbrel release. Setup requires the app password shown on this page, so
   an instance reachable before it is configured cannot be claimed by anyone
   else, and no sign-in link is ever handed out to an unauthenticated caller.
-  Sign-in rate limits now apply per client rather than to the whole install, so
-  nobody else's wrong guesses can lock you out. The wizard fills in the
-  administrator address, and that same password signs you in once setup
+  Sign-in rate limits apply per client rather than to the whole install, so
+  nobody else's wrong guesses can lock you out. QuickBooks companies outside the
+  US are recognized, including their localized account names. The wizard fills
+  in the administrator address, and that same password signs you in once setup
   finishes.
 developer: Josh Goble
 website: https://github.com/tx-joshg/recat-qbo
