@@ -15,14 +15,24 @@ recat/
 
 ## Before submitting
 
-**`submission` is a placeholder.** It must be the URL of the upstream pull
-request, which does not exist until you open it. Umbrel will reject the
-manifest with `PENDING` in place.
+**Submitted:** [getumbrel/umbrel-apps#6019](https://github.com/getumbrel/umbrel-apps/pull/6019),
+and `submission` now carries that URL. Anything below that says "before
+submitting" applies to the next revision of the package rather than the first.
 
-**`port: 3009`** — re-checked against the App Store index on 2026-08-15 (394
-apps, up from 391 twelve days earlier): no package references `3009`, and the app
-id `recat` is still unclaimed. `3001` was taken by `ride-the-lightning`. Re-check
-again immediately before submitting, since the store moves.
+**`port: 3019`** — and the way this was checked twice was wrong, so check it the
+right way next time.
+
+A port is claimed if *anything* in the store binds it, not just a
+`umbrel-app.yml`. `3009` was picked and re-picked by scanning manifest `port:`
+fields, which never sees a port bound through a variable. `samourai-server`
+exports `APP_SAMOURAI_SERVER_DOJO_PORT="3009"` from its `exports.sh` and binds it
+in its `nginx` service; upstream's linter rejected the submission on exactly
+that.
+
+Scan manifests, every `ports:` mapping in every `docker-compose.yml`, **and**
+every `exports.sh` — 562 ports are claimed across the store that way, against 390
+manifest entries. `3019` is free by that fuller test. The id `recat` is
+unclaimed.
 
 Note the split: `port` is the host-facing app_proxy port and must be unique,
 while `APP_PORT` and the container's `PORT` stay `3001` — that is Recat's own
@@ -74,7 +84,7 @@ deliberate choice rather than a trap.
 ### Connecting real QuickBooks needs an HTTPS address
 
 **Confirmed against a real Intuit registration: Intuit will not accept a
-non-HTTPS redirect URI for a production app.** `http://umbrel.local:3009` is
+non-HTTPS redirect URI for a production app.** `http://umbrel.local:3019` is
 neither HTTPS nor public, so an Umbrel user cannot register it.
 
 The public URL is therefore configurable at runtime (#38). An operator who

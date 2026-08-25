@@ -47,11 +47,11 @@ developer: Josh Goble
 website: https://github.com/tx-joshg/recat-qbo
 repo: https://github.com/tx-joshg/recat-qbo
 support: https://github.com/tx-joshg/recat-qbo/issues
-port: 3009
+port: 3019
 path: ""
 gallery: []
 defaultUsername: admin@recat.local
 defaultPassword: ""
 deterministicPassword: true
 submitter: Josh Goble
-submission: https://github.com/getumbrel/umbrel-apps/pull/PENDING
+submission: https://github.com/getumbrel/umbrel-apps/pull/6019
