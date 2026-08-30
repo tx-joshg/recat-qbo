@@ -29,6 +29,7 @@ export type TxnStatus =
 export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
 export type TaxCalculation = 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+export type TaxDisposition = 'set' | 'preserve_current';
 export type TaxSupportStatus = 'unsupported' | 'needs_setup' | 'ready';
 
 export interface TaxCodeDto {
@@ -92,6 +93,7 @@ export interface CategorizationProposalLine {
 /** A normalized, client-authored categorization proposal.
  * Tax totals are deliberately absent: the server calculates them. */
 export interface CategorizationProposal {
+  taxDisposition?: TaxDisposition;
   taxCalculation: TaxCalculation;
   lines: CategorizationProposalLine[];
   tagIds: string[];
@@ -119,6 +121,8 @@ export interface StagedCategorizationLine {
 export interface StagedCategorization {
   transactionId: string;
   revision: number;
+  /** Present after preserve-current staging is implemented; omitted by legacy fixtures. */
+  taxDisposition?: TaxDisposition;
   taxCalculation: TaxCalculation;
   totals: {
     subtotalCents: number;

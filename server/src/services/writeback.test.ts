@@ -120,6 +120,10 @@ describe('hashStagedCategorization', () => {
       }],
       tagIds: ['tag-c', 'tag-d'],
     }));
+    expect(hashStagedCategorization(staged)).toBe(hashStagedCategorization({
+      ...staged,
+      taxDisposition: 'set',
+    }));
   });
 });
 
@@ -1793,6 +1797,61 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
+  it('reconstructs and durably replays an exact preserve-current Purchase stage', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const input = {
+      ...commitInput('request-preserve-current'),
+      expectedTaxDisposition: 'preserve_current' as const,
+      expectedStageHash: hashStagedCategorization(preserved),
+    };
+
+    const first = await commitStagedCategorization(input, fixture.deps);
+    const persistedBody = structuredClone(fixture.db.attempts[0]!.requestPayload);
+    const replay = await commitStagedCategorization(input, fixture.deps);
+
+    expect(first).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(replay).toEqual(first);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      preserved,
+      expect.anything(),
+      'request-preserve-current',
+    );
+    expect(fixture.db.attempts[0]!.requestPayload).toEqual(persistedBody);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects a mismatched expected stage hash before QBO access on PREPARED resume', async () => {
     const fixture = durableDeps();
     seedAttempt(fixture.db, 'PREPARED', 'request-generic');
@@ -3198,6 +3257,64 @@ describe('prepareCategorizationUndo', () => {
     expect(fixture.db.attempts).toHaveLength(attemptCount);
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
     expect(fixture.audit).not.toHaveBeenCalled();
+  });
+
+  it('prepares undo from the exact verified preserve-current stage binding', async () => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.body.GlobalTaxCalculation = 'NotApplicable';
+    sourcePrepared.body.Line![0]!.AccountBasedExpenseLineDetail = {
+      AccountRef: { value: 'expense-generic' },
+      TaxCodeRef: { value: 'NON' },
+    };
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1050,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+        rawHash: 'preserved-target',
+        categoryOnlyHash: 'preserved-category-only',
+      }],
+      untouchedLineHashes: [],
+    };
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    const preservedResponse: QboPurchaseSnapshot = {
+      ...verifiedPurchase,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    };
+    fixture.source.responseSnapshot = structuredClone(preservedResponse);
+    fixture.fetchPurchaseSnapshot.mockResolvedValue(structuredClone(preservedResponse));
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
   });
 
   it('hashes the complete source and restore bindings while excluding only the throwaway request ID', async () => {

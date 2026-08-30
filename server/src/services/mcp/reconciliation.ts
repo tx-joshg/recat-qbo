@@ -322,6 +322,7 @@ export async function commitMcpCategorization(
       actor,
       authorization,
       expectedStageHash: hashStagedCategorization(loaded.preview),
+      expectedTaxDisposition: loaded.preview.taxDisposition ?? 'set',
       expectedQboBinding: {
         qboType: loaded.operation.qboType,
         qboId: loaded.operation.qboId,
@@ -334,6 +335,7 @@ export async function commitMcpCategorization(
       companyId: loaded.operation.companyId,
       expectedRevision: loaded.operation.preparedRevision,
       expectedStageHash: hashStagedCategorization(loaded.preview),
+      expectedTaxDisposition: loaded.preview.taxDisposition ?? 'set',
       expectedQboBinding: {
         qboType: loaded.operation.qboType,
         qboId: loaded.operation.qboId,

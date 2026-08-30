@@ -31,6 +31,10 @@ import type {
   TransferCandidateDto,
 } from '../services/companyReads.js';
 import type { QboAccountDto, TagDto } from '@recat/shared';
+import {
+  writeSafetyReads,
+  type WriteSafetyReadOperations,
+} from '../services/writeSafetyReads.js';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
 import {
@@ -54,6 +58,7 @@ export const READ_TOOL_NAMES = [
   'list_companies',
   'list_transactions',
   'get_transaction',
+  'get_write_safety',
   'list_categories',
   'list_tax_codes',
   'list_tags',
@@ -115,6 +120,7 @@ export interface RecatMcpContext {
   principal: McpPrincipal;
   era: 'legacy' | 'modern';
   reads?: CompanyReadOperations;
+  writeSafetyReads?: WriteSafetyReadOperations;
   mutations?: McpMutationOperations;
   requestId?: string;
   traceId?: string;
@@ -297,6 +303,7 @@ const taxCode = z.strictObject({
   active: z.boolean(),
   taxable: z.boolean().nullable(),
   combinedPurchaseRate: z.number().finite().nullable(),
+  combinedSalesRate: z.number().finite().nullable(),
 });
 const tag = z.strictObject({
   id,
@@ -348,6 +355,25 @@ const taxPageOutput = z.strictObject({
   nextCursor: z.string().max(CURSOR_MAX).nullable(),
 });
 const transactionOutput = z.strictObject({ transaction: transactionRead });
+const writeSafetyOutput = z.strictObject({
+  writeSafety: z.strictObject({
+    transactionId: id,
+    revision: z.number().int().nonnegative(),
+    qboId: text,
+    qboType: z.enum(['Purchase', 'Deposit']),
+    qboSyncToken: text,
+    txnDate: z.iso.date(),
+    bankAccountQboId: text,
+    bookCloseDate: z.iso.date().nullable(),
+    cleared: z.boolean(),
+    reconciled: z.boolean(),
+    writable: z.boolean(),
+    blockCode: z.enum([
+      'QBO_PERIOD_CLOSED',
+      'QBO_TRANSACTION_LOCKED',
+    ]).nullable(),
+  }),
+});
 const identityOutput = z.strictObject({
   identity: z.strictObject({
     userId: id,
@@ -374,6 +400,7 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [listCompaniesInput, companyListOutput],
   [listTransactionsInput, transactionPageOutput],
   [getTransactionInput, transactionOutput],
+  [getTransactionInput, writeSafetyOutput],
   [companyPageInput, categoryListOutput],
   [companyPageInput, taxPageOutput],
   [companyPageInput, tagListOutput],
@@ -401,6 +428,7 @@ function inputWithoutCompany<T extends { companyId: string }>(
 
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
+  const safetyReads = context.writeSafetyReads ?? writeSafetyReads;
   const mutations = context.mutations ?? mcpMutationOperations;
   const requestId = context.requestId ?? randomUUID();
   const traceContext = context.traceContext ?? (
@@ -511,6 +539,19 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
         input.transactionId,
       ),
     }));
+  register(
+    'get_write_safety',
+    'Read current QuickBooks book-close, cleared, and reconciled safety before preparing a transaction write.',
+    getTransactionInput,
+    writeSafetyOutput,
+    async (input) => ({
+      writeSafety: await safetyReads.getWriteSafety(
+        context.principal.userId,
+        input.companyId,
+        input.transactionId,
+      ),
+    }),
+  );
   register('list_categories', 'List active category accounts.', companyPageInput, categoryListOutput,
     (input) => reads.listCategories(context.principal.userId, input.companyId, inputWithoutCompany(input)));
   register('list_tax_codes', 'List eligible tax codes and readiness.', companyPageInput, taxPageOutput,

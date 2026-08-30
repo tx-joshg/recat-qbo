@@ -157,10 +157,59 @@ const proposalLine = z.strictObject({
   tagIds: uniqueTagIds,
 });
 const proposal = z.strictObject({
+  taxDisposition: z.enum(['set', 'preserve_current']).optional(),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(proposalLine).min(1).max(MAX_LINES),
   tagIds: uniqueTagIds,
 }).superRefine((value, context) => {
+  if (value.taxDisposition === 'preserve_current') {
+    if (value.taxCalculation !== 'NotApplicable') {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current requires NotApplicable tax calculation.',
+        path: ['taxCalculation'],
+      });
+    }
+    if (value.lines.length !== 1) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current requires exactly one line.',
+        path: ['lines'],
+      });
+    }
+    if (value.tagIds.length !== 0) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current cannot change transaction tags.',
+        path: ['tagIds'],
+      });
+    }
+    for (const [index, line] of value.lines.entries()) {
+      if (line.taxCodeQboId == null) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current requires an explicit source tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (line.memo !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line memos.',
+          path: ['lines', index, 'memo'],
+        });
+      }
+      if (line.tagIds.length !== 0) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line tags.',
+          path: ['lines', index, 'tagIds'],
+        });
+      }
+    }
+    return;
+  }
+
   for (const [index, line] of value.lines.entries()) {
     if (
       value.taxCalculation === 'NotApplicable'
@@ -218,6 +267,8 @@ const previewLine = z.strictObject({
   subtotalCents: safeInteger,
   taxCents: safeInteger,
   totalCents: safeInteger,
+  categoryQboId: qboReference,
+  taxCodeQboId: qboReference.nullable(),
 });
 const preparedCategorizationOutput = z.strictObject({
   operationId: uuid,
@@ -227,6 +278,7 @@ const preparedCategorizationOutput = z.strictObject({
   preview: z.strictObject({
     transactionId: uuid,
     revision: z.number().int().min(1).max(MAX_REVISION),
+    taxDisposition: z.enum(['set', 'preserve_current']),
     taxCalculation: z.enum([
       'TaxInclusive',
       'TaxExcluded',

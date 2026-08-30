@@ -634,6 +634,7 @@ describe('MCP categorization operation execution', () => {
       expectedRevision: 2,
       requestId: 'operation-1',
       expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      expectedTaxDisposition: 'set',
       expectedQboBinding: {
         qboType: 'Purchase',
         qboId: 'qbo-private',
@@ -645,6 +646,43 @@ describe('MCP categorization operation execution', () => {
         tokenId: 'token-1',
         tokenPrefix: 'rct_example',
       },
+    }));
+  });
+
+  it('binds a preserve-current commit to its immutable tax disposition', async () => {
+    const { deps, commit, operations } = fixture();
+    const payload = operations[0]!.payload as {
+      preview: {
+        taxDisposition?: 'set' | 'preserve_current';
+        lines: Array<{ taxCodeQboId: string | null }>;
+      };
+    };
+    payload.preview.taxDisposition = 'preserve_current';
+    payload.preview.lines[0]!.taxCodeQboId = 'NON';
+    operations[0]!.payloadHash = hashOperationPayload(operations[0]!.payload);
+    operations[0]!.inputHash = hashOperationPayload({
+      tokenId: operations[0]!.tokenId,
+      tokenPrefix: operations[0]!.tokenPrefix,
+      userId: operations[0]!.userId,
+      companyId: operations[0]!.companyId,
+      transactionId: operations[0]!.transactionId,
+      toolName: operations[0]!.toolName,
+      kind: operations[0]!.kind,
+      idempotencyKey: operations[0]!.idempotencyKey,
+      payloadHash: operations[0]!.payloadHash,
+      sourceRevision: operations[0]!.sourceRevision,
+      preparedRevision: operations[0]!.preparedRevision,
+      qboType: operations[0]!.qboType,
+      qboId: operations[0]!.qboId,
+      qboSyncToken: operations[0]!.qboSyncToken,
+      retryOfId: operations[0]!.retryOfId,
+    });
+
+    await commitMcpCategorization(principal, { operationId: 'operation-1' }, deps);
+
+    expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     }));
   });
 
@@ -762,6 +800,7 @@ describe('MCP categorization operation execution', () => {
       expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
         requestId: 'operation-1',
         expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        expectedTaxDisposition: 'set',
         expectedQboBinding: {
           qboType: 'Purchase',
           qboId: 'qbo-private',

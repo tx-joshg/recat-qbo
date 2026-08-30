@@ -13,7 +13,13 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import type { PrismaClient, Prisma } from '@prisma/client';
-import type { AuditAction, SplitDto, StagedCategorization, TxnStatus } from '@recat/shared';
+import type {
+  AuditAction,
+  SplitDto,
+  StagedCategorization,
+  TaxDisposition,
+  TxnStatus,
+} from '@recat/shared';
 import {
   QboSyncTokenConflict,
   type QboClient,
@@ -978,6 +984,7 @@ export interface CommitStagedCategorizationInput {
   requestId: string;
   actor: Actor;
   expectedStageHash?: string;
+  expectedTaxDisposition?: TaxDisposition;
   expectedQboBinding?: ExpectedQboBinding;
   authorization?: DurableMutationAuthorization;
 }
@@ -987,6 +994,7 @@ export interface ReconcileMutationAttemptInput {
   actor: Actor;
   authorization?: DurableMutationAuthorization;
   expectedStageHash?: string;
+  expectedTaxDisposition?: TaxDisposition;
   expectedQboBinding?: ExpectedQboBinding;
   auditAttribution?: McpMutationAuditAttribution;
 }
@@ -1278,7 +1286,14 @@ async function loadAuthorizedStage(
   authorization: DurableMutationAuthorization = { kind: 'user' },
   expectedStageHash?: string,
   expectedQboBinding?: ExpectedQboBinding,
+  expectedTaxDisposition: TaxDisposition = 'set',
 ): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
+  if (expectedTaxDisposition === 'preserve_current' && expectedStageHash === undefined) {
+    lifecycleError(
+      'INVALID_STAGE',
+      'Preserved Purchase tax requires an immutable expected stage hash.',
+    );
+  }
   const txn = await loadAuthorizedTransactionState(
     transactionId,
     companyId,
@@ -1320,7 +1335,22 @@ async function loadAuthorizedStage(
     totalCents: number;
   }[];
   if (taxCalculation === 'NotApplicable') {
-    if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
+    if (expectedTaxDisposition === 'preserve_current') {
+      if (
+        txn.qboType !== 'Purchase'
+        || txn.splitLines.length !== 1
+        || txn.splitLines[0]!.taxCodeQboId === null
+        || txn.splitLines[0]!.taxCodeQboId!.trim() === ''
+        || txn.splitLines[0]!.memo !== null
+        || (txn.splitLines[0]!.tags?.length ?? 0) !== 0
+        || txn.txnTags.length !== 0
+      ) {
+        lifecycleError(
+          'INVALID_STAGE',
+          'Preserved Purchase tax requires one untagged, memo-free line with an explicit tax code.',
+        );
+      }
+    } else if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
       lifecycleError('INVALID_STAGE', 'NotApplicable lines cannot retain tax references.');
     }
     calculatedLines = grossCents.map((totalCents) => ({
@@ -1461,6 +1491,9 @@ async function loadAuthorizedStage(
   const staged: StagedCategorization = {
       transactionId: txn.id,
       revision: txn.revision,
+      ...(expectedTaxDisposition === 'preserve_current'
+        ? { taxDisposition: expectedTaxDisposition }
+        : {}),
       taxCalculation,
       totals,
       lines: txn.splitLines.map((line, index) => ({
@@ -2785,6 +2818,7 @@ async function loadAuthorizedAttempt(
   authorization: DurableMutationAuthorization = { kind: 'user' },
   expectedStageHash?: string,
   expectedQboBinding?: ExpectedQboBinding,
+  expectedTaxDisposition: TaxDisposition = 'set',
 ): Promise<{ txn: DurableTransaction }> {
   if (expectedStageHash === undefined) {
     const txn = await loadAuthorizedTransactionState(
@@ -2809,6 +2843,7 @@ async function loadAuthorizedAttempt(
     authorization,
     expectedStageHash,
     expectedQboBinding,
+    expectedTaxDisposition,
   );
 }
 
@@ -2848,6 +2883,7 @@ async function enterCommitting(
     readonly proof: LiveMutationProof;
     readonly input: AutopilotWritebackAuthorityInput;
   },
+  expectedTaxDisposition: TaxDisposition = 'set',
 ): Promise<
   | { won: true; attempt: DurableAttempt }
   | { won: false; attempt: DurableAttempt }
@@ -2866,6 +2902,7 @@ async function enterCommitting(
       authorization,
       expectedStageHash,
       expectedQboBinding,
+      expectedTaxDisposition,
     );
     validatePreparedBinding(attempt, currentTxn);
     if (finalQboProof) await finalQboProof(currentTxn);
@@ -3347,6 +3384,7 @@ async function commitStagedCategorizationInternal(
           authorization,
           input.expectedStageHash,
           input.expectedQboBinding,
+          input.expectedTaxDisposition,
         ));
         client = await d.getClient(input.companyId);
       } catch (error) {
@@ -3404,6 +3442,7 @@ async function commitStagedCategorizationInternal(
               proof: autopilot.proof,
               input: authorityInput!,
             },
+        input.expectedTaxDisposition,
       );
       if (!entered.won) {
         const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -3414,6 +3453,7 @@ async function commitStagedCategorizationInternal(
           authorization,
           input.expectedStageHash,
           input.expectedQboBinding,
+          input.expectedTaxDisposition,
         );
         return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
       }
@@ -3438,6 +3478,7 @@ async function commitStagedCategorizationInternal(
       authorization,
       input.expectedStageHash,
       input.expectedQboBinding,
+      input.expectedTaxDisposition,
     );
     if (txn.company.dryRun || d.envDryRun) {
       return recordDryRun(input, txn, staged, d);
@@ -3501,6 +3542,7 @@ async function commitStagedCategorizationInternal(
         authorization,
         input.expectedStageHash,
         input.expectedQboBinding,
+        input.expectedTaxDisposition,
       );
       return recordedAttemptResultWithOutcome(d, persisted.attempt, racedTxn);
     }
@@ -3541,6 +3583,10 @@ async function commitStagedCategorizationInternal(
               input.actor.id,
               d,
               ['PENDING'],
+              authorization,
+              input.expectedStageHash,
+              input.expectedQboBinding,
+              input.expectedTaxDisposition,
             );
         }
         await assertPreparedWriteSafety(client, prepared);
@@ -3552,6 +3598,7 @@ async function commitStagedCategorizationInternal(
             proof: autopilot.proof,
             input: authorityInput!,
           },
+      input.expectedTaxDisposition,
     );
     if (!entered.won) {
       const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -3562,6 +3609,7 @@ async function commitStagedCategorizationInternal(
         authorization,
         input.expectedStageHash,
         input.expectedQboBinding,
+        input.expectedTaxDisposition,
       );
       return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
     }
@@ -3604,6 +3652,7 @@ function hashPurchaseSnapshot(snapshot: QboPreparedSnapshot): string {
 export function hashStagedCategorization(staged: StagedCategorization): string {
   const normalized: StagedCategorization = {
     ...staged,
+    taxDisposition: staged.taxDisposition ?? 'set',
     lines: [...staged.lines]
       .sort((left, right) => left.idx - right.idx)
       .map((line) => ({
@@ -3801,6 +3850,7 @@ async function reconcileMutationAttemptInternal(
         authorization,
         input.expectedStageHash,
         input.expectedQboBinding,
+        input.expectedTaxDisposition,
       );
       return recordedAttemptResultWithOutcome(d, attempt, txn);
     }
@@ -3827,6 +3877,7 @@ async function reconcileMutationAttemptInternal(
       authorization,
       input.expectedStageHash,
       input.expectedQboBinding,
+      input.expectedTaxDisposition,
     );
     const prepared = validatePreparedBinding(attempt, txn);
     if (attempt.status === 'VERIFIED' || attempt.status === 'UNCHANGED') {
@@ -3842,6 +3893,7 @@ async function reconcileMutationAttemptInternal(
       authorization,
       input.expectedStageHash,
       input.expectedQboBinding,
+      input.expectedTaxDisposition,
     );
     const client = await d.getClient(txn.companyId);
     const actual = await client.fetchPreparedSnapshot(
@@ -3932,6 +3984,38 @@ export async function prepareCategorizationUndo(
     ) {
       lifecycleError('VERIFIED_POST_REQUIRED', 'The verified source write does not match this operation.');
     }
+    const sourceTaxDisposition = sourcePrepared.expected.taxDisposition ?? 'set';
+    let sourceStageHash: string | undefined;
+    if (sourceTaxDisposition === 'preserve_current') {
+      const target = sourcePrepared.expected.targetLines[0];
+      if (
+        sourcePrepared.expected.targetLines.length !== 1
+        || target === undefined
+        || target.accountQboId === null
+        || target.taxCodeQboId === null
+      ) {
+        lifecycleError('ATTEMPT_CORRUPT', 'Verified preserved Purchase source is incomplete.');
+      }
+      const totalCents = target.amountCents;
+      sourceStageHash = hashStagedCategorization({
+        transactionId: input.transactionId,
+        revision: input.expectedRevision,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        totals: { subtotalCents: totalCents, taxCents: 0, totalCents },
+        lines: [{
+          idx: 0,
+          subtotalCents: totalCents,
+          taxCents: 0,
+          totalCents,
+          categoryQboId: target.accountQboId,
+          taxCodeQboId: target.taxCodeQboId,
+          memo: null,
+          tagIds: [],
+        }],
+        tagIds: [],
+      });
+    }
 
     const { txn: initialTxn } = await loadAuthorizedStage(
       input.transactionId,
@@ -3941,6 +4025,9 @@ export async function prepareCategorizationUndo(
       d,
       ['POSTED'],
       input.authorization,
+      sourceStageHash,
+      undefined,
+      sourceTaxDisposition,
     );
     if (
       initialTxn.qboType !== input.expectedQboBinding.qboType
@@ -3981,6 +4068,9 @@ export async function prepareCategorizationUndo(
       d,
       ['POSTED'],
       input.authorization,
+      sourceStageHash,
+      undefined,
+      sourceTaxDisposition,
     );
     if (
       txn.qboType !== input.expectedQboBinding.qboType

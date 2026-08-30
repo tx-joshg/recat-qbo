@@ -23,6 +23,7 @@ export type PurchaseVerification = VerificationResult;
 
 export function canonicalPurchaseLineHash(line: PurchaseLine): string {
   return JSON.stringify([
+    line.rawHash,
     line.id,
     line.amountCents,
     line.description,
@@ -121,6 +122,15 @@ export function verifyPurchaseResult(
   if (actual.direction !== expected.direction) return drift('Purchase direction changed.');
   if (actual.globalTaxCalculation !== expected.globalTaxCalculation) return drift('Purchase global tax mode changed.');
   if (
+    expected.taxDisposition === 'preserve_current'
+    && (
+      typeof expected.preservedHash !== 'string'
+      || expected.preservedHash !== actual.preservedHash
+    )
+  ) {
+    return drift('Purchase preserved fields changed.');
+  }
+  if (
     !purchaseTotalTaxMatches(
       expected.globalTaxCalculation,
       expected.totalTaxCents,
@@ -140,7 +150,11 @@ export function verifyPurchaseResult(
         actual.totalTaxCents,
         targetLine,
         line,
-      ) || targetLineHash(line) === targetLineHash(targetLine));
+        expected.taxDisposition,
+      ) || (
+        expected.taxDisposition !== 'preserve_current'
+        && targetLineHash(line) === targetLineHash(targetLine)
+      ));
     if (targetIndex === -1) return drift('Expected target Purchase line is missing or changed.');
     remainingLines.splice(targetIndex, 1);
   }

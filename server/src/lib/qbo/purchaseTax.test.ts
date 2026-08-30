@@ -5,8 +5,10 @@ import {
   calculatePurchaseLine,
   calculatePurchaseTransaction as calculatePurchaseTransactionRaw,
   calculateSalesTransaction as calculateSalesTransactionRaw,
+  mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization,
   preparePurchaseRestore,
+  purchaseTargetLineMatches,
 } from './purchaseTax.js';
 import { QboSyncTokenConflict, type QboPurchaseSnapshot, type RawPurchase } from './types.js';
 import type { StagedCategorization } from '@recat/shared';
@@ -747,7 +749,224 @@ function prepare(
   });
 }
 
+function changedPaths(
+  left: unknown,
+  right: unknown,
+  path = '',
+): string[] {
+  if (Object.is(left, right)) return [];
+  if (
+    left === null
+    || right === null
+    || typeof left !== 'object'
+    || typeof right !== 'object'
+    || Array.isArray(left) !== Array.isArray(right)
+  ) {
+    return [path];
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const paths: string[] = [];
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      paths.push(...changedPaths(left[index], right[index], `${path}[${index}]`));
+    }
+    return paths;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  return [...new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])]
+    .sort()
+    .flatMap((key) => changedPaths(
+      leftRecord[key],
+      rightRecord[key],
+      path === '' ? key : `${path}.${key}`,
+    ));
+}
+
+function preserveCurrentFixture(): {
+  raw: RawPurchase;
+  before: QboPurchaseSnapshot;
+  preserved: StagedCategorization;
+} {
+  const raw: RawPurchase = {
+      Id: '6477',
+      SyncToken: '0',
+      TxnDate: '2025-01-21',
+      TotalAmt: 750,
+      PaymentType: 'CreditCard',
+      PrivateNote: 'keep private note',
+      EntityRef: { value: '033', name: '033. Delicious M' },
+      AccountRef: { value: '74', name: 'SinoPac TWD' },
+      CurrencyRef: { value: 'TWD', name: 'New Taiwan Dollar' },
+      ExchangeRate: 1,
+      GlobalTaxCalculation: 'NotApplicable',
+      TxnTaxDetail: { TotalTax: 0, TaxLine: [] },
+      MetaData: { CreateTime: '2025-01-21T00:00:00Z' },
+      Line: [{
+        Id: '1',
+        Amount: 750,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        Description: 'bank charge',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          CustomerRef: { value: 'customer-1', name: 'Customer One' },
+          ClassRef: { value: 'class-1', name: 'Class One' },
+          TaxCodeRef: { value: 'NON', name: 'Non-taxable' },
+          BillableStatus: 'NotBillable',
+        },
+        CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
+      }],
+    };
+  return {
+    raw,
+    before: mapPurchaseTaxSnapshot(raw),
+    preserved: {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -75_000, taxCents: 0, totalCents: -75_000 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -75_000,
+        taxCents: 0,
+        totalCents: -75_000,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    },
+  };
+}
+
 describe('preparePurchaseRecategorization', () => {
+  it('changes only the category reference on a 6477-shaped preserve-current Purchase', () => {
+    const { raw, before, preserved } = preserveCurrentFixture();
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: preserved,
+      before,
+      requestId: 'REQUEST_6477',
+    });
+
+    expect(changedPaths(prepared.body, raw)).toEqual([
+      'Line[0].AccountBasedExpenseLineDetail.AccountRef.value',
+    ]);
+    expect(prepared.body.Line![0]).toEqual({
+      ...raw.Line![0],
+      AccountBasedExpenseLineDetail: {
+        ...raw.Line![0]!.AccountBasedExpenseLineDetail,
+        AccountRef: {
+          ...raw.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef,
+          value: '42',
+        },
+      },
+    });
+    const normalizedReadback = structuredClone(prepared.body);
+    normalizedReadback.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef!.name = 'Bank Charges';
+    const actual = mapPurchaseTaxSnapshot(normalizedReadback);
+    expect(purchaseTargetLineMatches(
+      prepared.expected.globalTaxCalculation,
+      prepared.expected.totalTaxCents,
+      actual.totalTaxCents,
+      prepared.expected.targetLines[0]!,
+      actual.lines[0]!,
+      'preserve_current',
+    )).toBe(true);
+    expect(prepared.expected).toMatchObject({
+      qboId: '6477',
+      totalCents: -75_000,
+      accountQboId: '74',
+      date: '2025-01-21',
+      direction: 'purchase',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      targetLines: [{
+        id: '1',
+        amountCents: -75_000,
+        description: 'bank charge',
+        accountQboId: '42',
+        customerQboId: 'customer-1',
+        classQboId: 'class-1',
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+      }],
+    });
+  });
+
+  it.each([
+    ['a different source tax code', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef = { value: 'ALT' };
+      fixture.before.lines[0]!.taxCodeQboId = 'ALT';
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+    ['a different global tax mode', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.GlobalTaxCalculation = 'TaxInclusive';
+      fixture.before.globalTaxCalculation = 'TaxInclusive';
+      return { ...fixture, code: 'QBO_PURCHASE_UNSUPPORTED' };
+    }],
+    ['multiple holding lines', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.Line!.push({
+        ...structuredClone(fixture.raw.Line![0]!),
+        Id: '2',
+        Amount: 0,
+      });
+      fixture.before = mapPurchaseTaxSnapshot(fixture.raw);
+      return { ...fixture, code: 'QBO_PURCHASE_UNSUPPORTED' };
+    }],
+    ['a changed line identity', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.Line![0]!.Id = 'changed';
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+    ['an amount mismatch', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.preserved.lines[0]!.subtotalCents = -74_000;
+      fixture.preserved.lines[0]!.totalCents = -74_000;
+      fixture.preserved.totals = {
+        subtotalCents: -74_000,
+        taxCents: 0,
+        totalCents: -74_000,
+      };
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+    ['a missing source tax code', () => {
+      const fixture = preserveCurrentFixture();
+      delete fixture.raw.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef;
+      fixture.before.lines[0]!.taxCodeQboId = null;
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+    ['the target category already applied', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef = { value: '42' };
+      fixture.before.lines[0]!.accountQboId = '42';
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+    ['source-body drift from the stored before snapshot', () => {
+      const fixture = preserveCurrentFixture();
+      fixture.raw.Line![0]!.Description = 'drifted description';
+      return { ...fixture, code: 'QBO_STATE_DRIFT' };
+    }],
+  ])('rejects preserve-current when fresh QBO has %s', (_name, makeFixture) => {
+    const { raw, before, preserved, code } = makeFixture();
+
+    expect(() => preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: preserved,
+      before,
+      requestId: 'REQUEST_6477_MISMATCH',
+    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code }));
+  });
+
   it('prepares an exact tax-inclusive full Purchase body and expected snapshot', () => {
     const raw = completePurchase();
     const prepared = prepare(raw);
@@ -1113,6 +1332,48 @@ describe('preparePurchaseRecategorization', () => {
 });
 
 describe('preparePurchaseRestore', () => {
+  it('undoes preserve-current by changing only the category reference on the fresh raw line', () => {
+    const { raw, before, preserved } = preserveCurrentFixture();
+    const original = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: preserved,
+      before,
+      requestId: 'REQUEST_6477_FORWARD',
+    });
+    const current: RawPurchase = {
+      ...structuredClone(original.body),
+      SyncToken: '1',
+    };
+
+    const restore = preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_6477_UNDO',
+    });
+
+    expect(changedPaths(restore.body, current)).toEqual([
+      'Line[0].AccountBasedExpenseLineDetail.AccountRef.value',
+    ]);
+    expect(restore.body.Line![0]!.CustomField).toEqual(raw.Line![0]!.CustomField);
+    expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.BillableStatus)
+      .toBe('NotBillable');
+    expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef)
+      .toEqual({ value: '2', name: 'Uncategorized Expense' });
+    const normalizedReadback = structuredClone(restore.body);
+    normalizedReadback.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef!.name =
+      'Uncategorized Expense (normalized)';
+    const actual = mapPurchaseTaxSnapshot(normalizedReadback);
+    expect(purchaseTargetLineMatches(
+      restore.expected.globalTaxCalculation,
+      restore.expected.totalTaxCents,
+      actual.totalTaxCents,
+      restore.expected.targetLines[0]!,
+      actual.lines[0]!,
+      'preserve_current',
+    )).toBe(true);
+  });
+
   it('prepares restore after QBO normalizes a non-taxable write to null/default fields', () => {
     const originalRaw = completePurchase({
       TotalAmt: 10,

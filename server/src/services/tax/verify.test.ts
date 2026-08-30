@@ -112,6 +112,55 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
+  it('requires the exact literal tax code for preserve-current Purchase verification', () => {
+    const preservedTarget = {
+      ...targetLine,
+      id: 'preserved-target',
+      taxCodeQboId: 'NON',
+      taxAmountCents: null,
+      taxInclusiveCents: null,
+      rawHash: 'exact-target-line',
+      categoryOnlyHash: 'category-only-line',
+    };
+    const preservedExpected: ExpectedPurchaseResult = {
+      ...expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-top-level',
+      targetLines: [preservedTarget],
+      untouchedLineHashes: [],
+    };
+    const preservedActual = {
+      ...actual,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: null,
+      preservedHash: 'preserved-top-level',
+      lines: [{ ...preservedTarget, rawHash: 'provider-normalized-reference-name' }],
+    };
+
+    expect(verifyPurchaseResult(preservedExpected, preservedActual)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{
+        ...preservedActual.lines[0]!,
+        taxCodeQboId: 'PROVIDER_DEFAULT_NON_TAX',
+      }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      preservedHash: 'changed-top-level',
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{
+        ...preservedTarget,
+        rawHash: 'changed-custom-field',
+        categoryOnlyHash: 'changed-non-category-field',
+      }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
   it('accepts omitted redundant tax fields when the inclusive amount proves the exact tax', () => {
     const expectedTarget = {
       ...targetLine,

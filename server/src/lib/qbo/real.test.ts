@@ -27,6 +27,7 @@ import {
   mapTaxRate,
   parseStatementReport,
   parseTransactionListReport,
+  parseTransactionLogReport,
   rebuildDepositLines,
   rebuildJournalEntryLines,
   rebuildPurchaseLines,
@@ -656,6 +657,114 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       txnDate: '2026-08-01',
       bankAccountQboId: 'bank-1',
     })).resolves.toMatchObject({ cleared: true, reconciled: true });
+  });
+
+  it('reads safety identity from Intuit ColKey metadata and the transaction-type cell', async () => {
+    const report: RawReport = {
+      Columns: {
+        Column: [
+          {
+            ColTitle: 'Date',
+            ColType: 'Date',
+            MetaData: [{ Name: 'ColKey', Value: 'tx_date' }],
+          },
+          {
+            ColTitle: 'Transaction Type',
+            ColType: 'String',
+            MetaData: [{ Name: 'ColKey', Value: 'txn_type' }],
+          },
+        ],
+      },
+      Rows: {
+        Row: [{
+          ColData: [
+            { value: '2025-01-21' },
+            { value: 'Expense', id: '6477' },
+          ],
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...report,
+        Rows: { Row: [] },
+      }))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: '6477',
+      txnDate: '2025-01-21',
+      bankAccountQboId: '74',
+    })).resolves.toEqual({
+      bookCloseDate: null,
+      cleared: true,
+      reconciled: false,
+    });
+  });
+
+  it.each([
+    ['date-cell identity conflicts with the target transaction-type identity', 'other', '6477'],
+    ['transaction-type identity conflicts with the target date-cell identity', '6477', 'other'],
+  ])('fails closed when %s', async (_label, dateId, typeId) => {
+    const report: RawReport = {
+      Columns: {
+        Column: [
+          { ColType: 'tx_date' },
+          { ColType: 'txn_type' },
+        ],
+      },
+      Rows: {
+        Row: [{
+          ColData: [
+            { value: '2025-01-21', id: dateId },
+            { value: 'Expense', id: typeId },
+          ],
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValue(new Response(JSON.stringify(report))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: '6477',
+      txnDate: '2025-01-21',
+      bankAccountQboId: '74',
+    })).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+  });
+
+  it('accepts matching duplicated report identities', async () => {
+    const report: RawReport = {
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: {
+        Row: [{
+          ColData: [
+            { value: '2025-01-21', id: '6477' },
+            { value: 'Expense', id: '6477' },
+          ],
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...report, Rows: { Row: [] } }))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: '6477',
+      txnDate: '2025-01-21',
+      bankAccountQboId: '74',
+    })).resolves.toMatchObject({ cleared: true, reconciled: false });
   });
 
   it('fails closed when the exact provider identity has an unknown report type', async () => {
@@ -1881,7 +1990,7 @@ describe('tax read normalization', () => {
           },
         ],
       }),
-    ).toEqual({
+    ).toMatchObject({
       qboId: 'P-1',
       syncToken: '7',
       totalCents: 10500,
@@ -2409,6 +2518,82 @@ describe('parseTransactionListReport', () => {
     const grouped: RawReport = { Columns: txnList.Columns, Rows: { Row: [{ type: 'Section', Rows: txnList.Rows }] } };
     expect(parseTransactionListReport(grouped)).toHaveLength(2);
     expect(parseTransactionListReport({})).toEqual([]);
+  });
+
+  it('reads live Intuit ColKey metadata and identity from the transaction-type cell', () => {
+    expect(parseTransactionListReport({
+      Columns: {
+        Column: [
+          { ColTitle: 'Date', ColType: 'Date', MetaData: [{ Name: 'ColKey', Value: 'tx_date' }] },
+          { ColTitle: 'Transaction Type', ColType: 'String', MetaData: [{ Name: 'ColKey', Value: 'txn_type' }] },
+          { ColTitle: 'Name', ColType: 'String', MetaData: [{ Name: 'ColKey', Value: 'name' }] },
+          { ColTitle: 'Amount', ColType: 'Amount', MetaData: [{ Name: 'ColKey', Value: 'subt_nat_amount' }] },
+        ],
+      },
+      Rows: { Row: [{ ColData: [
+        { value: '2025-01-21' },
+        { value: 'Expense', id: '6477' },
+        { value: '033. Delicious M' },
+        { value: '-750.00' },
+      ] }] },
+    })).toEqual([{
+      date: '2025-01-21',
+      payee: '033. Delicious M',
+      amount: -750,
+      txnType: 'Expense',
+      qboId: '6477',
+    }]);
+  });
+
+  it('rejects conflicting report identity carriers', () => {
+    expect(() => parseTransactionListReport({
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: { Row: [{ ColData: [
+        { value: '2025-01-21', id: '6477' },
+        { value: 'Expense', id: 'other' },
+      ] }] },
+    })).toThrow('Conflicting QuickBooks report transaction identities');
+  });
+});
+
+describe('parseTransactionLogReport', () => {
+  it('uses live ColKey metadata and the transaction-type identity carrier', () => {
+    expect(parseTransactionLogReport({
+      Columns: {
+        Column: [
+          { ColTitle: 'Date', ColType: 'Date', MetaData: [{ Name: 'ColKey', Value: 'tx_date' }] },
+          { ColTitle: 'Transaction Type', ColType: 'String', MetaData: [{ Name: 'ColKey', Value: 'txn_type' }] },
+          { ColTitle: 'Account', ColType: 'String', MetaData: [{ Name: 'ColKey', Value: 'account_name' }] },
+          { ColTitle: 'Split', ColType: 'String', MetaData: [{ Name: 'ColKey', Value: 'other_account' }] },
+          { ColTitle: 'Amount', ColType: 'Amount', MetaData: [{ Name: 'ColKey', Value: 'subt_nat_amount' }] },
+        ],
+      },
+      Rows: { Row: [{ ColData: [
+        { value: '2025-01-21' },
+        { value: 'Expense', id: '6477' },
+        { value: 'SinoPac' },
+        { value: 'Bank Charges' },
+        { value: '-750.00' },
+      ] }] },
+    })).toEqual([{
+      date: '2025-01-21',
+      txnType: 'Expense',
+      payee: '',
+      account: 'SinoPac',
+      category: 'Bank Charges',
+      amount: -750,
+      qboId: '6477',
+    }]);
+  });
+
+  it('rejects conflicting report identity carriers', () => {
+    expect(() => parseTransactionLogReport({
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: { Row: [{ ColData: [
+        { value: '2025-01-21', id: '6477' },
+        { value: 'Expense', id: 'other' },
+      ] }] },
+    })).toThrow('Conflicting QuickBooks report transaction identities');
   });
 });
 
