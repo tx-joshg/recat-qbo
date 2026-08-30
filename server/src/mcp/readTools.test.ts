@@ -89,6 +89,64 @@ async function legacy(handler: ReturnType<typeof createMcpHandler>, method: stri
 }
 
 describe('Recat MCP read tools', () => {
+  it('returns the complete tax-code DTO instead of rejecting its sales rate', async () => {
+    const operations = reads();
+    vi.mocked(operations.listTaxCodes).mockResolvedValue({
+      status: 'ready',
+      reason: null,
+      usingSalesTax: true,
+      refreshedAt: '2026-08-30T20:00:00.000Z',
+      items: [
+        {
+          qboId: 'NON',
+          name: 'Non-taxable',
+          active: true,
+          taxable: false,
+          combinedPurchaseRate: null,
+          combinedSalesRate: null,
+        },
+        {
+          qboId: 'SALES7',
+          name: 'Sales tax 7%',
+          active: true,
+          taxable: true,
+          combinedPurchaseRate: null,
+          combinedSalesRate: 7,
+        },
+      ],
+      nextCursor: null,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'list_tax_codes',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.items).toEqual([
+      {
+        qboId: 'NON',
+        name: 'Non-taxable',
+        active: true,
+        taxable: false,
+        combinedPurchaseRate: null,
+        combinedSalesRate: null,
+      },
+      {
+        qboId: 'SALES7',
+        name: 'Sales tax 7%',
+        active: true,
+        taxable: true,
+        combinedPurchaseRate: null,
+        combinedSalesRate: 7,
+      },
+    ]);
+  });
+
   it('does not rerun static schema deadline checks for concurrent fresh servers', async () => {
     let simulatedNow = 0;
     const now = vi.spyOn(performance, 'now').mockImplementation(() => {
