@@ -364,21 +364,21 @@ describe('tax-aware manual queue', () => {
     const user = userEvent.setup();
     await renderQueue();
 
-    await user.click(screen.getByRole('button', {
-      name: 'Expenses · Generic expense',
+    await user.click(screen.getByRole('combobox', {
+      name: 'Category for Generic supplier',
     }));
 
-    expect(screen.queryByRole('button', {
+    expect(screen.queryByRole('option', {
       name: /Uncategorised Expense/,
     })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', {
+    expect(screen.getByRole('option', {
       name: /Alternate expense/,
     })).toBeInTheDocument();
 
     // A user's own account that merely mentions the term is not QuickBooks'
     // holding account, and hiding it would remove a destination they created
     // on purpose with nothing to explain where it went.
-    expect(screen.getByRole('button', {
+    expect(screen.getByRole('option', {
       name: /Old Uncategorized Costs/,
     })).toBeInTheDocument();
   });
@@ -534,8 +534,8 @@ describe('tax-aware manual queue', () => {
 
   it('invalidates an in-flight preview when the category changes', async () => {
     await expectInFlightChangeInvalidates(async (user) => {
-      await user.click(screen.getByRole('button', { name: 'Expenses · Generic expense' }));
-      await user.click(screen.getByRole('button', { name: /Alternate expense/ }));
+      await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+      await user.click(screen.getByRole('option', { name: /Alternate expense/ }));
     });
   });
 
@@ -833,8 +833,8 @@ describe('tax-aware manual queue', () => {
         },
       }));
 
-      expect(screen.getByRole('button', {
-        name: 'Expenses · Generic expense',
+      expect(screen.getByRole('combobox', {
+        name: 'Category for Generic supplier',
       })).toBeDisabled();
       expect(screen.getByRole('button', { name: 'Split' })).toBeDisabled();
       expect(screen.getByRole('button', { name: '+ tag' })).toBeDisabled();
