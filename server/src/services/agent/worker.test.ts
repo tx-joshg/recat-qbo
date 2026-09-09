@@ -173,7 +173,7 @@ function capabilityImporters(
 }
 
 describe('shadow worker safety boundary', () => {
-  it('does not import staging, writeback, transfer, QBO, network, or filesystem mutation services', () => {
+  it('restricts direct imports to snapshot, classification search, and durable job helpers', () => {
     const directory = dirname(fileURLToPath(import.meta.url));
     const fileName = join(directory, 'worker.ts');
     const source = readFileSync(fileName, 'utf8');
@@ -186,6 +186,7 @@ describe('shadow worker safety boundary', () => {
     });
 
     expect(imports).toEqual([
+      './classificationSearch.js',
       './core/decision.js',
       './core/model.js',
       './core/runner.js',

@@ -283,3 +283,5 @@ it.each(['COMMITTED', 'REPLAYED'] as const)('clears obsolete rule test counts af
   await screen.findByRole('button', { name: 'Disabled' });
   expect(screen.queryByText('2 pending · 1 processed · 0 conflicts')).not.toBeInTheDocument();
 });
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  ClassificationCase,
+  HistoricalObservationPastDecision,
   RuleCandidateDto,
   RuleDetailDto,
   RuleDirection,
@@ -10,14 +12,17 @@ import type {
   RuleTestResult,
 } from '@recat/shared';
 import { isQboHoldingAccountName } from '@recat/shared';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import {
+  classificationMemory,
   createCategorizationRequestId,
   ruleCandidates as ruleCandidatesApi,
   ruleOperations,
   rules as rulesApi,
   type PrepareRuleOperationBody,
 } from '../lib/api';
+import ClassificationMemoryPanel from '../components/ClassificationMemoryPanel';
+import PastDecisionsSection from './rules/PastDecisionsSection';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { Select } from '../components/SelectCombobox';
 import { fmtDate, fmtMoney } from '../lib/format';
@@ -99,6 +104,7 @@ function PreviewBody({ operation }: { operation: PreparedIntent }) {
 }
 
 export default function Rules() {
+  const { search: sourceSearch } = useLocation();
   const { activeCompanyId, activeCompany, accounts, tags, taxReadiness, toast } = useApp();
   const [filter, setFilter] = useState<RuleLifecycleFilter>('all');
   const [ruleList, setRuleList] = useState<RuleDetailDto[]>([]);
@@ -119,6 +125,8 @@ export default function Rules() {
   const [commitBusy, setCommitBusy] = useState(false);
   const [testResult, setTestResult] = useState<Record<string, { revision: number; result: RuleTestResult }>>({});
   const [testBusy, setTestBusy] = useState<string | null>(null);
+  const [sourceCase, setSourceCase] = useState<ClassificationCase | null>(null);
+  const [sourceObservation, setSourceObservation] = useState<HistoricalObservationPastDecision | null>(null);
   const [sourceRule, setSourceRule] = useState<RuleDetailDto | null>(null);
   const [sourceCandidate, setSourceCandidate] = useState<RuleCandidateDto | null>(null);
   const companyRef = useRef(activeCompanyId);
@@ -208,14 +216,22 @@ export default function Rules() {
     setCandidateList([]); candidateListRef.current = []; setCandidateCursor(null); setCandidatesError(null); setCandidatesTruncated(false);
     setPrepared(null); setPrepareBusy(false); setPrepareError(null); setCommitBusy(false);
     preparingRef.current = false; committingRef.current = false; pendingPreparationRef.current = null;
-    setTestBusy(null); setTestResult({}); setSourceRule(null); setSourceCandidate(null);
+    setTestBusy(null); setTestResult({}); setSourceCase(null); setSourceObservation(null); setSourceRule(null); setSourceCandidate(null);
     if (!companyId) return cleanup;
     void loadFirstPage(companyId, filter); void loadCandidates(companyId);
 
-    const source = new URLSearchParams(window.location.search);
+    const source = new URLSearchParams(sourceSearch);
     const sourceKind = source.get('source');
     const sourceId = source.get('sourceId');
-    if (sourceKind === 'rule' && sourceId) {
+    if (sourceKind === 'classification_case' && sourceId) {
+      classificationMemory.getCase(companyId, sourceId)
+        .then(value => { if (!cancelled && companyRef.current === companyId && value.companyId === companyId && value.id === sourceId) setSourceCase(value); })
+        .catch((error: Error) => { if (!cancelled && companyRef.current === companyId) toast(error.message); });
+    } else if (sourceKind === 'historical_observation' && sourceId) {
+      classificationMemory.getObservation(companyId, sourceId)
+        .then(value => { if (!cancelled && companyRef.current === companyId && value.companyId === companyId && value.id === sourceId) setSourceObservation(value); })
+        .catch((error: Error) => { if (!cancelled && companyRef.current === companyId) toast(error.message); });
+    } else if (sourceKind === 'rule' && sourceId) {
       rulesApi.detail(companyId, sourceId)
         .then((value) => { if (!cancelled && companyRef.current === companyId) setSourceRule(value); })
         .catch((error: Error) => { if (!cancelled && companyRef.current === companyId) toast(error.message); });
@@ -225,7 +241,7 @@ export default function Rules() {
         .catch((error: Error) => { if (!cancelled && companyRef.current === companyId) toast(error.message); });
     }
     return cleanup;
-  }, [activeCompanyId, filter, loadCandidates, loadFirstPage, toast]);
+  }, [activeCompanyId, filter, loadCandidates, loadFirstPage, sourceSearch, toast]);
 
   const loadMoreRules = useCallback(async () => {
     if (!activeCompanyId || !ruleCursor || rulesBusy || ruleListRef.current.length >= MAX_VISIBLE_RULES) return;
@@ -406,6 +422,20 @@ export default function Rules() {
         : 'Rule editing is unavailable until the current status can be loaded.'}
     </div>}
 
+    {activeCompanyId && <ClassificationMemoryPanel companyId={activeCompanyId} title="Search rules" />}
+
+    {sourceCase && <section id={`classification-case-${sourceCase.id}`} aria-label="Source classification case" className="rule-source-card">
+      <h2>Source classification case</h2><p>{sourceCase.rationale}</p>
+      <div className="rule-editor-meta">Verified {fmtDate(sourceCase.verifiedAt)} · {sourceCase.context.sourceAccountName ?? 'Unknown source account'} · {readable(sourceCase.originIntent)}</div>
+      {sourceCase.citations.slice(0, 10).map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title} — {citation.publisher}</a>)}
+    </section>}
+    {sourceObservation && <section id={`classification-historical_observation-${sourceObservation.id}`} aria-label="Source historical observation" className="rule-source-card">
+      <h2>Advisory historical observation</h2><p>{sourceObservation.payee}</p>
+      {sourceObservation.memo && <p>{sourceObservation.memo}</p>}
+      <p className="rule-editor-meta">Observed {fmtDate(sourceObservation.observedAt)} · Source status {sourceObservation.sourceStatus ?? 'unknown'}</p>
+      {sourceObservation.supersededByCaseId && <Link to={`/rules?source=classification_case&sourceId=${sourceObservation.supersededByCaseId}`}>Superseded by verified decision</Link>}
+    </section>}
+
     <section aria-labelledby="lifecycle-rules-title">
       <h2 id="lifecycle-rules-title" style={{ fontSize: 19 }}>Rules</h2>
       {rulesError && <div role="alert" aria-label="Rules unavailable" className="rule-error">{rulesError}{' '}<button style={buttonStyle} disabled={rulesBusy} onClick={() => activeCompanyId && void loadFirstPage(activeCompanyId, filter)}>Retry rules</button></div>}
@@ -441,6 +471,8 @@ export default function Rules() {
       {rulesTruncated && <div role="status" aria-label="Rule lifecycle truncated">Showing first {ruleList.length} rules; more rules exist.</div>}
       {ruleCursor && <button style={{ ...buttonStyle, marginTop: 12 }} disabled={rulesBusy} onClick={() => void loadMoreRules()}>{rulesBusy ? 'Loading…' : 'Load more rules'}</button>}
     </section>
+
+    {activeCompanyId && <PastDecisionsSection companyId={activeCompanyId} />}
 
     <section aria-labelledby="candidate-title" style={{ marginTop: 28 }}>
       <h2 id="candidate-title" style={{ fontSize: 19 }}>Learned Candidates</h2>

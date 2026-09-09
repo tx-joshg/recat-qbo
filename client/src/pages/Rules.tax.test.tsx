@@ -53,6 +53,7 @@ vi.mock('../lib/api', () => ({
 }));
 
 vi.mock('react-router-dom', () => ({
+  useLocation: () => ({ search: '' }),
   Link: ({ to, children, ...props }: { to: string; children: ReactNode } & AnchorHTMLAttributes<HTMLAnchorElement>) =>
     createElement('a', { href: to, ...props }, children),
 }));
@@ -84,3 +85,6 @@ describe('Rules historical tax validation', () => {
     ).toBeInTheDocument();
   });
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));

@@ -35,6 +35,7 @@ import { InfoDot, Spinner } from '../components/ui';
 import CategoryPicker from '../components/CategoryPicker';
 import { Select } from '../components/SelectCombobox';
 import TagPicker from '../components/TagPicker';
+import ClassificationMemoryPanel from '../components/ClassificationMemoryPanel';
 import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
@@ -141,6 +142,20 @@ const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 function canUndoPosted(postedAt: string | null | undefined): boolean {
   if (!postedAt) return true;
   return Date.now() - new Date(postedAt).getTime() <= UNDO_WINDOW_MS;
+}
+
+export function similarDecisionsQuery(
+  transaction: Pick<TransactionDto, 'payee' | 'memo'>,
+): string {
+  const normalize = (value: string | null | undefined) => value
+    ? value.normalize('NFC').trim().replace(/\s+/gu, ' ')
+    : '';
+  const payee = normalize(transaction.payee);
+  const memo = normalize(transaction.memo);
+  const parts = memo !== '' && memo.localeCompare(payee, undefined, { sensitivity: 'accent' }) !== 0
+    ? [payee, memo]
+    : [payee];
+  return parts.filter(Boolean).join(' ').slice(0, 256);
 }
 
 function errText(e: unknown): string {
@@ -2536,6 +2551,17 @@ export default function Queue() {
         <div style={{ marginBottom: 12 }}>
           <ProviderStatusRefresh key={activeCompanyId} companyId={activeCompanyId} onRefreshed={reloadProviderStatuses} />
         </div>
+      )}
+
+      {activeCompanyId && activeRow && (
+        <ClassificationMemoryPanel
+          key={`${activeCompanyId}:${activeRow.id}`}
+          companyId={activeCompanyId}
+          initialQuery={similarDecisionsQuery(activeRow)}
+          transactionId={activeRow.id}
+          title="Similar Decisions"
+          autoSearch
+        />
       )}
 
       {taxReadiness?.status !== 'ready' && (

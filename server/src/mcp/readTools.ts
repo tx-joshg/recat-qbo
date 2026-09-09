@@ -1,3 +1,4 @@
+import { parseClassificationSearchResult } from '../services/classification/contracts.js';
 import type { ClassificationCase, RuleDirection, RuleLifecycleFilter, RuleLifecyclePageDto } from '@recat/shared';
 import { HttpError } from '../lib/http.js';
 import {
@@ -12,6 +13,7 @@ import { z } from 'zod-v4';
 import type { McpPrincipal } from './auth.js';
 import {
   DEFAULT_READ_LIMIT,
+  searchClassificationKnowledge,
   MAX_READ_LIMIT,
   getTransaction,
   getClassificationCase,
@@ -29,6 +31,7 @@ import {
 } from '../services/companyReads.js';
 import type {
   CompanyRuleReadDto,
+  ClassificationSearchPage,
   RuleCandidateReadDto,
   RuleTestReadDto,
   CompanyReadTransactionDto,
@@ -92,6 +95,7 @@ export const READ_TOOL_NAMES = [
   'list_rule_candidates',
   'get_rule_candidate',
   'get_classification_case',
+  'search_classification_knowledge',
   'list_transfer_candidates',
 ] as const;
 
@@ -149,6 +153,18 @@ export interface CompanyReadOperations {
     caseId: string,
   ): Promise<ClassificationCase>;
 
+  searchClassificationKnowledge(
+    userId: string,
+    companyId: string,
+    input: {
+      query: string;
+      scope?: 'current_company' | 'accessible_companies';
+      mode: 'auto' | 'exact' | 'lexical' | 'hybrid' | 'semantic';
+      limit?: number;
+      cursor?: string;
+      transactionId?: string;
+    },
+  ): Promise<ClassificationSearchPage>;
   listTransferCandidates(
     userId: string,
     companyId: string,
@@ -177,6 +193,7 @@ export const companyReads: CompanyReadOperations = Object.freeze({
   listRuleCandidates,
   getRuleCandidate,
   getClassificationCase,
+  searchClassificationKnowledge,
   listTransferCandidates,
 });
 
@@ -327,10 +344,21 @@ const getRuleCandidateInput = z.strictObject({ companyId: id, candidateId: id })
 
 const getClassificationCaseInput = z.strictObject({ companyId: id, caseId: id });
 
+const searchClassificationInput = z.strictObject({
+  companyId: id,
+  query: z.string().min(1).max(256),
+  scope: z.enum(['current_company', 'accessible_companies']).default('current_company').optional(),
+  mode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  transactionId: id.optional(),
+  ...pageInput,
+});
+
 const text = z.string().max(2_048);
 const isoDate = z.string().max(64);
 const nullableText = text.nullable();
 const nullableIsoDate = isoDate.nullable();
+const observationProvenanceText = z.string().min(1).max(256)
+  .refine((value) => Array.from(value).length <= 128, 'Expected at most 128 code points.');
 const taxCalculation = z.enum([
   'TaxInclusive',
   'TaxExcluded',
@@ -352,6 +380,86 @@ const action = z.strictObject({
   memo: nullableText.optional(),
 });
 
+const actionSummary = z.strictObject({
+  categoryName: text,
+  taxCalculation,
+  taxCodeName: nullableText,
+  tagNames: z.array(text).max(50),
+});
+const observation = z.strictObject({
+  sourceTransactionId: id,
+  sourceQboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+  sourceQboId: observationProvenanceText,
+  sourceTransactionRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  sourceQboSyncToken: observationProvenanceText,
+  sourceStatus: z.literal('POSTED'),
+  sourceUpdatedAt: isoDate,
+  observedAt: isoDate,
+});
+const conflict = z.strictObject({
+  id,
+  companyId: id,
+  sourceId: id,
+  kind: z.enum(['case', 'candidate', 'rule', 'jurisdiction', 'tax']),
+  reason: text,
+  action: action.nullable(),
+  actionSummary: actionSummary.nullable(),
+  evidenceCount: z.number().int().nonnegative().max(10_000),
+});
+const evidenceCard = z.strictObject({
+  id,
+  sourceId: id,
+  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate', 'historical_observation']),
+  companyId: id,
+  companyName: z.string().min(1).max(200),
+  companyRelation: z.enum(['current', 'foreign']),
+  executable: z.boolean(),
+  advisory: z.boolean(),
+  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'observation', 'lexical', 'semantic'])).min(1).max(7),
+  score: z.number().finite().nonnegative(),
+  vendorIdentityId: id.nullable(),
+  vendorName: nullableText,
+  action: action.nullable(),
+  actionSummary: actionSummary.nullable(),
+  originIntent: z.enum(['apply_once', 'make_recurring', 'auto_candidate']).nullable(),
+  evidenceCount: z.number().int().nonnegative().max(10_000),
+  conflictingEvidenceCount: z.number().int().nonnegative().max(10_000),
+  conflicts: z.array(conflict).max(20),
+  provenance,
+  rationale: z.string().max(2_000).nullable(),
+  examples: z.array(text).max(20),
+  counterexamples: z.array(text).max(20),
+  jurisdiction: z.string().max(128).nullable(),
+  currency: z.string().regex(/^[A-Z]{3}$/u).nullable(),
+  verifiedAt: nullableIsoDate,
+  ruleRevision: z.number().int().nonnegative().nullable(),
+  observation: observation.nullable(),
+}).superRefine((card, issue) => {
+  if (
+    card.companyRelation === 'foreign'
+    && (
+      card.action !== null
+      || card.executable
+      || !card.advisory
+      || card.conflicts.some((item) => item.action !== null)
+    )
+  ) {
+    issue.addIssue({
+      code: 'custom',
+      path: ['action'],
+      message: 'Foreign evidence must be advisory and omit executable action identifiers.',
+    });
+  }
+  if (card.kind === 'historical_observation') {
+    if (!card.advisory || card.executable || card.action !== null || card.actionSummary === null
+      || card.originIntent !== null || card.verifiedAt !== null || card.evidenceCount !== 0
+      || card.observation === null || card.provenance.source !== 'historical_observation') {
+      issue.addIssue({ code: 'custom', path: ['kind'], message: 'Historical observations are display-only evidence.' });
+    }
+  } else if (card.observation !== null) {
+    issue.addIssue({ code: 'custom', path: ['observation'], message: 'Only historical observations carry snapshot provenance.' });
+  }
+});
 const role = z.enum(['viewer', 'categorizer', 'admin']);
 const transactionStatus = z.enum([
   'PENDING',
@@ -795,6 +903,23 @@ const tagListOutput = pageOutput(tag);
 const ruleListOutput = pageOutput(getRuleOutput).extend({ runtimeMode: z.enum(['legacy', 'bridge', 'paused', 'canonical']) });
 const candidateListOutput = pageOutput(candidateOutput);
 
+const searchClassificationOutput = z.strictObject({
+  query: z.string().min(1).max(256),
+  companyId: id,
+  scope: z.enum(['current_company', 'accessible_companies']),
+  mode: z.enum(['exact', 'lexical', 'hybrid', 'semantic']),
+  requestedMode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  degraded: z.boolean(),
+  degradedReason: z.enum([
+    'semantic_unavailable', 'vector_capability_unavailable', 'embedding_not_configured',
+    'lexical_only', 'semantic_error',
+  ]).nullable(),
+  status: z.enum(['matched', 'no_match']),
+  noMatch: z.boolean(),
+  total: z.number().int().nonnegative().max(10_000),
+  items: z.array(evidenceCard).max(MAX_READ_LIMIT),
+  nextCursor: z.string().max(CURSOR_MAX).nullable(),
+});
 const transferCandidateListOutput = pageOutput(
   z.strictObject({ a: transaction, b: transaction }),
 );
@@ -816,6 +941,7 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [companyPageInput, candidateListOutput],
   [getRuleCandidateInput, candidateOutput],
   [getClassificationCaseInput, classificationCaseOutput],
+  [searchClassificationInput, searchClassificationOutput],
   [companyPageInput, transferCandidateListOutput],
 ];
 
@@ -876,6 +1002,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     outputSchema: z.ZodObject,
     operation: (input: z.output<T>) => Promise<unknown>,
     toolAnnotations: ToolAnnotations = annotations,
+    validateOutput?: (output: unknown) => void,
   ): void => {
     const callback = async (input: z.output<T>, sdkContext: ServerContext) => {
       const tokenPrefixPolicy =
@@ -905,6 +1032,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
             // toolSuccess mirrors structured output into a text block.
             // Bound the complete wire representation before recording success.
             assertBoundedMcpOutput(toolSuccess(asJson(parsed.data)));
+            try { validateOutput?.(parsed.data); } catch { throw new InvalidMcpToolOutputError(); }
             return parsed.data;
           },
         );
@@ -1068,6 +1196,37 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     getClassificationCaseInput,
     classificationCaseOutput,
     (input) => reads.getClassificationCase(context.principal.userId, input.companyId, input.caseId),
+  );
+  register(
+    'search_classification_knowledge',
+    'Search bounded classification evidence cards. An optional current-company transactionId derives canonical context and excludes that transaction from its own evidence. Defaults to the current company; accessible-companies includes only actual memberships and foreign hits are advisory with QBO action IDs removed. Auto may label lexical degradation; explicit semantic or hybrid fails safely when unavailable; empty evidence returns no_match.',
+    searchClassificationInput,
+    searchClassificationOutput,
+    (input) => reads.searchClassificationKnowledge(
+      context.principal.userId,
+      input.companyId,
+      inputWithoutCompany(input),
+    ),
+    annotations,
+    (output) => {
+      const page = output as ClassificationSearchPage;
+      if (page.nextCursor !== null && (page.noMatch || page.items.length === 0)) {
+        throw new InvalidMcpToolOutputError();
+      }
+      parseClassificationSearchResult({
+        query: page.query,
+        companyId: page.companyId,
+        scope: page.scope,
+        mode: page.mode,
+        requestedMode: page.requestedMode,
+        degraded: page.degraded,
+        degradedReason: page.degradedReason,
+        status: page.status,
+        noMatch: page.noMatch,
+        total: page.total,
+        hits: page.items,
+      });
+    },
   );
   register('list_transfer_candidates', 'List bounded transfer candidate pairs.', companyPageInput, transferCandidateListOutput,
     (input) => reads.listTransferCandidates(context.principal.userId, input.companyId, inputWithoutCompany(input)));

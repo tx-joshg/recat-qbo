@@ -380,3 +380,5 @@ describe('Queue shared controls', () => {
     expect(category).toHaveTextContent('Expenses · Office expense');
   });
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));

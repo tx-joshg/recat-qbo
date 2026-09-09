@@ -95,7 +95,7 @@ function prepared(mutation: RuleMutationKind): RuleMutationResult {
   };
 }
 
-function renderRules() { return render(<MemoryRouter><Rules /></MemoryRouter>); }
+function renderRules() { return render(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>); }
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -310,7 +310,7 @@ describe('Rules candidate review', () => {
 
     mocks.activeCompanyId = 'company-b';
     mocks.activeCompany = { id: 'company-b', holdingAccountIds: [] };
-    view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+    view.rerender(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
     await waitFor(() => expect(mocks.candidates).toHaveBeenCalledWith('company-b'));
 
     await act(async () => {
@@ -366,7 +366,7 @@ describe('Rules candidate review', () => {
 
     mocks.activeCompanyId = 'company-b';
     mocks.activeCompany = { id: 'company-b', holdingAccountIds: [] };
-    view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+    view.rerender(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
     await waitFor(() => expect(mocks.candidates).toHaveBeenCalledWith('company-b'));
 
     await act(async () => resolveActivation(prepared('activate_candidate')));
@@ -381,7 +381,7 @@ it('does not commit a late immediate operation after the Rules page unmounts', a
   mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
   let resolve!: (value: RuleMutationResult) => void;
   mocks.prepare.mockReturnValue(new Promise<RuleMutationResult>(done => { resolve = done; }));
-  const view = render(<MemoryRouter><Rules /></MemoryRouter>);
+  const view = render(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
   await userEvent.click(await screen.findByRole('button', { name: 'Enabled' }));
   view.unmount();
   await act(async () => resolve(prepared('disable')));
@@ -393,12 +393,15 @@ it('does not restore a stale test result after switching away and back', async (
   mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
   let resolve!: (value: unknown) => void;
   mocks.testRule.mockReturnValue(new Promise(done => { resolve = done; }));
-  const view = render(<MemoryRouter><Rules /></MemoryRouter>);
+  const view = render(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
   await userEvent.click(await screen.findByRole('button', { name: 'Test rule' }));
   mocks.activeCompanyId = 'company-b';
-  view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+  view.rerender(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
   mocks.activeCompanyId = 'company-a';
-  view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+  view.rerender(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>);
   await act(async () => resolve({ pendingCount: 777, processedCount: 0, conflicts: [], matches: [] }));
   expect(screen.queryByText(/777 pending/)).not.toBeInTheDocument();
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));

@@ -1,3 +1,4 @@
+import { classificationSearchForCompany } from './classificationSearch.js';
 import type {
   CategorizationProposal,
   StageCategorizationInput,
@@ -1271,6 +1272,7 @@ function productionLiveWorkerDeps(
       model: models.decisionModel,
       reviewModel: models.reviewModel,
       limits: models.limits,
+      classificationSearch: classificationSearchForCompany(job.companyId),
     }),
     verifyDecision: async (snapshot, decision) => verifyLiveDecision(
       { snapshot, decision },

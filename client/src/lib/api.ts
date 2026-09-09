@@ -61,6 +61,12 @@ import type {
   RuleMutationKind,
   RuleMutationResult,
   ClassificationCase,
+  ClassificationSearchHit,
+  ClassificationSearchMode,
+  ClassificationSearchScope,
+  ClassificationPastDecisionPageDto,
+  HistoricalObservationPastDecision,
+  PastDecisionFilter,
   RuleCandidateDto,
   RuleTestResult,
   SavedReportConfig,
@@ -892,9 +898,86 @@ export const tags = {
     api.del<void>(`/api/companies/${companyId}/tags/${tagId}`),
 };
 
+export interface ClassificationSearchPageDto {
+  query: string;
+  companyId: string;
+  scope: ClassificationSearchScope;
+  mode: Exclude<ClassificationSearchMode, 'auto'>;
+  requestedMode: ClassificationSearchMode;
+  degraded: boolean;
+  degradedReason:
+    | 'semantic_unavailable'
+    | 'vector_capability_unavailable'
+    | 'embedding_not_configured'
+    | 'lexical_only'
+    | 'semantic_error'
+    | null;
+  status: 'matched' | 'no_match';
+  noMatch: boolean;
+  total: number;
+  items: ClassificationSearchHit[];
+  nextCursor: string | null;
+}
+
+export interface ClassificationSemanticHealthDto {
+  configured: boolean;
+  provider: string;
+  model: string;
+  dimensions: number;
+  vectorAvailable: boolean;
+  expectedGeneration: string | null;
+  indexedGeneration: string | null;
+  activeGeneration: string | null;
+  expectedState: string | null;
+  embedded: number;
+  skipped: number;
+  backlog: number;
+  progress: number;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  latestAttemptGeneration: string | null;
+  latestAttemptState: string | null;
+  latestAttemptAt: string | null;
+  latestAttemptError: string | null;
+  currentCorpusRevision: string | null;
+  indexedCorpusRevision: string | null;
+  expectedCorpusRevision: string | null;
+  latestAttemptCorpusRevision: string | null;
+}
+
+export interface ClassificationSearchParams {
+  query: string;
+  mode: ClassificationSearchMode;
+  scope?: ClassificationSearchScope;
+  transactionId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
 export const classificationMemory = {
+  search: (companyId: string, params: ClassificationSearchParams) =>
+    api.get<ClassificationSearchPageDto>(
+      `/api/companies/${companyId}/classification/search${qs({ ...params })}`,
+    ),
+  getCase: (companyId: string, caseId: string) =>
+    api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/${caseId}`),
+  pastDecisions: (companyId: string, params: {
+    kind?: PastDecisionFilter; limit?: number; cursor?: string;
+  }) => api.get<ClassificationPastDecisionPageDto>(
+    `/api/companies/${companyId}/classification/past-decisions${qs(params)}`,
+  ),
+  getObservation: (companyId: string, observationId: string) =>
+    api.get<HistoricalObservationPastDecision>(
+      `/api/companies/${companyId}/classification/observations/${observationId}`,
+    ),
   currentCase: (companyId: string, transactionId: string) =>
-    api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`),
+    api.get<ClassificationCase>(
+      `/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`,
+    ),
+  health: (companyId: string) =>
+    api.get<ClassificationSemanticHealthDto>(
+      `/api/companies/${companyId}/health/classification-search`,
+    ),
 };
 
 export interface PrepareRuleOperationBody {

@@ -147,3 +147,6 @@ it('loads history and affected rows from the same footer as the editor actions',
   expect(mocks.affectedTransactions).toHaveBeenCalledWith('COMPANY_GENERIC', 'rule-1', { status: 'all', limit: 20 });
   expect(await screen.findByText('No revisions recorded.')).toBeInTheDocument();
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));

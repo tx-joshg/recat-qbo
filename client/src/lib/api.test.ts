@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   companies,
+  classificationMemory,
   attachments,
   autopilot,
   createCategorizationRequestId,
@@ -332,4 +333,31 @@ it('omits malformed request references from API errors', async () => {
     error: 'Report unavailable.', requestId: 'UNTRUSTED_REFERENCE_SENTINEL',
   }), { status: 502 })));
   await expect(companies.dashboard('company-1')).rejects.toMatchObject({ requestId: undefined });
+});
+
+
+describe('classification memory reads', () => {
+  it('preserves search context and encodes cursors using company-scoped read routes', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ items: [], nextCursor: null }), {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await classificationMemory.search('company-a', { query: 'Example & supplier', mode: 'lexical',
+      scope: 'current_company', transactionId: 'transaction-a', limit: 20, cursor: 'cursor+/=' });
+    await classificationMemory.pastDecisions('company-a', { kind: 'all', limit: 20, cursor: 'cursor+/=' });
+    await classificationMemory.getObservation('company-a', 'observation-a');
+    await classificationMemory.getCase('company-a', 'case-a');
+    await classificationMemory.health('company-a');
+    const urls = fetchMock.mock.calls.map(call => new URL(String(call[0]), 'http://localhost'));
+    expect(urls[0]!.pathname).toBe('/api/companies/company-a/classification/search');
+    expect(Object.fromEntries(urls[0]!.searchParams)).toEqual({ query: 'Example & supplier', mode: 'lexical',
+      scope: 'current_company', transactionId: 'transaction-a', limit: '20', cursor: 'cursor+/=' });
+    expect(urls[1]!.searchParams.get('cursor')).toBe('cursor+/=');
+    expect(urls.slice(1).map(url => url.pathname)).toEqual([
+      '/api/companies/company-a/classification/past-decisions',
+      '/api/companies/company-a/classification/observations/observation-a',
+      '/api/companies/company-a/classification/cases/case-a',
+      '/api/companies/company-a/health/classification-search',
+    ]);
+  });
 });

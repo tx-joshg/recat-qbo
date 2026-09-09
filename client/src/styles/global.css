@@ -333,3 +333,7 @@ input, select, button { font-family:inherit; }
   .rr .rule-details-footer { gap:6px; }
   .rr .rule-details-footer > button { padding:8px 6px; font-size:13px; min-height:36px; white-space:nowrap; }
 }
+
+.rr .rule-source-card { border:1px solid var(--bd2); border-radius:10px; padding:15px; margin-bottom:18px; }
+.rr .rule-source-card h2 { margin:0; font-size:17px; }
+.rr .rule-source-card a { display:block; margin-top:6px; }

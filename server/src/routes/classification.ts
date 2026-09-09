@@ -5,11 +5,20 @@ import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import {
   getClassificationCase,
+  searchClassificationKnowledge,
   getHistoricalObservation,
   listPastDecisions,
   getCurrentClassificationCase,
 } from '../services/companyReads.js';
 
+const searchQuery = z.object({
+  query: z.string().trim().min(1).max(256),
+  mode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  scope: z.enum(['current_company', 'accessible_companies']).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  cursor: z.string().max(2048).optional(),
+  transactionId: z.string().min(1).max(128).optional(),
+}).strict();
 const currentQuery = z.object({ transactionId: z.string().min(1).max(128) }).strict();
 const pastDecisionQuery = z.object({
   kind: z.enum(['all', 'classification_case', 'historical_observation']).default('all'),
@@ -52,4 +61,16 @@ classificationRouter.get('/observations/:observationId', asyncHandler(async (req
   res.json(await getHistoricalObservation(
     userId(req), req.params.companyId!, validate(id)(req.params.observationId),
   ));
+}));
+
+classificationRouter.get('/search', asyncHandler(async (req, res) => {
+  const query = validate(searchQuery)(req.query);
+  res.json(await searchClassificationKnowledge(userId(req), req.params.companyId!, {
+    query: query.query,
+    mode: query.mode,
+    scope: query.scope ?? 'current_company',
+    ...(query.limit === undefined ? {} : { limit: query.limit }),
+    ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+    ...(query.transactionId === undefined ? {} : { transactionId: query.transactionId }),
+  }));
 }));

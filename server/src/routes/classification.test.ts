@@ -6,7 +6,7 @@ import { errorMiddleware, HttpError } from '../lib/http.js';
 
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(),
-  caseDetail: vi.fn(), currentCase: vi.fn(), pastDecisions: vi.fn(), observation: vi.fn(),
+  caseDetail: vi.fn(), currentCase: vi.fn(), pastDecisions: vi.fn(), observation: vi.fn(), search: vi.fn(),
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: {
@@ -16,7 +16,7 @@ vi.mock('../lib/prisma.js', () => ({ prisma: {
 vi.mock('../services/companyReads.js', () => ({
   getClassificationCase: mocks.caseDetail,
   getCurrentClassificationCase: mocks.currentCase,
-  listPastDecisions: mocks.pastDecisions, getHistoricalObservation: mocks.observation,
+  listPastDecisions: mocks.pastDecisions, getHistoricalObservation: mocks.observation, searchClassificationKnowledge: mocks.search,
 }));
 
 import { classificationRouter } from './classification.js';
@@ -101,5 +101,19 @@ describe('advisory historical observation routes', () => {
       .set('Cookie', 'recat_session=test').expect(403);
     expect(mocks.pastDecisions).not.toHaveBeenCalled();
     expect(mocks.observation).not.toHaveBeenCalled();
+  });
+});
+
+
+it('routes bounded explicit classification search modes and owned transaction context', async () => {
+  const result = { items: [], status: 'no_match', requestedMode: 'auto', mode: 'lexical', degraded: true, degradedReason: 'embedding_not_configured' };
+  mocks.search.mockResolvedValue(result);
+  const response = await request(app()).get('/api/companies/company-a/classification/search')
+    .query({ query: 'Synthetic fuel', mode: 'auto', scope: 'accessible_companies', limit: 5, transactionId: 'transaction-a' })
+    .set('Cookie', 'recat_session=test');
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual(result);
+  expect(mocks.search).toHaveBeenCalledWith('user-a', 'company-a', {
+    query: 'Synthetic fuel', mode: 'auto', scope: 'accessible_companies', limit: 5, transactionId: 'transaction-a',
   });
 });

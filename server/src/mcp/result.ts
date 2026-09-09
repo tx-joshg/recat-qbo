@@ -34,6 +34,7 @@ export type SafeToolErrorCode =
   | 'RULE_CHANGES_READ_ONLY'
   | 'OPERATION_RECONCILIATION_REQUIRED'
   | 'RESPONSE_TOO_LARGE'
+  | 'SEMANTIC_UNAVAILABLE'
   | 'COMPANY_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
   | 'QBO_PERIOD_CLOSED'
@@ -51,6 +52,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   RULE_CHANGES_READ_ONLY: 'Rule changes are currently read-only for this company. Ask an administrator to complete the rule migration or resume rule editing.',
   OPERATION_RECONCILIATION_REQUIRED: 'This operation requires reconciliation before it can continue.',
   RESPONSE_TOO_LARGE: 'The response exceeds the size limit. For list tools, request fewer items with limit. For single records, use the web app. For mutations, inspect the operation status before retrying.',
+  SEMANTIC_UNAVAILABLE: 'Semantic classification search is unavailable.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
   QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
@@ -297,6 +299,7 @@ function safeCode(error: unknown): SafeToolErrorCode {
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;
   if (!(error instanceof HttpError)) return 'COMPANY_UNAVAILABLE';
+  if (error.code === 'SEMANTIC_UNAVAILABLE') return 'SEMANTIC_UNAVAILABLE';
   if (error.code === 'COMPANY_UNAVAILABLE') return 'COMPANY_UNAVAILABLE';
   if (error.code === 'QBO_DISCONNECTED') return 'QBO_DISCONNECTED';
   switch (error.status) {

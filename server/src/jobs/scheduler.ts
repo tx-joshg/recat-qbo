@@ -1,3 +1,4 @@
+import { runClassificationEmbeddingTick } from '../services/classification/embedding/reconciler.js';
 // Background jobs: polling sync loop, nightly reconcile, daily digest, and the
 // stuck-POSTING sweep (boot + every tick).
 // A single 60-second ticker drives them; per-company syncs never overlap
@@ -23,6 +24,9 @@ import { recoverRulePreparationRetries } from '../services/rulePreparationRetry.
 import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
 import { recoverRuleAutoPosts } from '../services/ruleAutoPost.js';
 
+const CLASSIFICATION_EMBEDDING_TICK_MS = 10 * 60 * 1000;
+let classificationEmbeddingTickInFlight = false;
+let lastClassificationEmbeddingTickAt = Number.NEGATIVE_INFINITY;
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
 const STUCK_POSTING_MS = 5 * 60 * 1000;
@@ -172,6 +176,24 @@ export async function runReceiptTick(): Promise<void> {
   }
 }
 
+export async function runClassificationSearchEmbeddingTick(
+  now: Date = new Date(),
+): Promise<void> {
+  if (
+    classificationEmbeddingTickInFlight
+    || now.getTime() - lastClassificationEmbeddingTickAt < CLASSIFICATION_EMBEDDING_TICK_MS
+  ) {
+    return;
+  }
+  classificationEmbeddingTickInFlight = true;
+  lastClassificationEmbeddingTickAt = now.getTime();
+  try {
+    await runClassificationEmbeddingTick();
+  } finally {
+    classificationEmbeddingTickInFlight = false;
+  }
+}
+
 export async function runRuleAutoPostRecoveryTick(): Promise<void> {
   if (ruleAutoPostRecoveryInFlight) return;
   ruleAutoPostRecoveryInFlight = true;
@@ -228,6 +250,11 @@ async function tick(): Promise<void> {
     console.error('[jobs] agent scheduler tick failed');
   }
   try {
+    await runClassificationSearchEmbeddingTick(now);
+  } catch {
+    console.error('[jobs] classification embedding tick failed');
+  }
+  try {
     await runReceiptTick();
   } catch {
     console.error('[jobs] receipt scheduler tick failed');
@@ -237,6 +264,7 @@ async function tick(): Promise<void> {
 export function startJobs(): void {
   if (ticker !== null) return;
   startAgentScheduler();
+  runClassificationSearchEmbeddingTick().catch(() => console.error('[jobs] boot classification embedding tick failed'));
   sweepQboTokenRevocations().catch(() => console.error('[jobs] boot disconnect revocation recovery failed'));
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));

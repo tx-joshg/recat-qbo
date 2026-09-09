@@ -24,6 +24,7 @@ import {
 } from './core/verifier.js';
 import {
   TOOL_DEFINITIONS,
+  parseAgentClassificationToolResult,
   type AgentToolCall,
   type AgentToolName,
 } from './core/tools.js';
@@ -471,7 +472,12 @@ function validatedToolArguments(name: AgentToolName, rawArguments: unknown): str
     exactKeys(args, []);
     return '{}';
   }
-  exactKeys(args, ['query', 'limit']);
+  exactKeys(
+    args,
+    name === 'search_classification_knowledge'
+      ? ['query', 'limit', 'mode']
+      : ['query', 'limit'],
+  );
   if (
     typeof args.query !== 'string'
     || args.query.length === 0
@@ -479,6 +485,16 @@ function validatedToolArguments(name: AgentToolName, rawArguments: unknown): str
     || !Number.isInteger(args.limit)
     || (args.limit as number) < 1
     || (args.limit as number) > 100
+  ) {
+    throw new Error('invalid');
+  }
+  if (
+    name === 'search_classification_knowledge'
+    && args.mode !== 'auto'
+    && args.mode !== 'exact'
+    && args.mode !== 'lexical'
+    && args.mode !== 'hybrid'
+    && args.mode !== 'semantic'
   ) {
     throw new Error('invalid');
   }
@@ -490,6 +506,18 @@ function validatedToolResult(
   rawResult: unknown,
   snapshot: AgentTransactionSnapshot,
 ): string {
+  if (
+    name === 'search_classification_knowledge'
+    || (
+      name === 'find_similar_transactions'
+      && rawResult !== null
+      && typeof rawResult === 'object'
+      && !Array.isArray(rawResult)
+      && Object.hasOwn(rawResult, 'search')
+    )
+  ) {
+    return safeCanonicalJson(parseAgentClassificationToolResult(rawResult));
+  }
   const result = plainDataRecord(rawResult);
   exactKeys(result, ['items']);
   if (!Array.isArray(result.items) || result.items.length > 20) throw new Error('invalid');

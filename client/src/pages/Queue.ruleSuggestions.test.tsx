@@ -269,3 +269,5 @@ it('clears the canonical proof after an authoritative external transaction refre
   expect(mocks.stage.mock.calls[1]![1]).toMatchObject({ expectedRevision: 9, taxCalculation: 'TaxExcluded', lines: [{ categoryQboId: 'EXPENSE_ACCOUNT' }] });
   expect(mocks.stage.mock.calls[1]![1]).not.toHaveProperty('ruleSuggestion');
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));

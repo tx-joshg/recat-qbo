@@ -98,6 +98,8 @@ function prepared(mutation: RuleMutationKind): RuleMutationResult {
 function renderRules() { return render(<MemoryRouter initialEntries={[window.location.pathname + window.location.search]}><Rules /></MemoryRouter>); }
 
 
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));
 
 beforeEach(() => {
   vi.resetAllMocks();

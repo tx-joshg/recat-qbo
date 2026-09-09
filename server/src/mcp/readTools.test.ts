@@ -55,6 +55,22 @@ const sampleTransaction = {
   },
 };
 
+function evidenceCard(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'case:case-a', sourceId: 'case-a', kind: 'classification_case' as const,
+    companyId: 'company-a', companyName: 'Company A', companyRelation: 'current' as const,
+    executable: true, advisory: false, matchedIn: ['lexical'] as const, score: 1,
+    vendorIdentityId: null, vendorName: 'Coffee',
+    action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable' as const, taxCodeQboId: null, tagIds: [] },
+    actionSummary: { categoryName: 'Meals', taxCalculation: 'NotApplicable' as const, taxCodeName: null, tagNames: [] },
+    originIntent: 'apply_once' as const, evidenceCount: 1, conflictingEvidenceCount: 0,
+    conflicts: [], provenance: { source: 'qbo_verified' as const, sourceId: 'case-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+    rationale: 'Verified.', examples: [], counterexamples: [], jurisdiction: 'unknown',
+    currency: 'CAD', verifiedAt: '2026-01-01T00:00:00.000Z', ruleRevision: null, observation: null,
+    ...overrides,
+  };
+}
+
 function reads(): CompanyReadOperations {
   return {
     listCompanies: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
@@ -114,6 +130,11 @@ function reads(): CompanyReadOperations {
       context: { transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: null, businessPurpose: null },
       provenance: { source: 'qbo_verified', sourceId: 'attempt-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
       verifiedAt: '2026-01-01T00:00:00.000Z', invalidatedAt: null, invalidationReason: null,
+    }),
+    searchClassificationKnowledge: vi.fn().mockResolvedValue({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
     }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
   };
@@ -1021,4 +1042,273 @@ describe('Recat MCP read tools', () => {
     });
     expect(rejected.result.isError).toBe(true);
   });
+});
+
+describe('classification search MCP boundary', () => {
+  it('rejects oversized classification inputs before service execution', async () => {
+    const operations = reads();
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: {
+        companyId: 'company-a', query: 'x'.repeat(257), mode: 'lexical',
+      },
+    });
+    expect(response.result.isError).toBe(true);
+    expect(operations.searchClassificationKnowledge).not.toHaveBeenCalled();
+  });
+
+  it('rejects foreign evidence carrying executable action identifiers', async () => {
+    const outputSentinel = 'FOREIGN_ACCOUNT_SENTINEL';
+    const operations = reads();
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'accessible_companies',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [evidenceCard({
+        companyId: 'company-b', companyName: 'Company B', companyRelation: 'foreign',
+        executable: false, advisory: true,
+        action: { categoryQboId: outputSentinel, taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      })] as never,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', scope: 'accessible_companies', mode: 'lexical' },
+    });
+
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'INVALID_INPUT' } },
+    });
+    expect(JSON.stringify(response)).not.toContain(outputSentinel);
+  });
+
+  it('accepts display-only historical observations and rejects executable action data', async () => {
+    const operations = reads();
+    const observation = evidenceCard({
+      id: 'historical_observation:observation-a', sourceId: 'observation-a',
+      kind: 'historical_observation', executable: false, advisory: true,
+      matchedIn: ['observation'], action: null,
+      actionSummary: { categoryName: 'Meals', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+      originIntent: null, evidenceCount: 0,
+      provenance: { source: 'historical_observation', sourceId: 'observation-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+      rationale: null, verifiedAt: null,
+      observation: {
+        sourceTransactionId: 'transaction-a', sourceQboType: 'Purchase', sourceQboId: 'purchase-a',
+        sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED',
+        sourceUpdatedAt: '2026-01-01T00:00:00.000Z', observedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null, items: [observation] as never,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const accepted = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical' },
+    });
+    expect(accepted.result.isError).not.toBe(true);
+    expect(accepted.result.structuredContent.items).toMatchObject([
+      { kind: 'historical_observation', executable: false, action: null },
+    ]);
+
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [{ ...observation, action: evidenceCard().action }] as never,
+    });
+    const rejected = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical' },
+    });
+    expect(rejected.result.isError).toBe(true);
+  });
+
+  it('rejects foreign evidence carrying QBO identifiers in nested conflicts', async () => {
+    const outputSentinel = 'FOREIGN_NESTED_ACCOUNT_SENTINEL';
+    const operations = reads();
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'accessible_companies',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [evidenceCard({
+        companyId: 'company-b', companyName: 'Company B', companyRelation: 'foreign',
+        executable: false, advisory: true, action: null, conflictingEvidenceCount: 1,
+        conflicts: [{
+          id: 'conflict-a', companyId: 'company-b', sourceId: 'case-a', kind: 'case',
+          reason: 'Conflict.', evidenceCount: 1,
+          action: { categoryQboId: outputSentinel, taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+          actionSummary: { categoryName: 'Secret', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+        }],
+      })] as never,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', scope: 'accessible_companies', mode: 'lexical' },
+    });
+    expect(response.result.isError).toBe(true);
+    expect(JSON.stringify(response)).not.toContain(outputSentinel);
+  });
+
+  it('rejects search pages whose requested/effective mode and degradation metadata disagree', async () => {
+    const operations = reads();
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'semantic', degraded: false, degradedReason: null,
+      status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'semantic' },
+    });
+    expect(response.result.isError).toBe(true);
+  });
+
+  it('fails explicit semantic unavailability closed with a small safe error', async () => {
+    const operations = reads();
+    vi.mocked(operations.searchClassificationKnowledge).mockRejectedValueOnce(
+      new HttpError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE'),
+    );
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'semantic' },
+    });
+
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'SEMANTIC_UNAVAILABLE' } },
+    });
+    expect(JSON.stringify(response)).not.toContain('embedding_not_configured');
+    expect(JSON.stringify(response)).not.toContain('semantic_error');
+  });
+
+  it('keeps concurrent search principals and company scopes isolated', async () => {
+    const seen: Array<{ userId: string; companyId: string }> = [];
+    const payloads = await Promise.all(Array.from({ length: 16 }, async (_, index) => {
+      const userId = `user-${index}`;
+      const companyId = `company-${index}`;
+      const operations = reads();
+      vi.mocked(operations.searchClassificationKnowledge).mockImplementationOnce(async (
+        receivedUserId,
+        receivedCompanyId,
+      ) => {
+        seen.push({ userId: receivedUserId, companyId: receivedCompanyId });
+        return {
+          query: 'Coffee', companyId: receivedCompanyId, scope: 'current_company',
+          mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+          status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
+        };
+      });
+      const handler = createMcpHandler(
+        () => createRecatMcpServer({
+          principal: { ...principal, userId, memberships: [{ companyId, role: 'viewer' }] },
+          era: 'legacy',
+          reads: operations,
+        }),
+        { legacy: 'stateless' },
+      );
+      return legacy(handler, 'tools/call', {
+        name: 'search_classification_knowledge',
+        arguments: { companyId, query: 'Coffee', mode: 'lexical' },
+      });
+    }));
+
+    expect(payloads.every((payload) => payload.result.isError !== true)).toBe(true);
+    expect(seen.sort((left, right) => left.userId.localeCompare(right.userId))).toEqual(
+      Array.from({ length: 16 }, (_, index) => ({ userId: `user-${index}`, companyId: `company-${index}` }))
+        .sort((left, right) => left.userId.localeCompare(right.userId)),
+    );
+  });
+
+  it('replaces schema-valid but oversized evidence output with a bounded safe failure', async () => {
+    const outputSentinel = 'LARGE_VALID_EVIDENCE_SENTINEL';
+    const operations = reads();
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 100, nextCursor: null,
+      items: Array.from({ length: 100 }, (_, index) => evidenceCard({
+        id: `case:${index}`,
+        sourceId: `case-${index}`,
+        examples: Array.from({ length: 20 }, () => outputSentinel.repeat(50)),
+      })) as never,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical', limit: 100 },
+    });
+
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'RESPONSE_TOO_LARGE' } },
+    });
+    expect(JSON.stringify(response)).not.toContain(outputSentinel);
+  });
+
+  it('bounds the duplicated final wire representation by UTF-8 bytes', async () => {
+    const operations = reads();
+    const page = {
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      total: 100, nextCursor: null,
+      items: Array.from({ length: 100 }, (_, index) => evidenceCard({
+        id: `case:unicode-${index}`, sourceId: `unicode-${index}`,
+        provenance: {
+          source: 'qbo_verified', sourceId: `unicode-${index}`, actorId: null,
+          recordedAt: '2026-01-01T00:00:00.000Z',
+        },
+        rationale: '界'.repeat(500),
+      })),
+    };
+    expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(256 * 1024);
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce(page as never);
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical', limit: 100 },
+    });
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'RESPONSE_TOO_LARGE' } },
+    });
+    expect(Buffer.byteLength(JSON.stringify(response.result), 'utf8')).toBeLessThanOrEqual(256 * 1024);
+  });
+
+
 });

@@ -1,3 +1,4 @@
+import { healthRouter } from './routes/health.js';
 // Recat server entrypoint — wires middleware, routers, static client serving
 // (production), the error middleware, and the background job scheduler.
 
@@ -133,6 +134,7 @@ app.use('/api/companies/:companyId/rule-candidates', ruleCandidatesRouter);
 app.use('/api/companies/:companyId/rules', rulesRouter);
 app.use('/api/companies/:companyId/rule-operations', ruleOperationsRouter);
 app.use('/api/companies/:companyId/classification', classificationRouter);
+app.use('/api/companies/:companyId/health', healthRouter);
 app.use('/api/companies/:companyId/reports', reportsRouter);
 app.use('/api/companies/:companyId/dashboard', dashboardRouter);
 app.use('/api/companies/:companyId/audit', auditRouter);

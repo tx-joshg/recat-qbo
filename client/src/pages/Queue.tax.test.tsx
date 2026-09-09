@@ -11,6 +11,7 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
+  classificationPanel: vi.fn(),
   refreshProviderStatus: vi.fn(),
   role: 'categorizer' as 'categorizer' | 'admin' | 'viewer',
   bankAccounts: vi.fn(),
@@ -143,7 +144,7 @@ vi.mock('../lib/api', () => {
 });
 
 
-import Queue from './Queue';
+import Queue, { similarDecisionsQuery } from './Queue';
 import { ApiError } from '../lib/api';
 import { installGlobalStyles } from '../test/globalStyles';
 
@@ -2607,4 +2608,24 @@ it.each([
   await waitFor(() => expect(mocks.commit).toHaveBeenCalledTimes(1));
   expect(mocks.currentCase).not.toHaveBeenCalled();
   expect(mocks.prepareFromCase).not.toHaveBeenCalled();
+});
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: (props: unknown) => { mocks.classificationPanel(props); return null; } }));
+
+
+it('normalizes and bounds a selected transaction search without repeating its payee', () => {
+  expect(similarDecisionsQuery({ payee: ' Example  supplier ', memo: ' Freight  charge ' })).toBe('Example supplier Freight charge');
+  expect(similarDecisionsQuery({ payee: 'Example supplier', memo: 'example  supplier' })).toBe('Example supplier');
+  expect(similarDecisionsQuery({ payee: 'Example supplier', memo: null })).toBe('Example supplier');
+  expect(similarDecisionsQuery({ payee: 'x'.repeat(300), memo: 'freight' })).toHaveLength(256);
+});
+
+it('scopes similar decisions to the newly selected transaction without posting', async () => {
+  await renderQueue([transaction(), transaction({ id: 'TRANSACTION_SECOND', payee: 'Second supplier', memo: ' Freight ' })]);
+  await userEvent.click(screen.getByText('Second supplier'));
+  await waitFor(() => expect(mocks.classificationPanel).toHaveBeenLastCalledWith(expect.objectContaining({
+    companyId: 'COMPANY_GENERIC', transactionId: 'TRANSACTION_SECOND', initialQuery: 'Second supplier Freight',
+    title: 'Similar Decisions', autoSearch: true,
+  })));
+  expect(mocks.commit).not.toHaveBeenCalled();
 });

@@ -1,9 +1,20 @@
+import {
+  ClassificationSearchError,
+  searchClassificationMemoryWithRuntimeSnapshot,
+  type ClassificationSearchContextFilter,
+  type ClassificationSearchInput,
+  type ClassificationSearchSnapshot,
+} from './classification/search.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { categorizationSourceGrossCents } from './tax/sourceGross.js';
 import { CategorizationError } from './categorizationError.js';
 import type {
   ClassificationCase,
+  ClassificationSearchHit,
+  ClassificationSearchMode,
+  ClassificationSearchResult,
+  ClassificationSearchScope,
   ClassificationActionSummary,
   ClassificationCasePastDecision,
   ClassificationPastDecisionPageDto,
@@ -66,6 +77,7 @@ export const DEFAULT_READ_LIMIT = 20;
 export const MAX_READ_LIMIT = 100;
 const MAX_CURSOR_LENGTH = 2_048;
 const MAX_SEARCH_LENGTH = 200;
+const MAX_CLASSIFICATION_QUERY_LENGTH = 256;
 const MAX_ACCOUNT_LENGTH = 120;
 const MAX_ID_LENGTH = 128;
 const MAX_CANDIDATE_EVIDENCE = 20;
@@ -175,6 +187,19 @@ export interface TransferCandidateDto {
   b: TransactionDto;
 }
 
+export interface ClassificationSearchPage extends Page<ClassificationSearchHit> {
+  query: string;
+  companyId: string;
+  scope: ClassificationSearchScope;
+  mode: ClassificationSearchResult['mode'];
+  requestedMode: ClassificationSearchMode;
+  degraded: boolean;
+  degradedReason: ClassificationSearchResult['degradedReason'];
+  status: ClassificationSearchResult['status'];
+  noMatch: boolean;
+  total: number;
+}
+
 export type CompanyRuleRevisionReadDto = RuleRevisionReadDto;
 export type CompanyRuleReadDto = RuleDetailDto;
 
@@ -255,9 +280,11 @@ export interface CompanyReadDeps {
     txns: { payee: string; memo?: string | null; amount: number; qboType?: string }[],
   ): Promise<(CanonicalSuggestionDto | null)[]>;
   transferCandidates(companyId: string): Promise<Map<string, string>>;
+  classificationSearch(input: ClassificationSearchInput): Promise<ClassificationSearchSnapshot | ClassificationSearchResult>;
 }
 
 const defaultDeps: CompanyReadDeps = {
+  classificationSearch: searchClassificationMemoryWithRuntimeSnapshot,
   getTaxReadiness: defaultGetTaxReadiness,
   suggestForMany: defaultSuggestForMany,
   transferCandidates: (companyId) =>
@@ -1175,6 +1202,7 @@ export function createCompanyReadService(
       depsIn.transferCandidates ??
       ((companyId) =>
         defaultTransferCandidates(companyId, db as never)),
+    classificationSearch: depsIn.classificationSearch ?? searchClassificationMemoryWithRuntimeSnapshot,
   };
 
   async function currentUser(userId: string): Promise<Row> {
@@ -1209,6 +1237,154 @@ export function createCompanyReadService(
       throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
     }
     return { company, role: membership.role };
+  }
+
+  async function actualMembershipCompanyIds(userId: string): Promise<string[]> {
+    if (db.membership.findMany === undefined) {
+      throw new HttpError(503, 'Company memberships are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const rows = await db.membership.findMany({
+      where: { userId },
+      select: { companyId: true },
+      orderBy: { companyId: 'asc' },
+      take: 101,
+    }) as Row[];
+    if (rows.length > 100) {
+      throw new HttpError(400, 'Too many accessible companies', 'VALIDATION');
+    }
+    return [...new Set(rows.map((row) => String(row.companyId)))].sort();
+  }
+
+  async function runClassificationSearch<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof ClassificationSearchError)) throw error;
+      if (error.code === 'SEMANTIC_UNAVAILABLE') {
+        throw new HttpError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE');
+      }
+      if (error.code === 'COMPANY_UNAVAILABLE') {
+        throw new HttpError(503, 'Classification search is temporarily unavailable.', 'COMPANY_UNAVAILABLE');
+      }
+      if (error.code === 'FORBIDDEN') {
+        throw new HttpError(403, 'Classification company access is forbidden.', 'FORBIDDEN');
+      }
+      throw new HttpError(400, 'Classification search input is invalid.', 'VALIDATION');
+    }
+  }
+
+  async function searchClassificationKnowledgeForUser(
+    userId: string,
+    companyId: string,
+    input: {
+      query: string;
+      scope?: ClassificationSearchScope;
+      mode: ClassificationSearchMode;
+      limit?: number;
+      cursor?: string;
+      transactionId?: string;
+    },
+  ): Promise<ClassificationSearchPage> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    const query = optionalString(input.query, 'query', MAX_CLASSIFICATION_QUERY_LENGTH);
+    if (query === undefined) badRequest('query must not be empty');
+    const scope = input.scope ?? 'current_company';
+    if (scope !== 'current_company' && scope !== 'accessible_companies') {
+      badRequest('Invalid classification search scope');
+    }
+    if (!['auto', 'exact', 'lexical', 'hybrid', 'semantic'].includes(input.mode)) {
+      badRequest('Invalid classification search mode');
+    }
+    const requestedLimit = readLimit(input.limit);
+    const membershipIds = scope === 'accessible_companies'
+      ? await actualMembershipCompanyIds(userId)
+      : [companyId];
+    if (!membershipIds.includes(companyId)) {
+      throw new HttpError(403, 'Current company is not an actual membership', 'FORBIDDEN');
+    }
+    let context: ClassificationSearchContextFilter | undefined;
+    let transactionRevision: number | undefined;
+    if (input.transactionId !== undefined) {
+      boundedId(input.transactionId, 'transactionId');
+      const transaction = await db.transaction.findUnique({
+        where: { id: input.transactionId },
+        select: {
+          id: true, companyId: true, revision: true, qboType: true, date: true,
+          amount: true, bankAccount: true, rawData: true,
+        },
+      }) as Row | null;
+      if (transaction === null || transaction.companyId !== companyId) {
+        throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+      }
+      const amount = Number(transaction.amount);
+      const rawData = transaction.rawData !== null && typeof transaction.rawData === 'object'
+        && !Array.isArray(transaction.rawData) ? transaction.rawData as Row : {};
+      const currencyRef = rawData.CurrencyRef !== null && typeof rawData.CurrencyRef === 'object'
+        && !Array.isArray(rawData.CurrencyRef) ? rawData.CurrencyRef as Row : {};
+      const qboType = transaction.qboType === 'Purchase' || transaction.qboType === 'Deposit'
+        || transaction.qboType === 'JournalEntry' ? transaction.qboType : undefined;
+      context = {
+        ...(Number.isFinite(amount) && amount !== 0
+          ? { transactionDirection: amount < 0 ? 'out' as const : 'in' as const }
+          : {}),
+        ...(qboType === undefined ? {} : { qboType }),
+        ...(typeof transaction.bankAccount === 'string' && transaction.bankAccount.trim() !== ''
+          ? { sourceAccountName: transaction.bankAccount } : {}),
+        ...(typeof currencyRef.value === 'string' ? { currency: currencyRef.value } : {}),
+        transactionPeriod: iso(transaction.date).slice(0, 7),
+      };
+      transactionRevision = Number(transaction.revision);
+    }
+    const filter = canonicalFilter({
+      query, scope, mode: input.mode, limit: requestedLimit,
+      accessibleCompanyIds: [...membershipIds].sort(),
+      transactionId: input.transactionId ?? null,
+      transactionRevision: transactionRevision ?? null,
+      context: context ?? null,
+    });
+    const expected = { resource: 'classification-search', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const offset = position === null ? 0 : Number(position.offset);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const searched = await runClassificationSearch(() => deps.classificationSearch({
+      query,
+      companyId,
+      scope,
+      mode: input.mode,
+      limit: MAX_READ_LIMIT,
+      accessibleCompanyIds: membershipIds,
+      context,
+      ...(input.transactionId === undefined ? {} : { excludeTransactionId: input.transactionId }),
+    }));
+    const canonical = 'result' in searched ? searched.result : searched;
+    const fingerprint = 'result' in searched
+      ? searched.fingerprint
+      : createHmac('sha256', cursorSecret).update(JSON.stringify(canonical)).digest('hex');
+    if (position !== null && position.fingerprint !== fingerprint) {
+      badRequest('Search population changed; restart pagination', 'INVALID_CURSOR');
+    }
+    const items = canonical.hits.slice(offset, offset + requestedLimit);
+    const nextOffset = offset + items.length;
+    return {
+      query: canonical.query,
+      companyId: canonical.companyId,
+      scope: canonical.scope,
+      mode: canonical.mode,
+      requestedMode: canonical.requestedMode,
+      degraded: canonical.degraded,
+      degradedReason: canonical.degradedReason,
+      status: canonical.status,
+      noMatch: canonical.noMatch,
+      total: Math.min(canonical.total, canonical.hits.length),
+      items,
+      nextCursor: nextOffset < canonical.hits.length
+        ? encodeCursor(cursorSecret, {
+            v: 1, ...expected, position: { offset: nextOffset, fingerprint },
+          })
+        : null,
+    };
   }
 
   async function getRuleForCompany(
@@ -2558,6 +2734,7 @@ export function createCompanyReadService(
     listRuleCandidates: listRuleCandidatesForUser,
     getRuleCandidate: getRuleCandidateForUser,
     getClassificationCase: getClassificationCaseForUser,
+    searchClassificationKnowledge: searchClassificationKnowledgeForUser,
     listPastDecisions: listPastDecisionsForUser,
     getHistoricalObservation: getHistoricalObservationForUser,
     getCurrentClassificationCase: getCurrentClassificationCaseForUser,
@@ -2591,3 +2768,5 @@ export const listTransferCandidates = defaultService.listTransferCandidates;
 
 export const listPastDecisions = defaultService.listPastDecisions;
 export const getHistoricalObservation = defaultService.getHistoricalObservation;
+
+export const searchClassificationKnowledge = defaultService.searchClassificationKnowledge;

@@ -245,3 +245,5 @@ describe('Queue manual sync', () => {
     expect(context.refreshCompanies).toHaveBeenCalledOnce();
   });
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));

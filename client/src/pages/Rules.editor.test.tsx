@@ -255,3 +255,6 @@ describe('Rules editor', () => {
     expect(await screen.findByRole('textbox', { name: 'Payee contains' })).toHaveValue('Canonical supplier');
   });
 });
+
+vi.mock('../components/ClassificationMemoryPanel', () => ({ default: () => null }));
+vi.mock('./rules/PastDecisionsSection', () => ({ default: () => null }));
