@@ -297,6 +297,7 @@ const taxCode = z.strictObject({
   active: z.boolean(),
   taxable: z.boolean().nullable(),
   combinedPurchaseRate: z.number().finite().nullable(),
+  combinedSalesRate: z.number().finite().nullable(),
 });
 const tag = z.strictObject({
   id,
