@@ -12,6 +12,7 @@ import type {
 import { stageGuardedLiveCategorization } from '../categorization.js';
 import { disconnectCompanyWithLiveAuthority } from '../companyLiveAuthority.js';
 import { commitGuardedLiveCategorization } from '../writeback.js';
+import { isTransferPair } from '../transferCandidates.js';
 import {
   refreshTaxReference,
   type TaxReferenceDb,
@@ -566,6 +567,163 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
       sendPreparedWrite,
     } as unknown as QboClient;
   }
+
+  function unstagedProposal(fixture: Fixture) {
+    return {
+      transactionId: fixture.transactionId,
+      companyId: fixture.companyId,
+      expectedRevision: 0,
+      proposal: {
+        taxCalculation: 'NotApplicable' as const,
+        lines: [{ grossCents: -1_000, categoryQboId: 'expense-generic', taxCodeQboId: null, tagIds: [] }],
+        tagIds: [],
+      },
+    };
+  }
+
+  async function apparentCounterpart(fixture: Fixture, changes: {
+    companyId?: string; amount?: string; bankAccount?: string; date?: Date;
+    status?: 'PENDING' | 'POSTED'; category?: string; split?: boolean;
+  } = {}) {
+    return prisma.transaction.create({
+      data: {
+        companyId: changes.companyId ?? fixture.companyId,
+        qboId: `counterpart-${randomUUID()}`,
+        qboType: 'Deposit', qboSyncToken: '1',
+        payee: 'Synthetic counterpart', amount: changes.amount ?? '10.00',
+        bankAccount: changes.bankAccount ?? 'Other synthetic bank',
+        date: changes.date ?? new Date('2026-07-29T00:00:00.000Z'),
+        status: changes.status ?? 'PENDING', category: changes.category ?? null,
+        rawData: {},
+        ...(changes.split ? { splitLines: { create: [{
+          idx: 0, amount: '10.00', category: 'Generic expense', categoryQboId: 'expense-generic',
+        }] } } : {}),
+      },
+    });
+  }
+
+  it.each([
+    { payee: 'Synthetic PAYROLL service', memo: null },
+    { payee: 'Generic supplier', memo: 'Monthly salary payment' },
+    { payee: 'Generic supplier', memo: 'Monthly salaries' },
+    { payee: 'Generic supplier', memo: 'wage' },
+    { payee: 'Generic supplier', memo: 'wages' },
+    ...['adp', 'gusto', 'paychex', 'ceridian', 'deel'].map((marker) => ({
+      payee: 'Generic supplier', memo: `Synthetic ${marker} entry`,
+    })),
+  ])('vetoes payroll-like staging before any local preparation: %j', async (text) => {
+    const fixture = await seed({ staged: false });
+    try {
+      await prisma.transaction.update({ where: { id: fixture.transactionId }, data: text });
+      await expect(stageGuardedLiveCategorization(
+        unstagedProposal(fixture), fixture.context, fixture.proof,
+      )).rejects.toMatchObject({ code: 'LIVE_AUTHORITY_DENIED' });
+      await expect(prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
+        .resolves.toMatchObject({ revision: 0, taxCalculation: null });
+      await expect(prisma.splitLine.count({ where: { txnId: fixture.transactionId } })).resolves.toBe(0);
+      await expect(prisma.qboMutationAttempt.count({ where: { transactionId: fixture.transactionId } })).resolves.toBe(0);
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it.each([
+    ['same day', new Date('2026-07-29T00:00:00.000Z')],
+    ['three days before', new Date('2026-07-26T00:00:00.000Z')],
+    ['three days after', new Date('2026-08-01T00:00:00.000Z')],
+  ] as const)('vetoes an apparent transfer %s before staging', async (_label, date) => {
+    const fixture = await seed({ staged: false });
+    try {
+      const counterpart = await apparentCounterpart(fixture, { date });
+      expect(isTransferPair({
+        id: fixture.transactionId, amount: -10, bankAccount: 'Generic source',
+        date: new Date('2026-07-29T00:00:00.000Z'),
+      }, { ...counterpart, amount: Number(counterpart.amount) })).toBe(true);
+      await expect(stageGuardedLiveCategorization(
+        unstagedProposal(fixture), fixture.context, fixture.proof,
+      )).rejects.toMatchObject({ code: 'LIVE_AUTHORITY_DENIED' });
+      await expect(prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
+        .resolves.toMatchObject({ revision: 0, taxCalculation: null });
+      await expect(prisma.splitLine.count({ where: { txnId: fixture.transactionId } })).resolves.toBe(0);
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it.each([
+    ['different amount', { amount: '10.01' }, false],
+    ['same sign', { amount: '-10.00' }, false],
+    ['same bank', { bankAccount: 'Generic source' }, false],
+    ['outside earlier date bound', { date: new Date('2026-07-25T23:59:59.999Z') }, false],
+    ['outside later date bound', { date: new Date('2026-08-01T00:00:00.001Z') }, false],
+    ['posted counterpart', { status: 'POSTED' as const }, true],
+    ['category staged', { category: 'Generic expense' }, true],
+    ['split staged', { split: true }, true],
+  ] as const)('keeps an ordinary eligible Purchase stageable with %s', async (_label, changes, pairMatches) => {
+    const fixture = await seed({ staged: false });
+    try {
+      const counterpart = await apparentCounterpart(fixture, changes);
+      // Guard SQL must agree with the shared pair predicate; status/staging
+      // eligibility additionally excludes otherwise matching counterparts.
+      expect(isTransferPair({
+        id: fixture.transactionId, amount: -10, bankAccount: 'Generic source',
+        date: new Date('2026-07-29T00:00:00.000Z'),
+      }, { ...counterpart, amount: Number(counterpart.amount) })).toBe(pairMatches);
+      await prisma.transaction.update({
+        where: { id: fixture.transactionId },
+        data: { payee: 'Synthetic salaryman', memo: 'Upgraded supplies' },
+      });
+      await expect(stageGuardedLiveCategorization(
+        unstagedProposal(fixture), fixture.context, fixture.proof,
+      )).resolves.toMatchObject({ transactionId: fixture.transactionId, revision: 1 });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it('does not treat a matching transaction in another company as a transfer', async () => {
+    const fixture = await seed({ staged: false });
+    const other = await seed({ staged: false });
+    try {
+      await apparentCounterpart(fixture, { companyId: other.companyId });
+      await expect(stageGuardedLiveCategorization(
+        unstagedProposal(fixture), fixture.context, fixture.proof,
+      )).resolves.toMatchObject({ transactionId: fixture.transactionId, revision: 1 });
+    } finally {
+      await cleanup(other);
+      await cleanup(fixture);
+    }
+  });
+
+  it.each([
+    ['payroll', 'PREPARED'], ['transfer', 'PREPARED'],
+    ['payroll', 'RETRYABLE'], ['transfer', 'RETRYABLE'],
+  ] as const)('vetoes %s introduced after staging on the production %s recovery entrypoint', async (risk, status) => {
+    const fixture = await seed();
+    const claimed = await seedExpiredRecovery(fixture, status);
+    const nextTurn = vi.fn();
+    const send = vi.fn(async () => ({ ok: true as const, newSyncToken: '8' }));
+    const qbo = client(fixture, async () => beforeSnapshot(fixture), send);
+    const factory = vi.spyOn(qboFactory, 'forCompany').mockResolvedValue(qbo);
+    try {
+      if (risk === 'payroll') {
+        await prisma.transaction.update({ where: { id: fixture.transactionId }, data: { memo: 'Synthetic payroll entry' } });
+      } else {
+        await apparentCounterpart(fixture);
+      }
+      await runProductionClaimedLiveJob(claimed, 'worker-recovery', recoveryModels(nextTurn));
+      expect(nextTurn).not.toHaveBeenCalled();
+      expect(qbo.prepareRecategorization).not.toHaveBeenCalled();
+      expect(qbo.preparePurchaseRecategorization).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      await expect(liveWritePermitCount(fixture)).resolves.toBe(0);
+      await expect(prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
+        .resolves.toMatchObject({ status: 'PENDING', revision: 1 });
+    } finally {
+      factory.mockRestore();
+      await cleanup(fixture);
+    }
+  });
 
   it('uses the hard-wired fixed actor/owner path and excludes only its own PREPARED attempt', async () => {
     const fixture = await seed();

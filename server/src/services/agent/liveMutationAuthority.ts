@@ -42,6 +42,8 @@ export interface LiveMutationProof {
 
 interface AuthorityRow {
   readonly id: string;
+  readonly payee: string;
+  readonly memo: string | null;
 }
 
 interface TaxAuthorityRow {
@@ -180,8 +182,8 @@ async function lockedAuthorityRows(
   ownRequestId: string | null,
   ownStatus: 'PREPARED' | 'RETRYABLE' | null,
 ): Promise<AuthorityRow[]> {
-  return db.$queryRawUnsafe<AuthorityRow[]>(
-    `SELECT job."id"
+  const rows = await db.$queryRawUnsafe<AuthorityRow[]>(
+    `SELECT job."id", txn."payee", txn."memo"
        FROM "AgentJob" job
        JOIN "Transaction" txn
          ON txn."id" = job."transactionId"
@@ -209,6 +211,23 @@ async function lockedAuthorityRows(
         AND txn."status" = 'PENDING'
         AND txn."qboType" = $9
         AND txn."qboId" = $10
+        AND NOT EXISTS (
+          SELECT 1
+            FROM "Transaction" counterpart
+           WHERE counterpart."companyId" = txn."companyId"
+             AND counterpart."id" <> txn."id"
+             AND counterpart."status" = 'PENDING'
+             AND counterpart."category" IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM "SplitLine" line WHERE line."txnId" = counterpart."id"
+             )
+             AND txn."amount" <> 0
+             AND ABS(ABS(txn."amount") - ABS(counterpart."amount")) < 0.005
+             AND SIGN(txn."amount") <> SIGN(counterpart."amount")
+             AND counterpart."bankAccount" <> txn."bankAccount"
+             AND counterpart."date" BETWEEN txn."date" - INTERVAL '3 days'
+                                        AND txn."date" + INTERVAL '3 days'
+        )
         AND config."mode" = 'shadow'
         AND config."configVersion" = $5
         AND config."liveRequested" = TRUE
@@ -273,6 +292,11 @@ async function lockedAuthorityRows(
     ownStatus,
     providerBinding,
   );
+  // These deterministic vetoes apply at staging and every fresh-send boundary.
+  // Keep source text local: callers receive only the existing authority denial.
+  return rows.filter((row) => !/\b(payroll|salar(?:y|ies)|wages?|adp|gusto|paychex|ceridian|deel)\b/i.test(
+    `${row.payee}\n${row.memo ?? ''}`,
+  ));
 }
 
 async function lockAndAssertReferenceAuthority(
