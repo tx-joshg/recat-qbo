@@ -24,6 +24,7 @@ import {
   hashStagedCategorization,
   reconcileRuleAutoPostPreparation,
 } from './writeback.js';
+import { verifyRulePreparationRetryClaim, type RulePreparationRetryClaim } from './rulePreparationRetry.js';
 import { hashRuleAutoPostValue } from './ruleAutoPostBinding.js';
 
 const ACTIVE_PREPARATION_STATES = ['PREPARED', 'COMMITTING', 'UNCERTAIN', 'RETRYABLE'] as const;
@@ -52,6 +53,7 @@ export interface PrepareRuleAutoPostInput {
   transactionId: string;
   ruleId: string;
   ruleRevision: number;
+  deferredRetry?: RulePreparationRetryClaim;
 }
 
 export interface RecoveryReport {
@@ -358,6 +360,9 @@ export async function prepareRuleAutoPost(
 ): Promise<{ preparationId: string }> {
   const deps: RuleAutoPostDeps = { ...defaultDeps, ...dependencies };
   const candidate = await deps.loadCandidate(input);
+  if (input.deferredRetry !== undefined && candidate.expectedRevision !== input.deferredRetry.sourceRevision) {
+    throw new RuleAutoPostError('STALE_RULE_AUTO_POST');
+  }
   const preparationId = deps.id();
   const requestId = preparationId;
   const proposal: CategorizationProposal = proposalFromRuleAction(
@@ -380,6 +385,7 @@ export async function prepareRuleAutoPost(
         },
       });
       if (existing !== null) {
+        if (input.deferredRetry !== undefined) return { kind: 'return', value: { kind: 'stale' } };
         return existing.ruleId === input.ruleId && existing.ruleRevision === input.ruleRevision
           ? { kind: 'return', value: { kind: 'prepared', preparationId: existing.id } }
           : { kind: 'return', value: { kind: 'stale' } };
@@ -390,6 +396,9 @@ export async function prepareRuleAutoPost(
         || verified.qboType !== candidate.action.direction
         || !sameAction(verified.action, candidate.action)
       ) {
+        return { kind: 'return', value: { kind: 'stale' } };
+      }
+      if (!await verifyRulePreparationRetryClaim(db, input)) {
         return { kind: 'return', value: { kind: 'stale' } };
       }
       const [splitCount, tagCount, stagedTransaction] = await Promise.all([
@@ -416,7 +425,10 @@ export async function prepareRuleAutoPost(
           transactionId: input.transactionId,
           ruleId: input.ruleId,
           ruleRevision: input.ruleRevision,
-          inputHash: hashRuleAutoPostValue(input),
+          inputHash: hashRuleAutoPostValue({
+            companyId: input.companyId, transactionId: input.transactionId,
+            ruleId: input.ruleId, ruleRevision: input.ruleRevision,
+          }),
           proposal: receipt.normalizedProposal as unknown as Prisma.InputJsonValue,
           proposalHash: hashRuleAutoPostValue(receipt.normalizedProposal),
           stagedGraphHash: hashStagedCategorization(receipt.staged),

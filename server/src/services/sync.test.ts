@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -196,8 +197,8 @@ describe('syncCompany', () => {
       resume,
       loadState,
       listCandidates: vi.fn(async () => [
-        { transactionId: 'txn-ok', ruleId: 'rule-ok', ruleRevision: 3 },
-        { transactionId: 'txn-fail', ruleId: 'rule-fail', ruleRevision: 4 },
+        { transactionId: 'txn-ok', sourceRevision: 0, ruleId: 'rule-ok', ruleRevision: 3 },
+        { transactionId: 'txn-fail', sourceRevision: 0, ruleId: 'rule-fail', ruleRevision: 4 },
       ]),
     })).resolves.toEqual({ recovered: 1, autoPosted: 1, failed: 1 });
 
@@ -209,6 +210,51 @@ describe('syncCompany', () => {
     ]);
   });
 
+  it('records only typed contention before preparation, never a post-prepare failure', async () => {
+    const { EntityLeaseError } = await import('./entityLease.js');
+    const { RuleSuggestionApplicationError } = await import('./ruleSuggestionApplication.js');
+    for (const phase of ['prepare', 'company', 'resume', 'untyped'] as const) {
+      const rememberBusy = vi.fn(async () => undefined);
+      const busy = new EntityLeaseError();
+      const result = await runCanonicalRuleAutoPosts('company-1', {
+        recover: vi.fn(async () => ({ examined: 0, completed: 0, pending: 0, failed: 0 })),
+        listCandidates: vi.fn(async () => [{ transactionId: 'txn-busy', sourceRevision: 7, ruleId: 'rule-busy', ruleRevision: 2 }]),
+        prepare: vi.fn(async () => {
+          if (phase === 'prepare') throw busy;
+          if (phase === 'company') throw new RuleSuggestionApplicationError('RULE_SUGGESTION_BUSY');
+          if (phase === 'untyped') throw Object.assign(new Error('provider failure'), { code: 'ENTITY_BUSY' });
+          return { preparationId: 'existing-request' };
+        }),
+        resume: vi.fn(async () => { throw busy; }), rememberBusy,
+      });
+      expect(result.failed).toBe(1);
+      expect(rememberBusy).toHaveBeenCalledTimes(phase === 'prepare' || phase === 'company' ? 1 : 0);
+      if (phase === 'prepare') expect(rememberBusy).toHaveBeenCalledWith({ companyId: 'company-1', transactionId: 'txn-busy', sourceRevision: 7, ruleId: 'rule-busy', ruleRevision: 2 });
+    }
+  });
+
+  it.each([
+    ['P2024', 'P2024'],
+    ['P2028', 'P2028'],
+    ['synthetic-sensitive-code', 'UNKNOWN'],
+  ])('continues later candidates with a bounded persistence diagnostic (%s)', async (code, expectedCode) => {
+    const { EntityLeaseError } = await import('./entityLease.js');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const resume = vi.fn(async () => undefined);
+    try {
+      const result = await runCanonicalRuleAutoPosts('company-1', {
+        recover: vi.fn(async () => ({ examined: 0, completed: 0, pending: 0, failed: 0 })),
+        listCandidates: vi.fn(async () => ['busy', 'ready'].map(transactionId => ({ transactionId, sourceRevision: 0, ruleId: 'rule-1', ruleRevision: 1 }))),
+        prepare: vi.fn(async input => { if (input.transactionId === 'busy') throw new EntityLeaseError(); return { preparationId: 'ready-preparation' }; }),
+        rememberBusy: vi.fn(async () => { throw new Prisma.PrismaClientKnownRequestError('synthetic sensitive database details', { code, clientVersion: 'test' }); }),
+        resume, loadState: vi.fn(async () => 'VERIFIED'),
+      });
+      expect(result).toEqual({ recovered: 0, autoPosted: 1, failed: 1 });
+      expect(resume).toHaveBeenCalledWith('ready-preparation');
+      expect(warn).toHaveBeenCalledWith('[sync] rule preparation retry could not be recorded', { errorCode: expectedCode });
+    } finally { warn.mockRestore(); }
+  });
+
   it('does not count an unresolved durable preparation as auto-posted', async () => {
     await expect(runCanonicalRuleAutoPosts('company-1', {
       recover: vi.fn(async () => ({ examined: 0, completed: 0, pending: 0, failed: 0 })),
@@ -216,7 +262,7 @@ describe('syncCompany', () => {
       resume: vi.fn(async () => undefined),
       loadState: vi.fn(async () => 'UNCERTAIN'),
       listCandidates: vi.fn(async () => [
-        { transactionId: 'txn-pending', ruleId: 'rule-pending', ruleRevision: 3 },
+        { transactionId: 'txn-pending', sourceRevision: 0, ruleId: 'rule-pending', ruleRevision: 3 },
       ]),
     })).resolves.toEqual({ recovered: 0, autoPosted: 0, failed: 0 });
   });

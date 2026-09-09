@@ -19,6 +19,7 @@ import { recoverStuckAttachmentOperations } from '../services/attachments/operat
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 import { resolvePublicUrl } from '../services/publicUrl.js';
 import { runClassificationOutcomeRecoveryTick } from '../services/classification/recovery.js';
+import { recoverRulePreparationRetries } from '../services/rulePreparationRetry.js';
 import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
 import { recoverRuleAutoPosts } from '../services/ruleAutoPost.js';
 
@@ -176,6 +177,7 @@ export async function runRuleAutoPostRecoveryTick(): Promise<void> {
   ruleAutoPostRecoveryInFlight = true;
   try {
     await recoverRuleAutoPosts();
+    await recoverRulePreparationRetries();
   } finally {
     ruleAutoPostRecoveryInFlight = false;
   }

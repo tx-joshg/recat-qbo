@@ -266,6 +266,7 @@ model Company {
   ruleRevisions               RuleRevision[]
   ruleCanonicalMigrations     RuleCanonicalMigration[]
   ruleAutoPostPreparations    RuleAutoPostPreparation[]
+  rulePreparationRetries      RulePreparationRetry[]
   classificationCorpusRevisions ClassificationCorpusRevision[]
   ruleLifecycleRevision       RuleLifecycleRevision?
 }
@@ -1511,4 +1512,23 @@ model WebhookEvent {
   processed   Boolean   @default(false)
   processedAt DateTime?
   createdAt   DateTime  @default(now())
+}
+
+/// Finite rediscovery intent for contention before any durable preparation.
+model RulePreparationRetry {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  sourceRevision Int
+  ruleId         String
+  ruleRevision   Int
+  state          String   @default("PENDING")
+  attemptCount   Int      @default(0)
+  dueAt          DateTime
+  claimToken     String?
+  createdAt      DateTime @default(now())
+
+  @@unique([companyId, transactionId, sourceRevision, ruleId, ruleRevision], map: "RulePreparationRetry_binding_key")
+  @@index([state, dueAt])
 }

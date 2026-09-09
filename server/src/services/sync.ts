@@ -26,6 +26,8 @@ import {
 import { runCompanyMutationTransaction } from './companyMutationScope.js';
 import { disableRuleForSafetyInTransaction } from './ruleSafetyTransition.js';
 import { validateExistingRuleAction } from './rules.js';
+import { RuleSuggestionApplicationError } from './ruleSuggestionApplication.js';
+import { rememberBusyRulePreparation, type DeferredRuleCandidate } from './rulePreparationRetry.js';
 import { compareRuleWinner, ruleMatches } from './ruleMatching.js';
 import {
   prepareRuleAutoPost,
@@ -440,11 +442,13 @@ function permitsLegacySuggestions(mode: string): boolean {
 
 interface CanonicalRuleAutoPostCandidate {
   transactionId: string;
+  sourceRevision: number;
   ruleId: string;
   ruleRevision: number;
 }
 
 interface CanonicalRuleAutoPostDeps {
+  rememberBusy(input: DeferredRuleCandidate): Promise<void>;
   recover(companyId: string): Promise<RecoveryReport>;
   prepare(input: {
     companyId: string;
@@ -463,7 +467,7 @@ async function listCanonicalRuleAutoPostCandidates(
   const [transactions, rules] = await Promise.all([
     prisma.transaction.findMany({
       where: { companyId, status: 'PENDING' },
-      select: { id: true, qboType: true, payee: true },
+      select: { id: true, qboType: true, payee: true, revision: true },
     }),
     prisma.rule.findMany({
       where: {
@@ -496,6 +500,7 @@ async function listCanonicalRuleAutoPostCandidates(
       .sort(compareRuleWinner)[0];
     return winner === undefined || !winner.autoPost ? [] : [{
       transactionId: transaction.id,
+      sourceRevision: transaction.revision,
       ruleId: winner.id,
       ruleRevision: winner.revision,
     }];
@@ -503,6 +508,7 @@ async function listCanonicalRuleAutoPostCandidates(
 }
 
 const defaultCanonicalRuleAutoPostDeps: CanonicalRuleAutoPostDeps = {
+  rememberBusy: rememberBusyRulePreparation,
   recover: recoverRuleAutoPosts,
   prepare: prepareRuleAutoPost,
   resume: resumeRuleAutoPost,
@@ -524,8 +530,25 @@ export async function runCanonicalRuleAutoPosts(
   let autoPosted = 0;
   let failed = recovery.failed;
   for (const candidate of await deps.listCandidates(companyId)) {
+    let prepared: { preparationId: string };
     try {
-      const prepared = await deps.prepare({ companyId, ...candidate });
+      const { sourceRevision: _sourceRevision, ...authority } = candidate;
+      prepared = await deps.prepare({ companyId, ...authority });
+    } catch (error) {
+      if ((error instanceof EntityLeaseError && error.code === 'ENTITY_BUSY')
+        || (error instanceof RuleSuggestionApplicationError && error.code === 'RULE_SUGGESTION_BUSY')) {
+        try {
+          await deps.rememberBusy({ companyId, ...candidate });
+        } catch (persistError) {
+          const errorCode = persistError instanceof Prisma.PrismaClientKnownRequestError
+            && /^P[0-9]{4}$/.test(persistError.code) ? persistError.code : 'UNKNOWN';
+          console.warn('[sync] rule preparation retry could not be recorded', { errorCode });
+        }
+      }
+      failed += 1;
+      continue;
+    }
+    try {
       await deps.resume(prepared.preparationId);
       const state = await deps.loadState(prepared.preparationId);
       if (state === 'VERIFIED' || state === 'DRY_RUN') autoPosted += 1;
