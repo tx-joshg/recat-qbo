@@ -241,3 +241,6 @@ input, select, button { font-family:inherit; }
 
 .rr .category-picker { display:inline-flex; align-items:center; min-width:0; width:100%; flex:1; }
 .rr .category-picker > .control-trigger { flex:1; min-width:0; max-width:100%; }
+/* shared labelled fields */
+.rr .field { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.rr .field-label { color:var(--mut); font-size:13px; font-weight:500; }

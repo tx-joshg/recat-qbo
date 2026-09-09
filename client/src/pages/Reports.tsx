@@ -4,7 +4,7 @@
 // Statement math lives server-side — this screen renders StatementDto verbatim.
 
 import { Fragment, useEffect, useState } from 'react';
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties } from 'react';
 import type {
   CustomReportDto,
   SavedReportConfig,
@@ -19,6 +19,7 @@ import { reports, savedReports } from '../lib/api';
 import { fmtDate, fmtDateY, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import TagPicker from '../components/TagPicker';
+import { Select, type ControlOption } from '../components/SelectCombobox';
 
 type RptTab = 'pl' | 'bs' | 'custom' | 'txns';
 type LogRange = '30d' | '90d' | 'ytd' | '12m' | 'all' | 'custom';
@@ -60,27 +61,6 @@ const PREV_RANGE = {
 
 // ---- shared styles copied verbatim from the prototype ----
 
-const labeledSelectStyle: CSSProperties = {
-  border: '1px solid var(--bd)',
-  borderRadius: 7,
-  padding: '8px 10px',
-  fontSize: 14,
-  fontWeight: 500,
-  background: 'var(--card)',
-  color: 'var(--ink)',
-  cursor: 'pointer',
-};
-
-const bareSelectStyle: CSSProperties = {
-  border: '1px solid var(--bd)',
-  borderRadius: 7,
-  padding: '8px 10px',
-  fontSize: 14,
-  background: 'var(--card)',
-  color: 'var(--ink)',
-  cursor: 'pointer',
-};
-
 const controlCard: CSSProperties = {
   display: 'flex',
   gap: 18,
@@ -95,34 +75,33 @@ const controlCard: CSSProperties = {
 
 const customGrid = '1fr 80px minmax(70px,200px) 105px';
 
-function LabeledSelect({
-  label,
-  value,
-  onChange,
-  children,
-}: {
+// A saved report can refer to an older month or an account absent from today's choices.
+function withCurrentOption(options: ControlOption[], value: string, label = value): ControlOption[] {
+  return options.some((option) => option.value === value)
+    ? options
+    : [...options, { value, label }];
+}
+
+function savedPeriodLabel(value: string): string {
+  const month = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(value);
+  return month ? `${FULL_M[Number(month[2]) - 1]} ${month[1]}` : value;
+}
+
+function LabeledSelect({ label, value, onChange, options }: {
   label: string;
   value: string;
-  onChange: (v: string) => void;
-  children: ReactNode;
+  onChange: (value: string) => void;
+  options: readonly ControlOption[];
 }) {
-  return (
-    <label
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 5,
-        fontSize: 12,
-        fontWeight: 600,
-        color: 'var(--fnt)',
-      }}
-    >
-      {label}
-      <select value={value} onChange={(e) => onChange(e.target.value)} style={labeledSelectStyle}>
-        {children}
-      </select>
-    </label>
-  );
+  return <div className="field report-field">
+    <span className="field-label">{label}</span>
+    <Select
+      label={label}
+      value={value}
+      options={options}
+      onValueChange={(next) => { if (next !== null) onChange(next); }}
+    />
+  </div>;
 }
 
 /** Per-kind row styles — matches the prototype's stmtHead/stmtLine/total/grand rows. */
@@ -416,44 +395,50 @@ export default function Reports() {
           <div className="page-title">Reports</div>
           <div className="page-sub">Statements and the transaction log read straight from QuickBooks; custom slices from synced data.</div>
         </div>
-        <LabeledSelect label="Report" value={tab} onChange={(v) => setTab(v as RptTab)}>
-          <option value="pl">Profit &amp; Loss</option>
-          <option value="bs">Balance Sheet</option>
-          <option value="txns">Transaction log</option>
-          <option value="custom">Custom &amp; tags</option>
-        </LabeledSelect>
+        <LabeledSelect
+          label="Report"
+          value={tab}
+          onChange={(v) => setTab(v as RptTab)}
+          options={[{ value: 'pl', label: 'Profit & Loss' },
+            { value: 'bs', label: 'Balance Sheet' },
+            { value: 'txns', label: 'Transaction log' },
+            { value: 'custom', label: 'Custom & tags' }]}
+        />
       </div>
 
       {/* P&L controls */}
       {tab === 'pl' && (
         <div style={controlCard}>
-          <LabeledSelect label="Report period" value={plPeriod} onChange={setPlPeriod}>
-            {M_NAMES.map((label, v) => (
-              <option key={label} value={String(v)}>
-                {label} {CUR_YEAR}
-              </option>
-            ))}
-            <option value="ytd">Year to date {CUR_YEAR}</option>
-          </LabeledSelect>
+          <LabeledSelect
+            label="Report period"
+            value={plPeriod}
+            onChange={setPlPeriod}
+            options={[...M_NAMES.map((label, value) => ({ value: String(value), label: `${label} ${CUR_YEAR}` })), { value: 'ytd', label: `Year to date ${CUR_YEAR}` }]}
+          />
           <LabeledSelect
             label="Display columns by"
             value={plCols}
             onChange={(v) => setPlCols(v as 'total' | 'months')}
-          >
-            <option value="total">Total only</option>
-            <option value="months">Months</option>
-          </LabeledSelect>
+            options={[{ value: 'total', label: 'Total only' },
+              { value: 'months', label: 'Months' }]}
+          />
           {plCmpShown && (
-            <LabeledSelect label="Compare to" value={plCmp} onChange={(v) => setPlCmp(v as Compare)}>
-              <option value="none">None</option>
-              <option value="prev">Previous month</option>
-              <option value="py">Same month last year</option>
-            </LabeledSelect>
+            <LabeledSelect
+              label="Compare to"
+              value={plCmp}
+              onChange={(v) => setPlCmp(v as Compare)}
+              options={[{ value: 'none', label: 'None' },
+                { value: 'prev', label: 'Previous month' },
+                { value: 'py', label: 'Same month last year' }]}
+            />
           )}
-          <LabeledSelect label="Accounting method" value={basis} onChange={(v) => setBasis(v as Basis)}>
-            <option value="cash">Cash</option>
-            <option value="accrual">Accrual</option>
-          </LabeledSelect>
+          <LabeledSelect
+            label="Accounting method"
+            value={basis}
+            onChange={(v) => setBasis(v as Basis)}
+            options={[{ value: 'cash', label: 'Cash' },
+              { value: 'accrual', label: 'Accrual' }]}
+          />
         </div>
       )}
 
@@ -464,36 +449,40 @@ export default function Reports() {
             label="As of end of"
             value={String(bsMonth)}
             onChange={(v) => setBsMonth(Number(v))}
-          >
-            {M_NAMES.map((label, v) => (
-              <option key={label} value={String(v)}>
-                {label} {CUR_YEAR}
-              </option>
-            ))}
-          </LabeledSelect>
-          <LabeledSelect label="Compare to" value={bsCmp} onChange={(v) => setBsCmp(v as Compare)}>
-            <option value="none">None</option>
-            <option value="prev">Previous month</option>
-            <option value="py">Same month last year</option>
-          </LabeledSelect>
-          <LabeledSelect label="Accounting method" value={basis} onChange={(v) => setBasis(v as Basis)}>
-            <option value="cash">Cash</option>
-            <option value="accrual">Accrual</option>
-          </LabeledSelect>
+            options={M_NAMES.map((label, value) => ({ value: String(value), label: `${label} ${CUR_YEAR}` }))}
+          />
+          <LabeledSelect
+            label="Compare to"
+            value={bsCmp}
+            onChange={(v) => setBsCmp(v as Compare)}
+            options={[{ value: 'none', label: 'None' },
+              { value: 'prev', label: 'Previous month' },
+              { value: 'py', label: 'Same month last year' }]}
+          />
+          <LabeledSelect
+            label="Accounting method"
+            value={basis}
+            onChange={(v) => setBasis(v as Basis)}
+            options={[{ value: 'cash', label: 'Cash' },
+              { value: 'accrual', label: 'Accrual' }]}
+          />
         </div>
       )}
 
       {/* transaction log controls */}
       {tab === 'txns' && (
         <div style={controlCard}>
-          <LabeledSelect label="Period" value={logRange} onChange={(v) => setLogRange(v as LogRange)}>
-            <option value="30d">Last 30 days</option>
-            <option value="90d">Last 90 days</option>
-            <option value="ytd">This year</option>
-            <option value="12m">Last 12 months</option>
-            <option value="all">All time</option>
-            <option value="custom">Custom range…</option>
-          </LabeledSelect>
+          <LabeledSelect
+            label="Period"
+            value={logRange}
+            onChange={(v) => setLogRange(v as LogRange)}
+            options={[{ value: '30d', label: 'Last 30 days' },
+              { value: '90d', label: 'Last 90 days' },
+              { value: 'ytd', label: 'This year' },
+              { value: '12m', label: 'Last 12 months' },
+              { value: 'all', label: 'All time' },
+              { value: 'custom', label: 'Custom range…' }]}
+          />
           {logRange === 'custom' && (
             <>
               <div>
@@ -934,46 +923,35 @@ export default function Reports() {
           }}
         >
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-            <select
+            <Select
+              label="Custom report period"
               value={config.range}
-              onChange={(e) => setCfg('range', e.target.value)}
-              style={bareSelectStyle}
-            >
-              <option value="all">All time</option>
-              <option value={CUR_RANGE.value}>{CUR_RANGE.label}</option>
-              <option value={PREV_RANGE.value}>{PREV_RANGE.label}</option>
-            </select>
-            <select
+              onValueChange={(next) => { if (next !== null) setCfg('range', next); }}
+              options={withCurrentOption([{ value: 'all', label: 'All time' }, CUR_RANGE, PREV_RANGE], config.range, savedPeriodLabel(config.range))}
+            />
+            <Select
+              label="Money flow"
               value={config.flow}
-              onChange={(e) => setCfg('flow', e.target.value as SavedReportConfig['flow'])}
-              style={bareSelectStyle}
-            >
-              <option value="both">Money in &amp; out</option>
-              <option value="out">Money out only</option>
-              <option value="in">Money in only</option>
-            </select>
-            <select
+              onValueChange={(next) => { if (next) setCfg('flow', next as SavedReportConfig['flow']); }}
+              options={[{ value: 'both', label: 'Money in & out' },
+                { value: 'out', label: 'Money out only' },
+                { value: 'in', label: 'Money in only' }]}
+            />
+            <Select
+              label="Bank account"
               value={config.account}
-              onChange={(e) => setCfg('account', e.target.value)}
-              style={bareSelectStyle}
-            >
-              <option value="all">All bank accounts</option>
-              {(banks ?? []).map((b) => (
-                <option key={b} value={b}>
-                  {b}
-                </option>
-              ))}
-            </select>
+              onValueChange={(next) => { if (next !== null) setCfg('account', next); }}
+              options={withCurrentOption([{ value: 'all', label: 'All bank accounts' }, ...(banks ?? []).map((bank) => ({ value: bank, label: bank }))], config.account)}
+            />
             <span style={{ fontSize: 13.5, color: 'var(--fnt)', marginLeft: 'auto' }}>Group by</span>
-            <select
+            <Select
+              label="Group by"
               value={config.groupBy}
-              onChange={(e) => setCfg('groupBy', e.target.value as SavedReportConfig['groupBy'])}
-              style={bareSelectStyle}
-            >
-              <option value="tag">Tag</option>
-              <option value="cat">Category</option>
-              <option value="acct">Bank account</option>
-            </select>
+              onValueChange={(next) => { if (next) setCfg('groupBy', next as SavedReportConfig['groupBy']); }}
+              options={[{ value: 'tag', label: 'Tag' },
+                { value: 'cat', label: 'Category' },
+                { value: 'acct', label: 'Bank account' }]}
+            />
           </div>
 
           {/* tag filter pills */}
