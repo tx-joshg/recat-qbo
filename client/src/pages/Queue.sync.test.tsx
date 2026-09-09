@@ -82,6 +82,10 @@ beforeEach(() => {
   }));
   sync.mockReset().mockResolvedValue(json({ ok: true, message: 'No new transactions', lastSyncedAt: null }));
   fetchMock.mockReset().mockImplementation(async (input, init) => {
+    if (/^\/api\/companies\/[^/]+\/reports\/bank-accounts$/.test(String(input))) {
+      expect(init?.method).toBe('GET');
+      return json([]);
+    }
     const match = /^\/api\/companies\/([^/]+)\/(transactions|sync)$/.exec(String(input));
     if (!match) throw new Error(`Unexpected test request: ${String(input)}`);
     if (match[2] === 'sync') {

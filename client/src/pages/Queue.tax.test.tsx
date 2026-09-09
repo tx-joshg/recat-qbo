@@ -328,7 +328,6 @@ describe('tax-aware manual queue', () => {
     await renderQueue([transaction(), transaction({
       id: 'TRANSACTION_SECOND', qboId: 'PURCHASE_SECOND', payee: 'Second supplier',
     })]);
-    await user.click(screen.getAllByRole('button', { name: /preview tax/i })[0]!);
     await waitFor(() => expect(screen.getAllByRole('button', { name: /^post$/i })[0]).toBeEnabled());
     await user.click(screen.getAllByRole('button', { name: 'Split' })[0]!);
     await waitFor(() => expect(document.activeElement).toHaveTextContent('Split transaction'));
@@ -339,6 +338,7 @@ describe('tax-aware manual queue', () => {
     await user.keyboard('{Escape}');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getAllByRole('checkbox').every((checkbox) => !(checkbox as HTMLInputElement).checked)).toBe(true);
+    (document.activeElement as HTMLElement)?.blur();
     await user.keyboard('{Enter}');
     await waitFor(() => expect(mocks.commit).toHaveBeenCalledWith(
       'TRANSACTION_GENERIC', 5, '00000000-0000-4000-8000-000000000101',
@@ -410,6 +410,7 @@ describe('tax-aware manual queue', () => {
     mocks.list.mockResolvedValue({ transactions: [], nextCursor: null, pendingCount: 0 });
     mocks.bankAccounts.mockResolvedValue(['Example dormant account']);
     render(<Queue />);
+    await userEvent.click(screen.getByRole('combobox', { name: 'Account filter' }));
     expect(await screen.findByRole('option', { name: 'Example dormant account' })).toBeInTheDocument();
     expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_GENERIC');
   });
@@ -422,6 +423,8 @@ describe('tax-aware manual queue', () => {
     await waitFor(() => expect(mocks.bankAccounts).toHaveBeenCalledTimes(1));
     mocks.activeCompanyId = 'COMPANY_OTHER';
     view.rerender(<Queue />);
+    await waitFor(() => expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_OTHER'));
+    await userEvent.click(screen.getByRole('combobox', { name: 'Account filter' }));
     expect(await screen.findByRole('option', { name: 'Example current account' })).toBeInTheDocument();
     await act(async () => old.resolve(['Example old account']));
     expect(screen.queryByRole('option', { name: 'Example old account' })).not.toBeInTheDocument();
@@ -1551,7 +1554,7 @@ describe('tax-aware manual queue', () => {
 
     await user.click(screen.getByRole('button', { name: 'Split' }));
     await user.type(screen.getByLabelText('Memo for split line 1'), 'Allocation');
-    await user.click(screen.getAllByRole('button', { name: '×' })[1]!);
+    await user.click(screen.getAllByRole('button', { name: /Remove split line/ })[1]!);
     await user.click(screen.getByRole('button', { name: 'Save split' }));
 
     await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
@@ -1578,7 +1581,7 @@ describe('tax-aware manual queue', () => {
 
     await user.click(screen.getByRole('button', { name: 'Split' }));
     await user.click(screen.getAllByRole('button', { name: 'Generic tag' })[0]!);
-    await user.click(screen.getAllByRole('button', { name: '×' })[1]!);
+    await user.click(screen.getAllByRole('button', { name: /Remove split line/ })[1]!);
     await user.click(screen.getByRole('button', { name: 'Save split' }));
 
     await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
@@ -1800,7 +1803,7 @@ describe('tax-aware manual queue', () => {
     await expectInFlightChangeRestages(async (user) => {
       await user.click(screen.getByRole('button', { name: 'Split' }));
       await user.type(screen.getByLabelText('Memo for split line 1'), 'Allocation');
-      const removeButtons = screen.getAllByRole('button', { name: '×' });
+      const removeButtons = screen.getAllByRole('button', { name: /Remove split line/ });
       await user.click(removeButtons[1]!);
       await user.click(screen.getByRole('button', { name: 'Save split' }));
     });
@@ -1929,7 +1932,7 @@ describe('Queue tax layout', () => {
     document.body.classList.add('rr');
     try {
       await renderQueue();
-      await userEvent.setup().click(screen.getByRole('button', { name: /preview tax/i }));
+      await waitForPostEnabled();
 
       const taxCode = screen.getByRole('combobox', { name: 'Purchase tax for Generic supplier' });
       const calculation = screen.getByRole('combobox', {
@@ -1993,7 +1996,7 @@ describe('Queue tax layout', () => {
     try {
       const user = userEvent.setup();
       await renderQueue();
-      await user.click(screen.getByRole('button', { name: /preview tax/i }));
+      await waitForPostEnabled();
       await user.click(screen.getByRole('button', { name: /^post$/i }));
 
       const recoveryCopy = await screen.findByText(/verify in quickbooks/i);
@@ -2018,7 +2021,7 @@ describe('Queue tax layout', () => {
     mocks.commit.mockResolvedValue(mutation({ ok: false, status: 'ERROR', outcome: 'UNCERTAIN' }));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitForPostEnabled();
       await user.click(screen.getByRole('button', { name: /^post$/i }));
 
     const statusCell = (await screen.findByText(/verify in quickbooks/i))

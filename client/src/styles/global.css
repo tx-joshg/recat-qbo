@@ -243,6 +243,7 @@ input, select, button { font-family:inherit; }
 
 .rr .category-picker { display:inline-flex; align-items:center; min-width:0; width:100%; flex:1; }
 .rr .category-picker > .control-trigger { flex:1; min-width:0; max-width:100%; }
+
 /* shared labelled fields and text controls */
 .rr .field { display:flex; flex-direction:column; gap:5px; min-width:0; }
 .rr .field-label { color:var(--mut); font-size:13px; font-weight:500; }
@@ -285,6 +286,7 @@ input, select, button { font-family:inherit; }
   .rr .split-line-primary > button:last-child { grid-column:2; grid-row:1; }
   .rr .split-line-details { grid-template-columns:minmax(0,1fr); }
 }
+
 .rr .queue-tax-controls { display:block; min-width:0; max-width:100%; }
 .rr .queue-tax-line { display:flex; align-items:center; gap:8px; margin-top:8px; min-width:0; max-width:100%; flex-wrap:wrap; }
 .rr .queue-tax-line > * { min-width:0; max-width:100%; }

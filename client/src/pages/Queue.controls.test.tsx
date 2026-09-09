@@ -41,6 +41,7 @@ vi.mock('../lib/api', () => ({
   ApiError: class ApiError extends Error {},
   createCategorizationRequestId: vi.fn(),
   companies: { sync: vi.fn() },
+  reports: { bankAccounts: vi.fn().mockResolvedValue([]) },
   rules: { create: vi.fn(), lifecycle: vi.fn() },
   autopilot: { get: vi.fn(), listRuns: vi.fn(), getReadiness: vi.fn() },
   transactions: {
