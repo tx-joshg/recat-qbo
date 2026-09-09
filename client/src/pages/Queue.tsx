@@ -1486,6 +1486,8 @@ export default function Queue() {
   const keyRef = useRef<(e: KeyboardEvent) => void>(() => {});
   keyRef.current = (e: KeyboardEvent) => {
     if (e.defaultPrevented) return;
+    // The split dialog owns keyboard interaction, including its non-input heading.
+    if (splitEditId !== null) return;
     if (e.key === 'Escape') {
       setSel({});
       setTagPicker(null);

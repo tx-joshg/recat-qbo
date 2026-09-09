@@ -274,3 +274,14 @@ input, select, button { font-family:inherit; }
 .rr .receipt-dropzone.is-disabled { color:var(--fnt); cursor:not-allowed; opacity:.65; }
 .rr .receipt-file-input { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
 .rr .receipt-dropzone-error { color:var(--erT); font-size:13px; margin-top:6px; }
+.rr .split-line-primary { display:grid; grid-template-columns:92px minmax(0,1fr) 24px; align-items:center; gap:10px; }
+.rr .split-line-details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:end; gap:10px; margin-top:9px; }
+.rr .split-line-primary .control-trigger,.rr .split-line-details .control-trigger { width:100%; }
+.rr .split-line-details > span { min-width:0; }
+@media (max-width:480px) {
+  .rr .split-line-primary { grid-template-columns:minmax(0,1fr) 24px; }
+  .rr .split-line-primary .split-amount { grid-column:1; grid-row:1; }
+  .rr .split-line-primary .split-category { grid-column:1 / -1; grid-row:2; }
+  .rr .split-line-primary > button:last-child { grid-column:2; grid-row:1; }
+  .rr .split-line-details { grid-template-columns:minmax(0,1fr); }
+}

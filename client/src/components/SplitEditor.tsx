@@ -2,7 +2,8 @@
 // 1553–1582 (logic). The draft lives here (the component mounts fresh each time
 // the editor opens); amounts are edited as absolute values like the prototype.
 
-import { useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { FloatingFocusManager, FloatingOverlay, FloatingPortal, useDismiss, useFloating, useInteractions } from '@floating-ui/react';
 import type { MouseEvent } from 'react';
 import type {
   TagDto,
@@ -14,6 +15,7 @@ import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
 import TaxCodePicker, { usableTaxCodesForDirection } from './TaxCodePicker';
 import type { TaxDirection } from './TaxCodePicker';
+import { Combobox, Select } from './SelectCombobox';
 
 export interface SplitLineDraft {
   amt: string;
@@ -45,7 +47,15 @@ export default function SplitEditor({
   onClose: () => void;
   onSave: (lines: SplitLineDraft[], taxCalculation?: TaxCalculation) => void;
 }) {
-  const { toast } = useApp();
+  const { toast, theme = 'light' } = useApp();
+  const titleId = useId();
+  const headingRef = useRef<HTMLDivElement>(null);
+  const { refs, context, elements } = useFloating({ open: true, onOpenChange: (open) => { if (!open) onClose(); } });
+  useLayoutEffect(() => {
+    if (elements.floating) headingRef.current?.focus({ preventScroll: true });
+  }, [elements.floating]);
+  const dismiss = useDismiss(context, { outsidePress: false });
+  const { getFloatingProps } = useInteractions([dismiss]);
   const sourceAmount = txn.sourceGrossCents === undefined ? txn.amount : txn.sourceGrossCents / 100;
   const total = Math.abs(sourceAmount);
   const taxDirection: TaxDirection | null = txn.qboType === 'Purchase'
@@ -116,6 +126,10 @@ export default function SplitEditor({
 
   const upd = (i: number, patch: Partial<SplitLineDraft>) =>
     setDraft((d) => d.map((l, j) => (j === i ? { ...l, ...patch } : l)));
+  const categoryValueFor = (name: string): string => {
+    const match = catOpts.find((option) => option.name === name);
+    return match ? `${match.group}·${match.name}` : '';
+  };
 
   const remainLabel =
     Math.abs(remain) < 0.005
@@ -125,7 +139,10 @@ export default function SplitEditor({
     Math.abs(remain) < 0.005 ? 'var(--okT)' : remain < 0 ? 'var(--erT)' : 'var(--amT)';
 
   return (
-    <div
+    <FloatingPortal>
+    <div className="rr" data-theme={theme} style={{ color: 'var(--ink)', fontSize: 15 }}>
+    <FloatingOverlay
+      lockScroll
       onClick={onClose}
       style={{
         position: 'fixed',
@@ -141,7 +158,13 @@ export default function SplitEditor({
         padding: 20,
       }}
     >
+      <FloatingFocusManager context={context} initialFocus={-1}>
       <div
+        ref={refs.setFloating}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        {...getFloatingProps()}
         onClick={stop}
         onMouseDown={stop}
         style={{
@@ -157,7 +180,7 @@ export default function SplitEditor({
           boxSizing: 'border-box',
         }}
       >
-        <div style={{ fontFamily: "'Spectral',serif", fontSize: 20, fontWeight: 500 }}>
+        <div ref={headingRef} id={titleId} tabIndex={-1} style={{ outline: 'none', fontFamily: "'Spectral',serif", fontSize: 20, fontWeight: 500 }}>
           Split transaction
         </div>
         <div style={{ fontSize: 13.5, color: 'var(--mut)', margin: '4px 0 16px' }}>
@@ -165,34 +188,31 @@ export default function SplitEditor({
         </div>
         {taxEnabled && (
           <span style={{ display: 'block', marginBottom: 12 }}>
-            <label
-              htmlFor={`split-tax-calculation-${txn.id}`}
-              style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
-            >
-              Tax calculation for split
-            </label>
-            <select
+            <Select
               id={`split-tax-calculation-${txn.id}`}
-              className="select"
+              label="Tax calculation for split"
               value={taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
-              onChange={(event) => setTaxCalculation(event.target.value as TaxCalculation)}
-            >
-              <option value="TaxInclusive">Tax inclusive</option>
-              <option value="TaxExcluded">Tax exclusive</option>
-            </select>
+              options={[
+                { value: 'TaxInclusive', label: 'Tax inclusive' },
+                { value: 'TaxExcluded', label: 'Tax exclusive' },
+              ]}
+              onValueChange={(next) => {
+                if (next === 'TaxInclusive' || next === 'TaxExcluded') setTaxCalculation(next);
+              }}
+            />
           </span>
         )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {draft.map((l, i) => (
             <div key={i} style={{ border: '1px solid var(--bd2)', borderRadius: 9, padding: '12px 14px' }}>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <div className="split-line-primary">
                 <input
                   aria-label={`Amount for split line ${i + 1}`}
                   value={l.amt}
                   onChange={(e) => upd(i, { amt: e.target.value })}
-                  className="foc-acc"
+                  className="foc-acc split-amount"
                   style={{
-                    width: 92,
+                    width: '100%',
                     boxSizing: 'border-box',
                     textAlign: 'right',
                     border: '1px solid var(--bd)',
@@ -205,33 +225,27 @@ export default function SplitEditor({
                     fontVariantNumeric: 'tabular-nums',
                   }}
                 />
-                <select
-                  aria-label={`Category for split line ${i + 1}`}
-                  value={l.cat}
-                  onChange={(e) => upd(i, { cat: e.target.value })}
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    border: '1px solid var(--bd)',
-                    borderRadius: 7,
-                    padding: '8px 10px',
-                    fontSize: 13.5,
-                    background: 'var(--card)',
-                    color: 'var(--ink)',
-                    cursor: 'pointer',
+                <Combobox
+                  className="split-category"
+                  label={`Category for split line ${i + 1}`}
+                  value={categoryValueFor(l.cat)}
+                  placeholder={l.cat || 'Category…'}
+                  searchPlaceholder="Search categories…"
+                  options={catOpts.map((option) => ({
+                    value: `${option.group}·${option.name}`,
+                    label: `${option.group} · ${option.name}`,
+                    searchText: `${option.group} ${option.name}`,
+                  }))}
+                  onValueChange={(next) => {
+                    const matched = catOpts.find((option) => `${option.group}·${option.name}` === next);
+                    if (matched) upd(i, { cat: matched.name });
                   }}
-                >
-                  <option value="">Category…</option>
-                  {catOpts.map((c) => (
-                    <option key={`${c.group}·${c.name}`} value={c.name}>
-                      {c.group} · {c.name}
-                    </option>
-                  ))}
-                </select>
+                />
                 <button
                   onClick={() =>
                     setDraft((d) => (d.length > 1 ? d.filter((_, j) => j !== i) : d))
                   }
+                  aria-label={`Remove split line ${i + 1}`}
                   data-tip="Remove line"
                   className="hov-del"
                   style={{
@@ -247,14 +261,7 @@ export default function SplitEditor({
                 </button>
               </div>
               {taxEnabled && (
-                <div
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
-                    gap: 10,
-                    marginTop: 9,
-                  }}
-                >
+                <div className="split-line-details">
                   <span style={{ display: 'block' }}>
                     <label
                       htmlFor={`split-memo-${txn.id}-${i}`}
@@ -419,6 +426,9 @@ export default function SplitEditor({
           </button>
         </div>
       </div>
+      </FloatingFocusManager>
+    </FloatingOverlay>
     </div>
+    </FloatingPortal>
   );
 }
