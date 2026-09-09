@@ -284,32 +284,6 @@ async function renderQueue(row: TransactionDto | TransactionDto[] = transaction(
   return view;
 }
 
-async function expectInFlightChangeInvalidates(
-  change: (user: ReturnType<typeof userEvent.setup>) => Promise<void>,
-  restaged: StagedCategorization = STAGED,
-) {
-  const pending = deferred<StagedCategorization>();
-  mocks.stage
-    .mockReset()
-    .mockImplementationOnce(() => pending.promise)
-    .mockResolvedValueOnce(restaged);
-  const user = userEvent.setup();
-  await renderQueue();
-  await user.click(screen.getByRole('button', { name: /preview tax/i }));
-
-  await change(user);
-
-  expect(screen.getByRole('button', { name: /calculating/i })).toBeDisabled();
-  await act(async () => pending.resolve(STAGED));
-  expect(screen.queryByText(/subtotal.*10\.00/i)).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: /preview tax/i })).toBeEnabled();
-
-  await user.click(screen.getByRole('button', { name: /preview tax/i }));
-  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
-  expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 5 });
-  expect(await screen.findByText(/subtotal/i)).toBeInTheDocument();
-}
-
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.list.mockReset();
@@ -383,11 +357,25 @@ describe('tax-aware manual queue', () => {
     })).toBeInTheDocument();
   });
 
+  it.each(['row', 'split'] as const)('explains an unavailable tax code after an existing %s preview', async (kind) => {
+    const current = kind === 'row' ? transaction() : transaction({ category: null, categoryQboId: null, splits: [{ amount: -10.5, category: 'Generic expense', categoryQboId: 'EXPENSE_ACCOUNT', taxCode: 'Standard tax', taxCodeQboId: 'TAX_CODE_STANDARD', tagIds: [] }] });
+    mocks.list.mockResolvedValue({ transactions: [current], nextCursor: null, pendingCount: 1 });
+    const view = render(<Queue />);
+    await screen.findByText('Generic supplier');
+    await waitForPostEnabled();
+    mocks.taxReadiness = { ...READY, taxCodes: [] };
+    view.rerender(<Queue />);
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    expect(screen.queryByText('Subtotal −$10.00')).not.toBeInTheDocument();
+    expect(screen.getByText(kind === 'split' ? 'Open Split to review its categories and tax codes before calculating tax.' : 'Choose an available category and tax code before calculating tax.')).toBeInTheDocument();
+    expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
   it('stages exact cents at the current revision, previews server totals, and commits that revision', async () => {
     const user = userEvent.setup();
     await renderQueue();
 
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
       'TRANSACTION_GENERIC',
       {
@@ -433,7 +421,7 @@ describe('tax-aware manual queue', () => {
     const user = userEvent.setup();
     await renderQueue(transaction({ amount: 10.5 }));
 
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
 
     expect(await screen.findByText('Subtotal +$10.00')).toBeInTheDocument();
     expect(screen.getByText('Tax +$0.50')).toBeInTheDocument();
@@ -444,7 +432,7 @@ describe('tax-aware manual queue', () => {
     vi.mocked(window.confirm).mockReturnValue(false);
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
     expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(
@@ -468,21 +456,6 @@ describe('tax-aware manual queue', () => {
     expect(mocks.requestId).not.toHaveBeenCalled();
   });
 
-  it('invalidates a staged preview when the draft changes and requires restaging', async () => {
-    const user = userEvent.setup();
-    await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
-    await screen.findByText(/subtotal.*10\.00/i);
-
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
-
-    expect(screen.queryByText(/subtotal.*10\.00/i)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
-    expect(mocks.commit).not.toHaveBeenCalled();
-  });
 
   it('lets an in-flight draft change restage and prevents the older request from clearing the newer one', async () => {
     const first = deferred<StagedCategorization>();
@@ -494,18 +467,13 @@ describe('tax-aware manual queue', () => {
     const user = userEvent.setup();
     await renderQueue();
 
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
-    expect(screen.getByRole('button', { name: /calculating/i })).toBeDisabled();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    expect(screen.getByText('Calculating tax…')).toBeInTheDocument();
     await act(async () => first.resolve(STAGED));
 
     expect(screen.queryByText(/subtotal.*10\.00/i)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /preview tax/i })).toBeEnabled();
-
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
     await act(async () => second.resolve({
       ...STAGED,
       revision: 6,
@@ -522,8 +490,9 @@ describe('tax-aware manual queue', () => {
   });
 
   it('invalidates an in-flight preview when the category changes', async () => {
-    await expectInFlightChangeInvalidates(async (user) => {
+    await expectInFlightChangeRestages(async (user) => {
       await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+      await user.type(screen.getByRole('textbox', { name: 'Category for Generic supplier' }), 'alternate');
       await user.click(screen.getByRole('option', { name: /Alternate expense/ }));
     });
   });
@@ -535,58 +504,19 @@ describe('tax-aware manual queue', () => {
       name: 'Generic tag',
       color: '#667788',
     }];
-    await expectInFlightChangeInvalidates(async (user) => {
+    await expectInFlightChangeRestages(async (user) => {
       await user.click(screen.getByRole('button', { name: '+ tag' }));
       await user.click(screen.getByRole('button', { name: 'Generic tag' }));
     });
   });
 
   it('invalidates an in-flight preview when the tax code changes', async () => {
-    await expectInFlightChangeInvalidates(async (user) => {
-      await user.click(screen.getByRole('combobox', { name: 'Purchase tax for Generic supplier' }));
-      await user.click(screen.getByRole('option', { name: 'No tax' }));
+    await expectInFlightChangeRestages(async (user) => {
+      await chooseControl(user, 'Purchase tax for Generic supplier', 'No tax');
     });
   });
 
-  it('invalidates an in-flight preview when the split draft is saved', async () => {
-    await expectInFlightChangeInvalidates(async (user) => {
-      await user.click(screen.getByRole('button', { name: 'Split' }));
-      const removeButtons = screen.getAllByRole('button', { name: '×' });
-      await user.click(removeButtons[1]!);
-      await user.click(screen.getByRole('button', { name: 'Save split' }));
-    });
-  });
 
-  it('refetches a stale rejected stage before allowing another preview', async () => {
-    const pending = deferred<StagedCategorization>();
-    mocks.stage
-      .mockReset()
-      .mockImplementationOnce(() => pending.promise)
-      .mockResolvedValueOnce({ ...STAGED, revision: 8 });
-    const user = userEvent.setup();
-    await renderQueue();
-    mocks.list.mockResolvedValueOnce({
-      transactions: [transaction({ revision: 7 })],
-      nextCursor: null,
-      pendingCount: 1,
-    });
-
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
-    await act(async () => pending.reject(new ApiError(
-      409,
-      'The transaction changed. Reload before continuing.',
-      'STALE_REVISION',
-    )));
-
-    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
-    await user.click(await screen.findByRole('button', { name: /preview tax/i }));
-    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
-    expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 7 });
-  });
 
   it.each([
     ['TaxInclusive', 'TaxInclusive'],
@@ -629,8 +559,8 @@ describe('tax-aware manual queue', () => {
 
       expect(
         screen.getByLabelText('Tax calculation for Generic supplier'),
-      ).toHaveValue(expectedCalculation);
-      await user.click(screen.getByRole('button', { name: /preview tax/i }));
+      ).toHaveTextContent(expectedCalculation === 'TaxExcluded' ? 'Tax exclusive' : 'Tax inclusive');
+      await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
 
       await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
         'TRANSACTION_GENERIC',
@@ -698,7 +628,7 @@ describe('tax-aware manual queue', () => {
     }));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
     expect(await screen.findByText(/verify in quickbooks/i)).toBeInTheDocument();
@@ -726,7 +656,7 @@ describe('tax-aware manual queue', () => {
     ));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
     expect(await screen.findByText(/not posted.*restage to retry/i)).toBeInTheDocument();
@@ -741,7 +671,7 @@ describe('tax-aware manual queue', () => {
     ));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
     expect(await screen.findByRole('button', { name: /^post$/i })).toBeEnabled();
@@ -755,7 +685,7 @@ describe('tax-aware manual queue', () => {
     mocks.commit.mockRejectedValue(new TypeError('Network request failed'));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
     expect(await screen.findByText(/verify in quickbooks/i)).toBeInTheDocument();
@@ -829,7 +759,7 @@ describe('tax-aware manual queue', () => {
       expect(screen.getByRole('button', { name: '+ tag' })).toBeDisabled();
       expect(screen.getByLabelText('Purchase tax for Generic supplier')).toBeDisabled();
       expect(screen.getByLabelText('Tax calculation for Generic supplier')).toBeDisabled();
-      expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+      expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
       expect(screen.getAllByRole('checkbox')[1]).toBeDisabled();
 
       await userEvent.setup().keyboard('ct{Enter}');
@@ -1040,7 +970,7 @@ describe('tax-aware manual queue', () => {
         expect(screen.getByRole('button', { name: /^undo$/i })).toBeEnabled();
         expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
       } else {
-        expect(await screen.findByText(/not posted.*restage to retry/i)).toBeInTheDocument();
+        await waitForPostEnabled();
         expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
       }
       expect(screen.queryByText(/write status unresolved/i)).not.toBeInTheDocument();
@@ -1268,7 +1198,7 @@ describe('tax-aware manual queue', () => {
     }));
     const user = userEvent.setup();
     await renderQueue();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
     await user.click(await screen.findByRole('button', { name: /reconcile/i }));
 
@@ -1340,7 +1270,7 @@ describe('tax-aware manual queue', () => {
 
     expect(screen.getByLabelText('Sales tax for Generic customer receipt')).toHaveTextContent('Standard sales tax');
     expect(screen.queryByLabelText('Purchase tax for Generic customer receipt')).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalled());
     await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
       'TRANSACTION_GENERIC',
       expect.objectContaining({
@@ -1435,7 +1365,7 @@ describe('tax-aware manual queue', () => {
       mocks.taxReadiness = readiness;
       await renderQueue(deposit({ taxCodeQboId, taxCalculation: 'TaxInclusive' }));
 
-      expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+      expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
       expect(mocks.stage).not.toHaveBeenCalled();
     },
   );
@@ -1460,8 +1390,474 @@ describe('tax-aware manual queue', () => {
         }],
       }));
 
-      expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+      expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
       expect(mocks.stage).not.toHaveBeenCalled();
     },
   );
+  it('automatically stages No tax after category selection', async () => {
+    const user = userEvent.setup();
+    await renderQueue(transaction({
+      category: null,
+      categoryQboId: null,
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    }));
+
+    await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+    await user.click(screen.getByRole('option', { name: /Generic expense/ }));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      {
+        expectedRevision: 4,
+        taxCalculation: 'NotApplicable',
+        lines: [{
+          grossCents: -1050,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: null,
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+    ));
+    expect(mocks.categorize).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Purchase tax for Generic supplier' })).toHaveTextContent('No tax');
+  });
+
+  it('automatically restages when the tax code changes', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await chooseControl(user, 'Purchase tax for Generic supplier', 'No tax');
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        expectedRevision: 5,
+        taxCalculation: 'NotApplicable',
+        lines: [expect.objectContaining({ taxCodeQboId: null })],
+      }),
+    );
+  });
+
+  it('automatically restages when tax calculation changes', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({ expectedRevision: 5, taxCalculation: 'TaxExcluded' }),
+    );
+  });
+
+  it('automatically restages transaction tags', async () => {
+    const tagId = '00000000-0000-4000-8000-000000000070';
+    mocks.tags = [{
+      id: tagId,
+      companyId: 'COMPANY_GENERIC',
+      name: 'Generic tag',
+      color: '#667788',
+    }];
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: '+ tag' }));
+    await user.click(screen.getByRole('button', { name: 'Generic tag' }));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        tagIds: [tagId],
+        lines: [expect.objectContaining({ tagIds: [tagId] })],
+      }),
+    );
+  });
+
+  it('automatically restages saved split-line changes', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: 'Split' }));
+    await user.type(screen.getByLabelText('Memo for split line 1'), 'Allocation');
+    await user.click(screen.getAllByRole('button', { name: '×' })[1]!);
+    await user.click(screen.getByRole('button', { name: 'Save split' }));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        expectedRevision: 5,
+        lines: [expect.objectContaining({ grossCents: -1050, memo: 'Allocation' })],
+      }),
+    );
+  });
+
+  it('automatically restages saved split tags', async () => {
+    const tagId = '00000000-0000-4000-8000-000000000070';
+    mocks.tags = [{
+      id: tagId,
+      companyId: 'COMPANY_GENERIC',
+      name: 'Generic tag',
+      color: '#667788',
+    }];
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: 'Split' }));
+    await user.click(screen.getAllByRole('button', { name: 'Generic tag' })[0]!);
+    await user.click(screen.getAllByRole('button', { name: '×' })[1]!);
+    await user.click(screen.getByRole('button', { name: 'Save split' }));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        lines: [expect.objectContaining({ tagIds: [tagId] })],
+      }),
+    );
+  });
+
+  it('stages delayed A and only the latest queued B snapshot', async () => {
+    const first = deferred<StagedCategorization>();
+    const second = deferred<StagedCategorization>();
+    mocks.stage
+      .mockReset()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const user = userEvent.setup();
+    await renderQueue(transaction({
+      category: null,
+      categoryQboId: null,
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    }));
+
+    await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+    await user.click(screen.getByRole('option', { name: /Generic expense/ }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+    await user.click(screen.getByRole('option', { name: /Alternate expense/ }));
+
+    await act(async () => first.resolve({ ...STAGED, taxCalculation: 'NotApplicable' }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        expectedRevision: 5,
+        lines: [expect.objectContaining({ categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE' })],
+      }),
+    );
+    await act(async () => second.resolve({
+      ...STAGED,
+      revision: 6,
+      taxCalculation: 'NotApplicable',
+      lines: [{ ...STAGED.lines[0]!, categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE', taxCodeQboId: null }],
+    }));
+  });
+
+  it('shows an inline staging error and retries the exact desired snapshot', async () => {
+    mocks.stage
+      .mockReset()
+      .mockRejectedValueOnce(new ApiError(400, 'Could not calculate this tax.', 'INVALID_INPUT'))
+      .mockResolvedValueOnce(STAGED);
+    const user = userEvent.setup();
+    await renderQueue();
+
+    expect(await screen.findByText('Could not calculate this tax.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Retry calculation' }));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      {
+        expectedRevision: 4,
+        taxCalculation: 'TaxInclusive',
+        lines: [{
+          grossCents: -1050,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: 'TAX_CODE_STANDARD',
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+    );
+    expect(await screen.findByText('Subtotal −$10.00')).toBeInTheDocument();
+  });
+
+  it('reloads and rebases after a lost staging response', async () => {
+    const first = deferred<StagedCategorization>();
+    mocks.stage
+      .mockReset()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce({ ...STAGED, revision: 8 });
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    mocks.list.mockResolvedValueOnce({
+      transactions: [transaction({ revision: 7 })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+
+    await act(async () => first.reject(new TypeError('Stage response lost')));
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({ expectedRevision: 7 }),
+    );
+  });
+
+  it.each(['posted', 'active', 'missing'] as const)('refreshes server truth after an immutable %s staging conflict', async (kind) => {
+    const first = deferred<StagedCategorization>();
+    mocks.stage.mockReset().mockImplementationOnce(() => first.promise);
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    const latest = transaction({ revision: 7, payee: 'Updated supplier', status: kind === 'posted' ? 'POSTED' : 'PENDING',
+      activeCategorizationAttempt: kind === 'active' ? { requestId: '00000000-0000-4000-8000-000000000909', operation: 'recategorize', status: 'PREPARED' } : null });
+    mocks.list.mockResolvedValueOnce({ transactions: kind === 'missing' ? [] : [latest], nextCursor: null, pendingCount: 0 });
+    await act(async () => first.reject(new ApiError(409, 'The transaction changed.', 'STALE_REVISION')));
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    if (kind === 'posted') expect(screen.getByText('Posted — verified ✓')).toBeInTheDocument();
+    if (kind === 'active') expect(screen.getByRole('button', { name: 'Resume post' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /^post$/i })).not.toBeInTheDocument();
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires review of concurrent server edits instead of overwriting them on rebase', async () => {
+    const first = deferred<StagedCategorization>();
+    mocks.stage.mockReset().mockImplementationOnce(() => first.promise).mockResolvedValueOnce({ ...STAGED, revision: 8 });
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 7, payee: 'Updated supplier', amount: -21,
+      category: 'Alternate expense', categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE', tagIds: ['TAG_GENERIC'] })], nextCursor: null, pendingCount: 1 });
+    await act(async () => first.reject(new ApiError(409, 'The transaction changed.', 'STALE_REVISION')));
+    expect(await screen.findByText('Updated supplier')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Category for Updated supplier' })).toHaveTextContent('Alternate expense');
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: 'Calculate tax for Updated supplier' }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage).toHaveBeenLastCalledWith('TRANSACTION_GENERIC', expect.objectContaining({ expectedRevision: 7,
+      tagIds: ['TAG_GENERIC'], lines: [expect.objectContaining({ categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE', grossCents: -2100 })] }));
+  });
+
+  it('restages after an immutable active conflict resumes with a retryable outcome', async () => {
+    const first = deferred<StagedCategorization>();
+    mocks.stage.mockReset().mockImplementationOnce(() => first.promise).mockResolvedValueOnce({ ...STAGED, revision: 8 });
+    mocks.commit.mockResolvedValue(mutation({ ok: false, status: 'PENDING', outcome: 'RETRYABLE' }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 7,
+      activeCategorizationAttempt: { requestId: '00000000-0000-4000-8000-000000000909', operation: 'recategorize', status: 'PREPARED' } })], nextCursor: null, pendingCount: 1 });
+    await act(async () => first.reject(new ApiError(409, 'The transaction changed.', 'STALE_REVISION')));
+    await user.click(await screen.findByRole('button', { name: 'Resume post' }));
+    await user.click(await screen.findByRole('button', { name: 'Restage categorization' }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(await waitForPostEnabled()).toBeEnabled();
+  });
+
+  it('reloads a mutation-blocked stage once to expose the active attempt', async () => {
+    const first = deferred<StagedCategorization>();
+    mocks.stage.mockReset().mockImplementationOnce(() => first.promise);
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 7,
+      activeCategorizationAttempt: { requestId: '00000000-0000-4000-8000-000000000909', operation: 'recategorize', status: 'PREPARED' } })], nextCursor: null, pendingCount: 1 });
+    await act(async () => first.reject(new ApiError(409, 'Resume the prepared write.', 'MUTATION_BLOCKED')));
+    expect(await screen.findByRole('button', { name: 'Resume post' })).toBeEnabled();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'Retry calculation' })).not.toBeInTheDocument();
+  });
+
+  it('calculates only the active row on load and lets another row request a preview', async () => {
+    mocks.list.mockResolvedValue({ transactions: Array.from({ length: 30 }, (_, i) => transaction({ id: 'transaction-' + i, payee: 'Supplier ' + i })), nextCursor: null, pendingCount: 30 });
+    mocks.stage.mockImplementation(() => new Promise(() => {}));
+    const user = userEvent.setup();
+    render(<Queue />);
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    expect(mocks.stage.mock.calls[0]?.[0]).toBe('transaction-0');
+    await user.click(screen.getByRole('button', { name: 'Calculate tax for Supplier 20' }));
+    expect(mocks.stage).toHaveBeenCalledTimes(2);
+    expect(mocks.stage.mock.calls[1]?.[0]).toBe('transaction-20');
+  });
+
+  it('enables Post only after the exact latest desired snapshot is ready', async () => {
+    const first = deferred<StagedCategorization>();
+    const second = deferred<StagedCategorization>();
+    mocks.stage
+      .mockReset()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    await act(async () => first.resolve(STAGED));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+
+    await act(async () => second.resolve({
+      ...STAGED,
+      revision: 6,
+      taxCalculation: 'TaxExcluded',
+      totals: { subtotalCents: -1050, taxCents: -53, totalCents: -1103 },
+    }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^post$/i })).toBeEnabled());
+  });
+
+  it('automatically replaces staged totals when the draft changes', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+    await screen.findByText(/subtotal.*10\.00/i);
+
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^post$/i })).toBeEnabled());
+    expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
+  it('queues an updated saved split while staging is in flight', async () => {
+    await expectInFlightChangeRestages(async (user) => {
+      await user.click(screen.getByRole('button', { name: 'Split' }));
+      await user.type(screen.getByLabelText('Memo for split line 1'), 'Allocation');
+      const removeButtons = screen.getAllByRole('button', { name: '×' });
+      await user.click(removeButtons[1]!);
+      await user.click(screen.getByRole('button', { name: 'Save split' }));
+    });
+  });
+
+  it('refetches and automatically rebases a stale rejected stage', async () => {
+    const pending = deferred<StagedCategorization>();
+    mocks.stage
+      .mockReset()
+      .mockImplementationOnce(() => pending.promise)
+      .mockResolvedValueOnce({ ...STAGED, revision: 8 });
+    const user = userEvent.setup();
+    await renderQueue();
+    mocks.list.mockResolvedValueOnce({
+      transactions: [transaction({ revision: 7 })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    await act(async () => pending.reject(new ApiError(
+      409,
+      'The transaction changed. Reload before continuing.',
+      'STALE_REVISION',
+    )));
+
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 7 });
+  });
+
+  it('preserves failed-post recovery when restage is unavailable during calculation', async () => {
+    const pendingStage = deferred<StagedCategorization>();
+    mocks.stage
+      .mockReset()
+      .mockResolvedValueOnce(STAGED)
+      .mockReturnValueOnce(pendingStage.promise);
+    mocks.commit.mockResolvedValue(mutation({
+      ok: false,
+      status: 'PENDING',
+      outcome: 'RETRYABLE',
+    }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(await waitForPostEnabled());
+    const recoveryCopy = await screen.findByText(/not posted.*restage to retry/i);
+
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole('button', { name: 'Restage categorization' }));
+
+    expect(recoveryCopy).toBeInTheDocument();
+    expect(mocks.stage).toHaveBeenCalledTimes(2);
+    expect(mocks.commit).toHaveBeenCalledTimes(1);
+    expect(mocks.requestId).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves failed-post recovery when the stage coordinator is in error', async () => {
+    mocks.stage
+      .mockReset()
+      .mockResolvedValueOnce(STAGED)
+      .mockRejectedValueOnce(new ApiError(400, 'Cannot calculate tax.', 'INVALID_INPUT'));
+    mocks.commit.mockResolvedValue(mutation({
+      ok: false,
+      status: 'PENDING',
+      outcome: 'RETRYABLE',
+    }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(await waitForPostEnabled());
+
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole('button', { name: 'Restage categorization' }));
+
+    expect(screen.getByText(/not posted.*restage to retry/i)).toBeInTheDocument();
+    expect(mocks.stage).toHaveBeenCalledTimes(2);
+    expect(mocks.commit).toHaveBeenCalledTimes(1);
+    expect(mocks.requestId).toHaveBeenCalledTimes(1);
+  });
+
 });
+
+async function waitForPostEnabled() { const post = screen.getByRole("button", { name: /^post$/i }); await waitFor(() => expect(post).toBeEnabled()); return post; }
+
+async function chooseControl(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+  optionName: string,
+) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  const search = screen.queryByRole('textbox', { name: label });
+  if (search) await user.type(search, optionName);
+  await user.click(screen.getByRole('option', { name: optionName }));
+}
+
+
+async function expectInFlightChangeRestages(
+  change: (user: ReturnType<typeof userEvent.setup>) => Promise<void>,
+  restaged: StagedCategorization = STAGED,
+) {
+  const pending = deferred<StagedCategorization>();
+  mocks.stage
+    .mockReset()
+    .mockImplementationOnce(() => pending.promise)
+    .mockResolvedValueOnce(restaged);
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+
+  await change(user);
+
+  expect(screen.getByText('Calculating tax…')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+  await act(async () => pending.resolve(STAGED));
+
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+  expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 5 });
+  expect(await screen.findByText(/subtotal/i)).toBeInTheDocument();
+}
