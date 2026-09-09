@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   company: { findUnique: vi.fn() },
   qboAccount: { findMany: vi.fn() },
   rule: { findMany: vi.fn() },
-  transaction: { findMany: vi.fn() },
+  transaction: { findMany: vi.fn(), update: vi.fn() },
 }));
 
 vi.mock('./instanceSettings.js', () => ({ getInstanceSettings: mocks.getInstanceSettings }));
@@ -24,6 +24,7 @@ import {
   normalizePayee,
   pickSuggestion,
   ruleSuggestion,
+  refreshSuggestions,
   suggestFor,
   type HistoryTxnLike,
   type RuleLike,
@@ -234,5 +235,116 @@ describe('AI suggestion model', () => {
     await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
 
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AI cache binding', () => {
+  const txn = { payee: 'Example supplier', amount: -25 };
+  const supplies = { qboId: '1', name: 'Office supplies' };
+  const freight = { qboId: '2', name: 'Freight' };
+
+  beforeEach(() => {
+    mocks.qboAccount.findMany.mockResolvedValue([supplies, freight]);
+  });
+
+  function answer(category: string) {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: category } }] }),
+    });
+  }
+
+  it.each([
+    ['model', { suggestionModel: 'replacement-model' }],
+    ['endpoint', { aiEndpoint: 'https://replacement.example/v1' }],
+    ['provider', { suggestionProvider: 'openrouter' }],
+  ])('recomputes a cached suggestion when the effective %s changes', async (name, patch) => {
+    const companyId = `cache-settings-${name}`;
+    const settings = await mocks.getInstanceSettings();
+    expect(await suggestFor(companyId, txn)).toMatchObject({ categoryQboId: '1' });
+
+    mocks.getInstanceSettings.mockResolvedValue({ ...settings, ...patch });
+    answer('Freight');
+
+    expect(await suggestFor(companyId, txn)).toMatchObject({ categoryQboId: '2' });
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['removed', 'holding', 'renamed', 'replaced'])('does not reuse a category that was %s', async (change) => {
+    const companyId = `cache-categories-${change}`;
+    expect(await suggestFor(companyId, txn)).toMatchObject({ categoryQboId: '1' });
+    if (change === 'holding') mocks.company.findUnique.mockResolvedValue({ holdingAccountIds: ['1'] });
+    else if (change === 'renamed') mocks.qboAccount.findMany.mockResolvedValue([{ ...supplies, name: 'Stationery' }, freight]);
+    else if (change === 'replaced') mocks.qboAccount.findMany.mockResolvedValue([{ ...supplies, qboId: '3' }, freight]);
+    else mocks.qboAccount.findMany.mockResolvedValue([freight]);
+    answer(change === 'replaced' ? 'Office supplies' : 'Freight');
+
+    expect(await suggestFor(companyId, txn)).toMatchObject({ categoryQboId: change === 'replaced' ? '3' : '2' });
+  });
+
+  it('invalidates a cached no-suggestion answer when a category becomes available', async () => {
+    const companyId = 'cache-new-category';
+    mocks.qboAccount.findMany.mockResolvedValue([supplies]);
+    answer('Freight');
+    expect(await suggestFor(companyId, txn)).toBeNull();
+    mocks.qboAccount.findMany.mockResolvedValue([supplies, freight]);
+    expect(await suggestFor(companyId, txn)).toMatchObject({ categoryQboId: '2' });
+  });
+
+  it('keeps reusable cache entries company-scoped and independent of category query order', async () => {
+    expect(await suggestFor('cache-reuse-a', txn)).toMatchObject({ categoryQboId: '1' });
+    mocks.qboAccount.findMany.mockResolvedValue([freight, supplies]);
+    answer('Freight');
+    expect(await suggestFor('cache-reuse-a', txn)).toMatchObject({ categoryQboId: '1' });
+    expect(await suggestFor('cache-reuse-b', txn)).toMatchObject({ categoryQboId: '2' });
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the same settings snapshot for cache identity and the provider request', async () => {
+    const settings = await mocks.getInstanceSettings();
+    mocks.getInstanceSettings
+      .mockResolvedValueOnce({ ...settings, suggestionModel: 'first-model' })
+      .mockResolvedValue({ ...settings, suggestionModel: 'second-model' });
+    await suggestFor('cache-settings-race', txn);
+    expect(JSON.parse(mocks.fetch.mock.calls[0]?.[1]?.body as string)).toMatchObject({ model: 'first-model' });
+    answer('Freight');
+    expect(await suggestFor('cache-settings-race', txn)).toMatchObject({ categoryQboId: '2' });
+    expect(JSON.parse(mocks.fetch.mock.calls[1]?.[1]?.body as string)).toMatchObject({ model: 'second-model' });
+  });
+
+  it('replaces an obsolete binding instead of retaining every model version for a payee', async () => {
+    const settings = await mocks.getInstanceSettings();
+    await suggestFor('cache-replaced-binding', txn);
+    mocks.getInstanceSettings.mockResolvedValue({ ...settings, suggestionModel: 'temporary-model' });
+    answer('Freight');
+    await suggestFor('cache-replaced-binding', txn);
+    mocks.getInstanceSettings.mockResolvedValue(settings);
+
+    expect(await suggestFor('cache-replaced-binding', txn)).toMatchObject({ categoryQboId: '2' });
+    expect(mocks.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('loads one category snapshot for all AI suggestions in a sync refresh', async () => {
+    const companyId = 'cache-batch-categories';
+    const rows = [
+      { id: 'txn-a', payee: 'Example supplier alpha', memo: null, amount: -25, suggestion: null },
+      { id: 'txn-b', payee: 'Example supplier beta', memo: null, amount: -30, suggestion: null },
+    ];
+    mocks.transaction.findMany.mockImplementation(async (args: { where: { status: unknown } }) => (
+      args.where.status === 'PENDING' ? rows : []
+    ));
+    const written: unknown[] = [];
+    mocks.transaction.update.mockImplementation(async (args: { data: { suggestion: unknown } }) => {
+      written.push(args.data.suggestion);
+    });
+
+    await refreshSuggestions(companyId);
+
+    expect(written).toEqual([
+      { category: 'Office supplies', categoryQboId: '1', source: 'ai' },
+      { category: 'Office supplies', categoryQboId: '1', source: 'ai' },
+    ]);
+    expect(mocks.company.findUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.qboAccount.findMany).toHaveBeenCalledTimes(1);
   });
 });

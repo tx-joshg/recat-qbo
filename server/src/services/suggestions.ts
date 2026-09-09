@@ -10,7 +10,7 @@
 import { Prisma } from '@prisma/client';
 import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
-import { completeCategory } from './ai/provider.js';
+import { completeCategory, type CategoryProviderSettings } from './ai/provider.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -109,6 +109,7 @@ export function pickSuggestion(
 
 interface SuggestionSettings {
   suggestionSource: SuggestionSetting;
+  aiSettings: CategoryProviderSettings | null;
 }
 
 let warnedSettingsUnavailable = false;
@@ -119,13 +120,22 @@ async function loadSettings(): Promise<SuggestionSettings> {
     const s = await getInstanceSettings();
     return {
       suggestionSource: (s.suggestionSource || 'builtin') as SuggestionSetting,
+      aiSettings: {
+        suggestionProvider: s.suggestionProvider,
+        suggestionModel: s.suggestionModel,
+        aiEndpoint: s.aiEndpoint,
+        aiApiKey: s.aiApiKey,
+        openrouterApiKey: s.openrouterApiKey,
+        openrouterReferer: s.openrouterReferer,
+        openrouterTitle: s.openrouterTitle,
+      },
     };
   } catch {
     if (!warnedSettingsUnavailable) {
       warnedSettingsUnavailable = true;
       console.warn('[suggestions] instance settings unavailable — defaulting to builtin suggestions');
     }
-    return { suggestionSource: 'builtin' };
+    return { suggestionSource: 'builtin', aiSettings: null };
   }
 }
 
@@ -133,9 +143,10 @@ async function loadSettings(): Promise<SuggestionSettings> {
 // AI step
 // ---------------------------------------------------------------------------
 
-// Cache per (companyId, normalized payee). Resolved answers (including a valid
+// Bind cached answers to the effective model settings and allowed categories,
+// in addition to company and normalized payee. Resolved answers (including a valid
 // "no idea") are cached; transport errors are not, so a flaky endpoint retries.
-const aiCache = new Map<string, SuggestionDto | null>();
+const aiCache = new Map<string, { binding: string; result: SuggestionDto | null }>();
 
 interface CategoryOption {
   qboId: string;
@@ -155,12 +166,24 @@ async function categoryOptions(companyId: string): Promise<CategoryOption[]> {
 async function aiSuggestion(
   companyId: string,
   txn: { payee: string; memo?: string | null; amount: number },
+  settings: CategoryProviderSettings | null,
+  optionsIn?: CategoryOption[],
 ): Promise<SuggestionDto | null> {
-  const cacheKey = `${companyId}|${normalizePayee(txn.payee)}`;
-  if (aiCache.has(cacheKey)) return aiCache.get(cacheKey) ?? null;
-
-  const options = await categoryOptions(companyId);
+  if (settings === null) return null;
+  const options = optionsIn ?? await categoryOptions(companyId);
   if (options.length === 0) return null;
+  const openrouter = settings.suggestionProvider === 'openrouter';
+  const cacheKey = JSON.stringify([companyId, normalizePayee(txn.payee)]);
+  const binding = JSON.stringify([
+    openrouter ? 'openrouter' : 'custom',
+    settings.suggestionModel,
+    openrouter ? 'https://openrouter.ai/api/v1' : settings.aiEndpoint.replace(/\/+$/, ''),
+    [...options]
+      .sort((a, b) => a.qboId.localeCompare(b.qboId) || a.name.localeCompare(b.name))
+      .map(({ qboId, name }) => [qboId, name]),
+  ]);
+  const cached = aiCache.get(cacheKey);
+  if (cached?.binding === binding) return cached.result;
 
   // Minimal context only: one transaction + the category name list. Never the
   // full books.
@@ -174,14 +197,16 @@ async function aiSuggestion(
     ...options.map((o) => `- ${o.name}`),
   ].join('\n');
 
-  const answer = await completeCategory(prompt);
+  // The request and its cache entry must use the same settings snapshot.
+  const answer = await completeCategory(prompt, settings);
   // Only accept an exact (case-insensitive) category name — anything else is
   // a hallucination and must not reach the queue.
   const hit = options.find((o) => o.name.toLowerCase() === answer?.toLowerCase());
   const result: SuggestionDto | null = hit
     ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
     : null;
-  if (answer !== null) aiCache.set(cacheKey, result);
+  // Retain one binding per payee, not every obsolete settings/category version.
+  if (answer !== null) aiCache.set(cacheKey, { binding, result });
   return result;
 }
 
@@ -219,7 +244,7 @@ export async function suggestFor(
   const history = historyEnabled ? await loadHistory(companyId) : [];
   const picked = pickSuggestion(txn.payee, rules, history, historyEnabled);
   if (picked) return picked;
-  if (settings.suggestionSource === 'ai') return aiSuggestion(companyId, txn);
+  if (settings.suggestionSource === 'ai') return aiSuggestion(companyId, txn, settings.aiSettings);
   return null;
 }
 
@@ -249,12 +274,14 @@ export async function refreshSuggestions(companyId: string): Promise<void> {
   const rules = await loadRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
   const pending = await prisma.transaction.findMany({ where: { companyId, status: 'PENDING' } });
+  let aiOptions: CategoryOption[] | undefined;
 
   for (const t of pending) {
     const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
     let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
     if (!suggestion && settings.suggestionSource === 'ai') {
-      suggestion = await aiSuggestion(companyId, input);
+      aiOptions ??= await categoryOptions(companyId);
+      suggestion = await aiSuggestion(companyId, input, settings.aiSettings, aiOptions);
     }
     const current = JSON.stringify(t.suggestion ?? null);
     const next = JSON.stringify(suggestion);
