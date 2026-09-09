@@ -4,6 +4,8 @@
 // All filtering, sorting and row-state transitions happen client-side on the
 // locally-held transaction list, exactly like the prototype.
 
+import { createRowStageCoordinator, sameDesired, type DesiredStage, type RowStageView } from './queue/rowStageCoordinator';
+
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -14,7 +16,6 @@ import {
   type CategorizationMutationResult,
   type SplitDto,
   type StageCategorizationBody,
-  type StagedCategorization,
   type TaxCalculation,
   type TransactionDto,
   type TxnStatus,
@@ -160,12 +161,7 @@ interface TaxMutationState {
 interface TaxRowState {
   taxCalculation: TaxCalculation;
   taxCodeQboId: string | null;
-  staged: StagedCategorization | null;
-  staging: boolean;
-  stagingRequestId: number | null;
-  reloadRequired: boolean;
-  version: number;
-  stagedVersion: number | null;
+  stage: RowStageView;
   mutation: TaxMutationState | null;
 }
 
@@ -186,12 +182,7 @@ function initialTaxState(t: TransactionDto): TaxRowState {
           ? 'TaxExcluded'
           : 'TaxInclusive',
     taxCodeQboId,
-    staged: null,
-    staging: false,
-    stagingRequestId: null,
-    reloadRequired: false,
-    version: 0,
-    stagedVersion: null,
+    stage: { status: 'idle', desired: null, staged: null, result: null, error: null },
     mutation: t.activeCategorizationAttempt === null
       ? null
       : {
@@ -259,9 +250,7 @@ export default function Queue() {
   const [syncingCompanyId, setSyncingCompanyId] = useState<string | null>(
     () => activeCompanyId && companySyncLocks.has(activeCompanyId) ? activeCompanyId : null,
   );
-  const taxVersionsRef = useRef<Record<string, number>>({});
-  const stageRequestSequenceRef = useRef(0);
-  const stageRequestTokensRef = useRef<Record<string, number>>({});
+  const stageCoordinatorsRef = useRef<Record<string, ReturnType<typeof createRowStageCoordinator>>>({});
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia('(max-width: 640px)').matches,
   );
@@ -319,21 +308,6 @@ export default function Queue() {
       );
     },
     [taxState],
-  );
-
-  const invalidateTaxStage = useCallback(
-    (t: TransactionDto, patch: Partial<Pick<TaxRowState, 'taxCalculation' | 'taxCodeQboId'>> = {}) => {
-      const nextVersion = (taxVersionsRef.current[t.id] ?? 0) + 1;
-      taxVersionsRef.current[t.id] = nextVersion;
-      updateTaxState(t, (current) => ({
-        ...current,
-        ...patch,
-        staged: null,
-        stagedVersion: null,
-        version: nextVersion,
-      }));
-    },
-    [updateTaxState],
   );
 
   const aliveRef = useRef(true);
@@ -625,6 +599,153 @@ export default function Queue() {
     [rows, hasActiveMutation, openSplit],
   );
 
+  const stageBodyFor = useCallback(
+    (t: TransactionDto, state: TaxRowState): DesiredStage | null => {
+      const taxCalculation: TaxCalculation =
+        t.splits && t.splits.length > 0
+          ? state.taxCalculation
+          : state.taxCodeQboId === null
+            ? 'NotApplicable'
+            : state.taxCalculation === 'TaxExcluded'
+              ? 'TaxExcluded'
+              : 'TaxInclusive';
+      const sourceLines = t.splits && t.splits.length > 0
+        ? t.splits.map((split) => ({
+            amount: split.amount,
+            categoryQboId: split.categoryQboId ?? qboIdOf(split.category),
+            taxCodeQboId: split.taxCodeQboId ?? null,
+            memo: split.memo,
+            tagIds: split.tagIds,
+          }))
+        : [{
+            // Stage against the proven source gross, not the displayed amount:
+            // for a holding-account transaction `amount` is the net, and the
+            // server balances the lines against the gross.
+            amount: t.sourceGrossCents === undefined ? t.amount : t.sourceGrossCents / 100,
+            categoryQboId: t.categoryQboId ?? (t.category ? qboIdOf(t.category) : null),
+            taxCodeQboId: state.taxCodeQboId,
+            memo: undefined,
+            tagIds: t.tagIds,
+          }];
+
+      const lines: StageCategorizationBody['lines'] = [];
+      for (const line of sourceLines) {
+        const grossCents = exactCents(line.amount);
+        if (grossCents === null || !line.categoryQboId) return null;
+        if (
+          taxCalculation !== 'NotApplicable' &&
+          (line.taxCodeQboId === null || !isTaxCodeUsableFor(t, line.taxCodeQboId))
+        ) return null;
+        lines.push({
+          grossCents,
+          categoryQboId: line.categoryQboId,
+          taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
+          ...(line.memo ? { memo: line.memo } : {}),
+          tagIds: [...line.tagIds],
+        });
+      }
+      return {
+        taxCalculation,
+        lines,
+        tagIds: [...t.tagIds],
+      };
+    },
+    [qboIdOf, isTaxCodeUsableFor],
+  );
+
+  const readyStageFor = useCallback((t: TransactionDto, state: TaxRowState) => {
+    const desired = stageBodyFor(t, state);
+    if (hasActiveMutation(t) || desired === null || state.stage.status !== 'ready' ||
+      state.stage.staged === null || state.stage.staged !== state.stage.desired ||
+      !sameDesired(state.stage.staged, desired)) return null;
+    return state.stage.result;
+  }, [hasActiveMutation, stageBodyFor]);
+
+  const requestStage = useCallback(
+    (t: TransactionDto, state: TaxRowState) => {
+      if (t.status !== 'PENDING' || state.stage.status === 'conflict' || hasActiveMutation(t) || !taxReadyFor(t)) return;
+      const desired = stageBodyFor(t, state);
+      if (desired === null) return;
+      let coordinator = stageCoordinatorsRef.current[t.id];
+      if (!coordinator) {
+        const companyId = activeCompanyIdRef.current;
+        // A revision-only change or a lost response may rebase safely. A different
+        // server draft must be shown for review before another local write.
+        let acknowledged = stageBodyFor(t, initialTaxState(t));
+        let lastSent: DesiredStage | null = null;
+        let concurrentEdit = false;
+        coordinator = createRowStageCoordinator(t.revision, {
+          stage: async (expectedRevision, nextDesired) => {
+            lastSent = nextDesired;
+            const result = await txnApi.stageCategorization(t.id, { ...nextDesired, expectedRevision });
+            acknowledged = nextDesired;
+            return result;
+          },
+          reload: async () => {
+            if (!companyId) return null;
+            const latestRows = await fetchAllTxns(companyId);
+            if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return null;
+            const latest = latestRows.find((row) => row.id === t.id) ?? null;
+            const latestDesired = latest ? stageBodyFor(latest, initialTaxState(latest)) : null;
+            concurrentEdit = latest !== null && latest.status === 'PENDING' && latest.activeCategorizationAttempt === null
+              && (latestDesired === null || !(
+                (acknowledged !== null && sameDesired(latestDesired, acknowledged))
+                || (lastSent !== null && sameDesired(latestDesired, lastSent))
+              ));
+            if (latest === null) {
+              setRows((prev) => prev.filter((row) => row.id !== t.id));
+            } else if (latest.status !== 'PENDING' || latest.activeCategorizationAttempt !== null || concurrentEdit) {
+              patchRow(t.id, latest);
+              setTaxRows((prev) => ({ ...prev, [t.id]: {
+                ...initialTaxState(latest), stage: prev[t.id]?.stage ?? initialTaxState(latest).stage,
+              } }));
+            }
+            if (latest && !concurrentEdit) {
+              patchRow(t.id, { revision: latest.revision, payee: latest.payee, memo: latest.memo,
+                amount: latest.amount, date: latest.date, bankAccount: latest.bankAccount,
+                qboId: latest.qboId, qboType: latest.qboType });
+            }
+            return latest;
+          },
+          isMutable: (latest) => !concurrentEdit && latest.status === 'PENDING' && (
+            latest.activeCategorizationAttempt === null
+          ),
+        }, (view) => {
+          if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+          setTaxRows((prev) => ({ ...prev, [t.id]: {
+            ...(prev[t.id] ?? initialTaxState(t)), stage: concurrentEdit && view.status === 'conflict'
+              ? { ...view, error: 'The transaction changed. Review the refreshed details, then calculate tax again.' } : view,
+            ...(view.status === 'ready' ? { mutation: null } : {}),
+          } }));
+          if (view.status === 'ready' && view.result !== null) {
+            patchRow(t.id, { revision: view.result.revision, taxCalculation: view.result.taxCalculation });
+          }
+        });
+        stageCoordinatorsRef.current[t.id] = coordinator;
+      }
+      coordinator.update(desired);
+    },
+    [hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
+  );
+
+  useEffect(() => {
+    if (activeRow) requestStage(activeRow, taxRows[activeRow.id] ?? initialTaxState(activeRow));
+  }, [requestStage, activeRow, taxRows]);
+
+  useEffect(() => {
+    const present = new Set(rows.map((row) => row.id));
+    for (const [id, coordinator] of Object.entries(stageCoordinatorsRef.current)) {
+      if (present.has(id)) continue;
+      coordinator.dispose();
+      delete stageCoordinatorsRef.current[id];
+    }
+  }, [rows]);
+
+  useEffect(() => () => {
+    for (const coordinator of Object.values(stageCoordinatorsRef.current)) coordinator.dispose();
+    stageCoordinatorsRef.current = {};
+  }, []);
+
   /** Assign a category: server merges matching rule tags — use the returned dto. */
   const categorizeTo = useCallback(
     (t: TransactionDto, name: string, categoryQboId: string) => {
@@ -632,7 +753,7 @@ export default function Queue() {
       const prev = { category: t.category, categoryQboId: t.categoryQboId };
       patchRow(t.id, { category: name, categoryQboId }); // optimistic
       if (taxReadyFor(t)) {
-        invalidateTaxStage(t);
+        requestStage({ ...t, category: name, categoryQboId }, taxState(t));
         return;
       }
       txnApi
@@ -649,7 +770,8 @@ export default function Queue() {
       hasActiveMutation,
       patchRow,
       taxReadyFor,
-      invalidateTaxStage,
+      requestStage,
+      taxState,
       updateRow,
       toast,
     ],
@@ -698,169 +820,6 @@ export default function Queue() {
       }
     },
     [catAccounts, selPend, rows, categorizeTo],
-  );
-
-  const stageBodyFor = useCallback(
-    (t: TransactionDto, state: TaxRowState): StageCategorizationBody | null => {
-      const taxCalculation: TaxCalculation =
-        t.splits && t.splits.length > 0
-          ? state.taxCalculation
-          : state.taxCodeQboId === null
-            ? 'NotApplicable'
-            : state.taxCalculation === 'TaxExcluded'
-              ? 'TaxExcluded'
-              : 'TaxInclusive';
-      const sourceLines = t.splits && t.splits.length > 0
-        ? t.splits.map((split) => ({
-            amount: split.amount,
-            categoryQboId: split.categoryQboId ?? qboIdOf(split.category),
-            taxCodeQboId: split.taxCodeQboId ?? null,
-            memo: split.memo,
-            tagIds: split.tagIds,
-          }))
-        : [{
-            amount: t.sourceGrossCents === undefined ? t.amount : t.sourceGrossCents / 100,
-            categoryQboId: t.categoryQboId ?? (t.category ? qboIdOf(t.category) : null),
-            taxCodeQboId: state.taxCodeQboId,
-            memo: undefined,
-            tagIds: t.tagIds,
-          }];
-
-      const lines: StageCategorizationBody['lines'] = [];
-      for (const line of sourceLines) {
-        const grossCents = exactCents(line.amount);
-        if (grossCents === null || !line.categoryQboId) return null;
-        if (
-          taxCalculation !== 'NotApplicable' &&
-          (line.taxCodeQboId === null || !isTaxCodeUsableFor(t, line.taxCodeQboId))
-        ) return null;
-        lines.push({
-          grossCents,
-          categoryQboId: line.categoryQboId,
-          taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
-          ...(line.memo ? { memo: line.memo } : {}),
-          tagIds: [...line.tagIds],
-        });
-      }
-      return {
-        expectedRevision: t.revision,
-        taxCalculation,
-        lines,
-        tagIds: [...t.tagIds],
-      };
-    },
-    [qboIdOf, isTaxCodeUsableFor],
-  );
-
-  const stageTax = useCallback(
-    (t: TransactionDto) => {
-      if (hasActiveMutation(t)) return;
-      const current = taxState(t);
-      const body = stageBodyFor(t, current);
-      if (!body) {
-        toast('Choose a valid category and tax code for every line');
-        return;
-      }
-      const capturedVersion = taxVersionsRef.current[t.id] ?? current.version;
-      const stagingRequestId = ++stageRequestSequenceRef.current;
-      stageRequestTokensRef.current[t.id] = stagingRequestId;
-      updateTaxState(t, (state) => ({
-        ...state,
-        staging: true,
-        stagingRequestId,
-        reloadRequired: false,
-        staged: null,
-        stagedVersion: null,
-      }));
-      txnApi
-        .stageCategorization(t.id, body)
-        .then((staged) => {
-          if (!aliveRef.current) return;
-          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
-          delete stageRequestTokensRef.current[t.id];
-          const isCurrentVersion =
-            (taxVersionsRef.current[t.id] ?? 0) === capturedVersion;
-          setTaxRows((prev) => {
-            const latest = prev[t.id] ?? initialTaxState(t);
-            if (latest.stagingRequestId !== stagingRequestId) return prev;
-            if (!isCurrentVersion || latest.version !== capturedVersion) {
-              return {
-                ...prev,
-                [t.id]: {
-                  ...latest,
-                  staging: false,
-                  stagingRequestId: null,
-                  reloadRequired: false,
-                  staged: null,
-                  stagedVersion: null,
-                },
-              };
-            }
-            return {
-              ...prev,
-              [t.id]: {
-                ...latest,
-                staging: false,
-                stagingRequestId: null,
-                reloadRequired: false,
-                staged,
-                stagedVersion: capturedVersion,
-                mutation: null,
-              },
-            };
-          });
-          patchRow(t.id, {
-            revision: staged.revision,
-            ...(isCurrentVersion ? { taxCalculation: staged.taxCalculation } : {}),
-          });
-        })
-        .catch((error) => {
-          if (!aliveRef.current) return;
-          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
-          delete stageRequestTokensRef.current[t.id];
-          const staleRevision = error instanceof ApiError && error.code === 'STALE_REVISION';
-          updateTaxState(t, (state) =>
-            state.stagingRequestId === stagingRequestId
-              ? {
-                  ...state,
-                  staging: false,
-                  stagingRequestId: null,
-                  reloadRequired: staleRevision,
-                }
-              : state,
-          );
-          if (staleRevision && activeCompanyId) {
-            fetchAllTxns(activeCompanyId)
-              .then((all) => {
-                if (!aliveRef.current) return;
-                setRows(all);
-                delete taxVersionsRef.current[t.id];
-                setTaxRows((prev) => {
-                  const next = { ...prev };
-                  delete next[t.id];
-                  return next;
-                });
-                toast('The transaction changed. Loaded the latest version.');
-              })
-              .catch((reloadError) => {
-                if (!aliveRef.current) return;
-                toast(`${errText(reloadError)}. Reload the page before previewing again.`);
-              });
-            return;
-          }
-          toast(errText(error));
-        });
-    },
-    [
-      taxState,
-      hasActiveMutation,
-      stageBodyFor,
-      updateTaxState,
-      patchRow,
-      toast,
-      activeCompanyId,
-      fetchAllTxns,
-    ],
   );
 
   const recordTaxMutation = useCallback(
@@ -934,13 +893,9 @@ export default function Queue() {
   const commitTax = useCallback(
     (t: TransactionDto) => {
       const current = taxState(t);
-      if (
-        !current.staged ||
-        current.stagedVersion === null ||
-        current.stagedVersion !== current.version ||
-        current.staging
-      ) return;
-      const totals = current.staged.totals;
+      const staged = readyStageFor(t, current);
+      if (staged === null || current.mutation?.outcome === 'RETRYABLE' || current.mutation?.outcome === 'UNCHANGED') return;
+      const totals = staged.totals;
       if (!window.confirm(
         [
           'Post this categorization to QuickBooks?',
@@ -963,7 +918,7 @@ export default function Queue() {
       updateTaxState(t, (state) => ({ ...state, mutation }));
       patchRow(t.id, { status: 'POSTING', error: null });
       txnApi
-        .commitCategorization(t.id, current.staged.revision, requestId)
+        .commitCategorization(t.id, staged.revision, requestId)
         .then((result) => {
           if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
         })
@@ -972,7 +927,7 @@ export default function Queue() {
           recordTaxMutationFailure(t, error, mutation);
         });
     },
-    [taxState, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
+    [taxState, readyStageFor, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
   );
 
   const reconcileTax = useCallback(
@@ -1328,7 +1283,7 @@ export default function Queue() {
         : [...t.tagIds, tagId];
       patchRow(t.id, { tagIds: next }); // optimistic
       if (taxReadyFor(t)) {
-        invalidateTaxStage(t);
+        requestStage({ ...t, tagIds: next }, taxState(t));
         return;
       }
       txnApi
@@ -1341,7 +1296,7 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [hasActiveMutation, patchRow, taxReadyFor, invalidateTaxStage, updateRow, toast],
+    [hasActiveMutation, patchRow, taxReadyFor, requestStage, taxState, updateRow, toast],
   );
 
   const saveSplit = useCallback(
@@ -1365,10 +1320,9 @@ export default function Queue() {
       patchRow(t.id, { category: null, categoryQboId: null, splits }); // optimistic
       toast('Split saved — ready to post');
       if (taxReadyFor(t)) {
-        invalidateTaxStage(t, {
-          taxCalculation: taxCalculation ?? 'NotApplicable',
-          taxCodeQboId: null,
-        });
+        const nextState = { ...taxState(t), taxCalculation: taxCalculation ?? 'NotApplicable', taxCodeQboId: null };
+        updateTaxState(t, () => nextState);
+        requestStage({ ...t, category: null, categoryQboId: null, splits }, nextState);
         return;
       }
       txnApi
@@ -1386,7 +1340,9 @@ export default function Queue() {
       qboIdOf,
       patchRow,
       taxReadyFor,
-      invalidateTaxStage,
+      requestStage,
+      taxState,
+      updateTaxState,
       updateRow,
       toast,
     ],
@@ -1769,15 +1725,11 @@ export default function Queue() {
       return null;
     }
     const state = taxState(t);
+    const readyStage = readyStageFor(t, state);
     const direction = taxDirectionFor(t);
     const taxLabel = taxLabelFor(t);
     const isSplit = !!(t.splits && t.splits.length);
     const locked = hasActiveMutation(t);
-    const canStage =
-      stageBodyFor(t, state) !== null &&
-      !state.staging &&
-      !state.reloadRequired &&
-      !locked;
     return (
       <span className="queue-tax-controls">
         <span className={`queue-tax-line${isMobile ? ' queue-tax-line-mobile' : ''}`}>
@@ -1796,7 +1748,8 @@ export default function Queue() {
                   taxCode:
                     taxCodesFor(t).find((code) => code.qboId === taxCodeQboId)?.name ?? null,
                 });
-                invalidateTaxStage(t, {
+                const nextState: TaxRowState = {
+                  ...state,
                   taxCodeQboId,
                   taxCalculation:
                     taxCodeQboId === null
@@ -1804,59 +1757,92 @@ export default function Queue() {
                       : state.taxCalculation === 'TaxExcluded'
                         ? 'TaxExcluded'
                         : 'TaxInclusive',
-                });
+                };
+                updateTaxState(t, () => nextState);
+                requestStage({ ...t, taxCodeQboId }, nextState);
               }}
             />
           )}
           {state.taxCodeQboId !== null ||
           (isSplit && state.taxCalculation !== 'NotApplicable') ? (
             <span style={{ display: 'block' }}>
-              <label
-                htmlFor={`tax-calculation-${t.id}`}
-                style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
-              >
-                Tax calculation for {t.payee}
-              </label>
-              <select
+              <Select
                 id={`tax-calculation-${t.id}`}
-                className="select"
+                label={`Tax calculation for ${t.payee}`}
                 value={state.taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
                 disabled={locked}
-                onChange={(event) => {
-                  if (locked) return;
-                  invalidateTaxStage(t, {
-                    taxCalculation: event.target.value as TaxCalculation,
-                  });
+                options={[{ value: 'TaxInclusive', label: 'Tax inclusive' }, { value: 'TaxExcluded', label: 'Tax exclusive' }]}
+                onValueChange={(next) => {
+                  if (locked || (next !== 'TaxInclusive' && next !== 'TaxExcluded')) return;
+                  const nextState: TaxRowState = { ...state, taxCalculation: next };
+                  updateTaxState(t, () => nextState);
+                  requestStage(t, nextState);
                 }}
-                style={{ width: '100%' }}
-              >
-                <option value="TaxInclusive">Tax inclusive</option>
-                <option value="TaxExcluded">Tax exclusive</option>
-              </select>
+              />
             </span>
           ) : (
             <span style={{ fontSize: 12, color: 'var(--mut)', paddingBottom: 8 }}>
               No tax selected
             </span>
           )}
-          {state.staged && state.stagedVersion === state.version && (
+          {readyStage !== null && (
             <span className="queue-tax-totals">
-              <span>Subtotal {centsLabel(state.staged.totals.subtotalCents)}</span>
-              <span>Tax {centsLabel(state.staged.totals.taxCents)}</span>
-              <span>Total {centsLabel(state.staged.totals.totalCents)}</span>
+              <span>Subtotal {centsLabel(readyStage.totals.subtotalCents)}</span>
+              <span>Tax {centsLabel(readyStage.totals.taxCents)}</span>
+              <span>Total {centsLabel(readyStage.totals.totalCents)}</span>
             </span>
           )}
         </span>
         <span className="queue-tax-feedback">
-          <button
-            type="button"
-            className="btn-ghost"
-            disabled={!canStage}
-            onClick={() => stageTax(t)}
-            style={{ opacity: canStage ? 1 : 0.45, whiteSpace: 'nowrap' }}
-          >
-            {state.staging ? 'Calculating…' : 'Preview tax'}
-          </button>
+          {!locked && stageBodyFor(t, state) === null && (
+            <span style={{ color: 'var(--amT)' }}>
+              {t.splits?.length
+                ? 'Open Split to review its categories and tax codes before calculating tax.'
+                : 'Choose an available category and tax code before calculating tax.'}
+            </span>
+          )}
+          {(state.stage.status === 'idle' || (state.stage.status === 'conflict' && !locked)) && (
+            <button
+              type="button"
+              className="btn-ghost"
+              aria-label={`Calculate tax for ${t.payee}`}
+              disabled={locked || stageBodyFor(t, state) === null}
+              style={{ whiteSpace: 'nowrap' }}
+              onClick={(event) => {
+                event.stopPropagation();
+                const next = { ...state, stage: initialTaxState(t).stage };
+                if (state.stage.status === 'conflict') {
+                  stageCoordinatorsRef.current[t.id]?.dispose();
+                  delete stageCoordinatorsRef.current[t.id];
+                  updateTaxState(t, () => next);
+                }
+                requestStage(t, next);
+              }}
+            >
+              Calculate tax
+            </button>
+          )}
+          {state.stage.status === 'calculating' && (
+            <span style={{ color: 'var(--mut)' }}>Calculating tax…</span>
+          )}
+          {state.stage.status === 'error' && (
+            <span style={{ color: 'var(--erT)' }}>
+              {state.stage.error ?? 'Could not calculate tax.'}
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  stageCoordinatorsRef.current[t.id]?.retry();
+                }}
+              >
+                Retry calculation
+              </button>
+            </span>
+          )}
+          {state.stage.status === 'conflict' && (
+            <span style={{ color: 'var(--erT)' }}>{state.stage.error}</span>
+          )}
         </span>
       </span>
     );
@@ -1865,11 +1851,7 @@ export default function Queue() {
   const taxStatusCell = (v: RowView, mobile: boolean) => {
     const state = taxState(v.t);
     const mutation = state.mutation;
-    const validStage =
-      state.staged !== null &&
-      state.stagedVersion !== null &&
-      state.stagedVersion === state.version &&
-      !state.staging;
+    const validStage = readyStageFor(v.t, state) !== null;
     const buttonStyle: CSSProperties = {
       fontSize: 13.5,
       fontWeight: 600,
@@ -1986,7 +1968,22 @@ export default function Queue() {
       );
     }
     if (mutation?.outcome === 'RETRYABLE' || mutation?.outcome === 'UNCHANGED') {
-      return <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>;
+      return <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5 }}>
+        <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>
+        <button className="btn-ghost" onClick={(event) => {
+          event.stopPropagation();
+          if (state.stage.status === 'conflict') {
+            stageCoordinatorsRef.current[v.t.id]?.dispose();
+            delete stageCoordinatorsRef.current[v.t.id];
+            const next = { ...state, mutation: null, stage: initialTaxState(v.t).stage };
+            updateTaxState(v.t, () => next);
+            requestStage(v.t, next);
+            return;
+          }
+          if (!stageCoordinatorsRef.current[v.t.id]?.restage()) return;
+          updateTaxState(v.t, (current) => ({ ...current, mutation: null }));
+        }}>Restage categorization</button>
+      </span>;
     }
     if (v.t.status === 'PENDING') {
       return (
