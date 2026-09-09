@@ -1399,10 +1399,15 @@ describe('tax-aware manual queue', () => {
     expect(mocks.legacyPost).not.toHaveBeenCalled();
   });
 
-  it('uses categorization undo for a reloaded posted Deposit when sales readiness is unavailable', async () => {
+  it('uses categorization undo for a recently posted Deposit when sales readiness is unavailable', async () => {
     mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
     const user = userEvent.setup();
-    await renderQueue(deposit({ status: 'POSTED', postedAt: '2026-07-28T00:00:00.000Z' }));
+    // Keep the fixture inside the server's 30-day undo window regardless of
+    // when this suite runs.
+    await renderQueue(deposit({
+      status: 'POSTED',
+      postedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    }));
 
     await user.click(screen.getByRole('button', { name: /^undo$/i }));
     await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalledWith(
