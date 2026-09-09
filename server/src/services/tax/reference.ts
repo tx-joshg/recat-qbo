@@ -1,7 +1,9 @@
 import { isUsableSalesTaxCodeDto, isUsableTaxCodeDto, type TaxReadinessDto, type TaxSupportStatus } from '@recat/shared';
+import type { Prisma } from '@prisma/client';
 import type { QboClient, QboTaxCodeInfo, QboTaxProfile, QboTaxRateInfo } from '../../lib/qbo/types.js';
 import { isSupportedTaxRateValue } from '../../lib/qbo/purchaseTax.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
+import { disableRuleForSafetyInTransaction } from '../ruleSafetyTransition.js';
 import { cachedTaxCodeSupport, cachedTaxRates } from './cache.js';
 
 export const TAX_REFERENCE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -146,6 +148,53 @@ function validatedReferencedRates(codes: QboTaxCodeInfo[], rates: QboTaxRateInfo
   return referencedRates;
 }
 
+async function disableRulesWithInvalidTaxReferences(
+  tx: TaxReferenceDb,
+  companyId: string,
+  profile: QboTaxProfile,
+  codes: QboTaxCodeInfo[],
+  rates: QboTaxRateInfo[],
+): Promise<void> {
+  // Minimal unit-test adapters for this service predate rule safety. Production
+  // always supplies a Prisma transaction and therefore always enters this path.
+  if (!('rule' in tx)) return;
+  const prismaTx = tx as unknown as Prisma.TransactionClient;
+  const rules = await prismaTx.rule.findMany({
+    where: {
+      companyId,
+      canonicalVersion: { not: null },
+      enabled: true,
+      taxCalculation: { in: ['TaxInclusive', 'TaxExcluded'] },
+    },
+    select: { id: true, revision: true, direction: true, taxCodeQboId: true },
+  });
+  const ratesById = new Map(rates.map((rate) => [rate.qboId, rate]));
+  const codeById = new Map(codes.map((code) => [code.qboId, code]));
+  for (const rule of rules) {
+    const code = rule.taxCodeQboId === null ? undefined : codeById.get(rule.taxCodeQboId);
+    const direction = rule.direction === 'Deposit' ? 'sales' : rule.direction === 'Purchase' ? 'purchase' : null;
+    const support = code === undefined || direction === null
+      ? null
+      : cachedTaxCodeSupport(code, [...ratesById.values()], direction);
+    const valid = profile.usingSalesTax === true
+      && code !== undefined
+      && code.taxable === true
+      && direction !== null
+      && support?.supported === true
+      && support.combinedRate !== null
+      && support.componentCount > 0;
+    if (!valid) {
+      await disableRuleForSafetyInTransaction(prismaTx, {
+        companyId,
+        ruleId: rule.id,
+        expectedRevision: rule.revision,
+        reason: `Tax reference ${rule.taxCodeQboId ?? 'missing'} is unavailable for this rule direction.`,
+        actor: 'system:tax-reference-refresh',
+      });
+    }
+  }
+}
+
 async function replaceTaxCache(
   db: TaxReferenceDb,
   companyId: string,
@@ -212,6 +261,13 @@ async function replaceTaxCache(
       where: codeIds.length > 0 ? { companyId, qboId: { notIn: codeIds } } : { companyId },
       data: { active: false },
     });
+    await disableRulesWithInvalidTaxReferences(
+      tx,
+      companyId,
+      profile,
+      codes,
+      [...ratesById.values()],
+    );
     await tx.company.update({
       where: { id: companyId },
       data: {
@@ -347,9 +403,33 @@ export async function getTaxReadinessInTransaction(
 }
 
 async function recordRefreshFailure(db: TaxReferenceDb, companyId: string): Promise<void> {
-  await db.company.update({
-    where: { id: companyId },
-    data: { taxSupportStatus: 'needs_setup', taxSupportReason: REFRESH_FAILURE_REASON },
+  await db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, companyId);
+    if ('rule' in tx) {
+      const prismaTx = tx as unknown as Prisma.TransactionClient;
+      const taxableRules = await prismaTx.rule.findMany({
+        where: {
+          companyId,
+          canonicalVersion: { not: null },
+          enabled: true,
+          taxCalculation: { in: ['TaxInclusive', 'TaxExcluded'] },
+        },
+        select: { id: true, revision: true },
+      });
+      for (const rule of taxableRules) {
+        await disableRuleForSafetyInTransaction(prismaTx, {
+          companyId,
+          ruleId: rule.id,
+          expectedRevision: rule.revision,
+          reason: 'Tax reference refresh failed; this taxable rule requires reviewed repair.',
+          actor: 'system:tax-reference-refresh',
+        });
+      }
+    }
+    await tx.company.update({
+      where: { id: companyId },
+      data: { taxSupportStatus: 'needs_setup', taxSupportReason: REFRESH_FAILURE_REASON },
+    });
   });
 }
 

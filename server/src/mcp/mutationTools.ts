@@ -1,3 +1,4 @@
+import { commitMcpRuleChange, prepareMcpRuleChange, type CommitMcpRuleChangeInput, type PrepareMcpRuleChangeInput } from '../services/mcp/rules.js';
 import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod-v4';
@@ -65,6 +66,8 @@ const CORE_MUTATION_TOOL_NAMES = [
   'prepare_tax_refund',
   'cancel_tax_refund',
   'acknowledge_tax_refund_recorded',
+  'prepare_rule_change',
+  'commit_rule_change',
 ] as const;
 
 export const MUTATION_TOOL_NAMES = [
@@ -123,6 +126,14 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: AcknowledgeMcpTaxRefundRecordedInput,
   ): ReturnType<typeof acknowledgeMcpTaxRefundRecorded>;
+  prepareRuleChange(
+    principal: McpPrincipal,
+    input: PrepareMcpRuleChangeInput,
+  ): ReturnType<typeof prepareMcpRuleChange>;
+  commitRuleChange(
+    principal: McpPrincipal,
+    input: CommitMcpRuleChangeInput,
+  ): ReturnType<typeof commitMcpRuleChange>;
 }
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
@@ -140,6 +151,8 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   prepareTaxRefund: prepareMcpTaxRefund,
   cancelTaxRefund: cancelMcpTaxRefund,
   acknowledgeTaxRefundRecorded: acknowledgeMcpTaxRefundRecorded,
+  prepareRuleChange: prepareMcpRuleChange,
+  commitRuleChange: commitMcpRuleChange,
 });
 
 interface McpMutationToolDefinition {
@@ -337,6 +350,74 @@ const cancelTaxRefundInput = z.strictObject({
 const acknowledgeTaxRefundRecordedInput = z.strictObject({
   operationId: uuid,
   confirmQuickBooksActionPerformed: z.literal(true),
+});
+
+const ruleMutation = z.enum([
+  'create', 'update', 'review', 'enable', 'disable',
+  'activate_candidate', 'dismiss_candidate',
+]);
+
+const taxCalculation = z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']);
+
+const ruleChangeProposal = z.strictObject({
+  matchText: z.string().trim().min(1).max(200).optional(),
+  direction: z.enum(['Purchase', 'Deposit']).optional(),
+  categoryQboId: qboReference.optional(),
+  taxCalculation: taxCalculation.optional(),
+  taxCodeQboId: qboReference.nullable().optional(),
+  tagIds: uniqueTagIds.optional(),
+  autoPost: z.boolean().optional(),
+  sourceCaseId: uuid.nullable().optional(),
+  reviewReason: z.string().trim().min(1).max(500).optional(),
+});
+
+const prepareRuleChangeInput = z.strictObject({
+  companyId: uuid,
+  mutation: ruleMutation,
+  ruleId: uuid.optional(),
+  candidateId: uuid.optional(),
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey,
+  retryOfId: uuid.optional(),
+  proposal: ruleChangeProposal.optional(),
+}).superRefine((value, context) => {
+  const hasRule = value.ruleId !== undefined;
+  const hasCandidate = value.candidateId !== undefined;
+  const ruleMutationRequiresRule = ['update', 'review', 'enable', 'disable']
+    .includes(value.mutation);
+  const candidateMutation = ['activate_candidate', 'dismiss_candidate']
+    .includes(value.mutation);
+  if (hasRule !== ruleMutationRequiresRule || hasCandidate !== candidateMutation) {
+    context.addIssue({ code: 'custom', message: 'Mutation target does not match action.' });
+  }
+  if (value.mutation === 'create') {
+    const proposal = value.proposal;
+    if (
+      proposal?.matchText === undefined
+      || proposal.direction === undefined
+      || proposal.categoryQboId === undefined
+      || proposal.taxCalculation === undefined
+      || proposal.tagIds === undefined
+      || proposal.autoPost !== false
+    ) context.addIssue({ code: 'custom', path: ['proposal'], message: 'Create proposal is incomplete.' });
+  }
+  if (value.mutation === 'update' && Object.keys(value.proposal ?? {}).length === 0) {
+    context.addIssue({ code: 'custom', path: ['proposal'], message: 'Update proposal is empty.' });
+  }
+  if (
+    value.proposal?.taxCalculation === 'NotApplicable'
+    && value.proposal.taxCodeQboId != null
+  ) context.addIssue({ code: 'custom', path: ['proposal', 'taxCodeQboId'], message: 'NotApplicable cannot select tax.' });
+  if (
+    (value.proposal?.taxCalculation === 'TaxInclusive'
+      || value.proposal?.taxCalculation === 'TaxExcluded')
+    && value.proposal.taxCodeQboId == null
+  ) context.addIssue({ code: 'custom', path: ['proposal', 'taxCodeQboId'], message: 'Tax code is required.' });
+});
+
+const commitRuleChangeInput = z.strictObject({
+  operationId: uuid,
+  idempotencyKey,
 });
 
 const warnings = z.array(
@@ -611,6 +692,121 @@ const acknowledgedTaxRefundRecordedOutput = z.strictObject({
   manualRecordedAt: z.iso.datetime(),
 });
 
+const ruleActionOutput = z.strictObject({
+  categoryQboId: qboReference,
+  taxCalculation,
+  taxCodeQboId: qboReference.nullable(),
+  tagIds: uniqueTagIds,
+  memo: z.string().max(MAX_MEMO_LENGTH).nullable().optional(),
+});
+
+const ruleConditionOutput = z.strictObject({
+  matchField: z.literal('payee'),
+  matchText: z.string().min(1).max(200),
+});
+
+const ruleSampleOutput = z.strictObject({
+  transactionId: uuid,
+  payee: z.string().min(1).max(500),
+  date: z.iso.datetime(),
+  amountCents: safeInteger,
+  status: z.enum(['PENDING', 'POSTED', 'DRY_RUN']),
+});
+
+const ruleConflictOutput = z.strictObject({
+  id: z.string().min(1).max(128),
+  companyId: uuid,
+  sourceId: z.string().min(1).max(128),
+  kind: z.enum(['case', 'candidate', 'rule', 'jurisdiction', 'tax']),
+  reason: z.string().min(1).max(500),
+  action: ruleActionOutput.nullable(),
+  actionSummary: z.strictObject({
+    categoryName: z.string().min(1).max(500),
+    taxCalculation,
+    taxCodeName: z.string().min(1).max(500).nullable(),
+    tagNames: z.array(z.string().min(1).max(500)).max(MAX_TAGS),
+  }).nullable(),
+  evidenceCount: z.number().int().min(0).max(10_000),
+});
+
+const rulePreviewOutput = z.strictObject({
+  operationId: uuid,
+  companyId: uuid,
+  ruleId: uuid.nullable(),
+  candidateId: uuid.nullable(),
+  mutation: ruleMutation,
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  currentRevision: revision,
+  proposedRevision: z.number().int().min(1).max(MAX_REVISION),
+  condition: ruleConditionOutput,
+  direction: z.enum(['Purchase', 'Deposit']).nullable(),
+  action: ruleActionOutput.nullable(),
+  categoryName: z.string().min(1).max(500),
+  taxCodeName: z.string().min(1).max(500).nullable(),
+  autoPost: z.boolean(),
+  affectedPendingCount: z.number().int().min(0).max(MAX_REVISION),
+  affectedProcessedCount: z.number().int().min(0).max(MAX_REVISION),
+  sampleTransactions: z.array(ruleSampleOutput).max(20),
+  conflicts: z.array(ruleConflictOutput).max(20),
+  warnings,
+  expiresAt: z.iso.datetime(),
+  preparationDigest: z.string().regex(SHA256),
+});
+
+const canonicalRuleRevisionOutput = z.strictObject({
+  id: z.string().min(1).max(128),
+  ruleId: uuid,
+  companyId: uuid,
+  revision,
+  state: z.enum(['enabled', 'disabled']),
+  condition: ruleConditionOutput,
+  direction: z.enum(['Purchase', 'Deposit']).nullable(),
+  action: z.strictObject({
+    version: z.literal(2),
+    direction: z.enum(['Purchase', 'Deposit']),
+    category: z.string().min(1).max(500),
+    categoryQboId: qboReference,
+    taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+    taxCodeQboId: qboReference.nullable(),
+    tagIds: z.array(uuid).max(50),
+  }).nullable(),
+  taxCodeName: z.string().min(1).max(500).nullable(),
+  autoPost: z.boolean(),
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  sourceCaseId: uuid.nullable(),
+  sourceCandidateId: uuid.nullable(),
+  changedBy: z.string().min(1).max(128).nullable(),
+  createdAt: z.iso.datetime(),
+  repairReason: z.string().min(1).max(500).nullable(),
+  affectedJournalEntryCount: z.number().int().nonnegative().nullable(),
+});
+
+const ruleMutationOutput = z.strictObject({
+  ok: z.boolean(),
+  operationId: uuid,
+  companyId: uuid,
+  mutation: ruleMutation,
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  status: z.enum(['PREPARED', 'COMMITTED', 'REPLAYED', 'REJECTED']),
+  ruleId: uuid.nullable(),
+  revision: revision.nullable(),
+  rule: canonicalRuleRevisionOutput.nullable(),
+  candidate: z.strictObject({
+    candidateId: uuid,
+    state: z.enum(['dismissed', 'activated']),
+    ruleId: uuid.nullable(),
+  }).nullable(),
+  preview: rulePreviewOutput.nullable(),
+  error: z.strictObject({
+    code: z.enum([
+      'INVALID_INPUT', 'FORBIDDEN', 'NOT_FOUND', 'COMPANY_UNAVAILABLE',
+      'UNKNOWN_JURISDICTION', 'SEMANTIC_UNAVAILABLE', 'CONFLICT',
+      'STALE_REVISION', 'INTERNAL',
+    ]),
+    message: z.string().min(1).max(500),
+  }).nullable(),
+});
+
 const prepareCategorizationAnnotations: ToolAnnotations = Object.freeze({
   readOnlyHint: false,
   destructiveHint: true,
@@ -784,6 +980,29 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
         principal,
         input as AcknowledgeMcpTaxRefundRecordedInput,
       ),
+  },
+  {
+    name: 'prepare_rule_change',
+    description: 'Validate and prepare a company-scoped rule lifecycle change.',
+    inputSchema: prepareRuleChangeInput,
+    outputSchema: ruleMutationOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareRuleChange(principal, input as PrepareMcpRuleChangeInput),
+  },
+  {
+    name: 'commit_rule_change',
+    description: 'Commit an owned prepared rule lifecycle change.',
+    inputSchema: commitRuleChangeInput,
+    outputSchema: ruleMutationOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.commitRuleChange(principal, input as CommitMcpRuleChangeInput),
   },
   ...attachmentToolDefinitions.map((definition) => ({
     ...definition,

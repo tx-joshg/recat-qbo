@@ -3,7 +3,7 @@
 // Per run: refresh the chart of accounts, pull holding-account transactions
 // (full list for manual/initial/nightly, Change Data Capture deltas for
 // poll/webhook), upsert on (companyId, qboType, qboId), mark txns that were
-// fixed inside QuickBooks as SUPERSEDED, recompute suggestion snapshots, apply
+// fixed inside QuickBooks as SUPERSEDED, recompute suggestion snapshots, gate
 // auto-post rules, and record a SyncLog row. QBO is always the source of truth.
 
 import { randomUUID } from 'node:crypto';
@@ -18,14 +18,21 @@ import {
   type EntityLeaseFenceDb,
   type EntityLeaseKey,
 } from './entityLease.js';
-import { postTransaction } from './writeback.js';
-import type { SuggestionDto } from '@recat/shared';
 import { refreshSuggestions } from './suggestions.js';
 import {
   ensureUnknownProviderActionability,
   type ProviderActionabilityDb,
 } from './providerActionability.js';
 import { runCompanyMutationTransaction } from './companyMutationScope.js';
+import { disableRuleForSafetyInTransaction } from './ruleSafetyTransition.js';
+import { validateExistingRuleAction } from './rules.js';
+import { compareRuleWinner, ruleMatches } from './ruleMatching.js';
+import {
+  prepareRuleAutoPost,
+  recoverRuleAutoPosts,
+  resumeRuleAutoPost,
+  type RecoveryReport,
+} from './ruleAutoPost.js';
 
 export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
 
@@ -305,8 +312,10 @@ const CDC_MAX_AGE_MS = 25 * 24 * 60 * 60 * 1000;
 const inFlightSyncs = new Map<string, Promise<unknown>>();
 
 /**
- * Replaces the company account cache as one authoritative snapshot inside
- * the company mutation fence, including accounts absent from the response.
+ * Replaces the company account cache as one authoritative snapshot. Any
+ * enabled canonical rule whose category disappeared, became inactive, or no
+ * longer belongs to its declared direction is disabled inside the same
+ * company mutation fence before sync can emit rule-backed work.
  */
 export async function replaceAccountReferenceCache(
   companyId: string,
@@ -343,7 +352,189 @@ export async function replaceAccountReferenceCache(
         : { companyId },
       data: { active: false },
     });
+
+    const currentAccounts = new Map(accounts.map((account) => [account.qboId, account]));
+    const rules = await tx.rule.findMany({
+      where: { companyId, canonicalVersion: { not: null }, enabled: true },
+      select: { id: true, revision: true, direction: true, categoryQboId: true },
+    });
+    for (const rule of rules) {
+      const account = rule.categoryQboId === null
+        ? undefined
+        : currentAccounts.get(rule.categoryQboId);
+      const valid = account?.active === true && (
+        (rule.direction === 'Purchase'
+          && (account.classification === 'Expenses' || account.classification === 'COGS'))
+        || (rule.direction === 'Deposit' && account.classification === 'Income')
+      );
+      if (!valid) {
+        await disableRuleForSafetyInTransaction(tx, {
+          companyId,
+          ruleId: rule.id,
+          expectedRevision: rule.revision,
+          reason: `Category reference ${rule.categoryQboId ?? 'missing'} is unavailable for this rule direction.`,
+          actor: 'system:account-reference-refresh',
+        });
+      }
+    }
   });
+}
+
+async function suppressLegacyRuleRuntime(
+  companyId: string,
+  validateCanonicalRules: boolean,
+): Promise<void> {
+  await runCompanyMutationTransaction(prisma, companyId, async (tx) => {
+    if (validateCanonicalRules) {
+      const rules = await tx.rule.findMany({
+        where: { companyId, canonicalVersion: { not: null }, enabled: true },
+        include: { ruleTags: true, candidateOrigin: true },
+      });
+      for (const rule of rules) {
+        let failure: string | null = null;
+        if (rule.direction === null) {
+          failure = 'Rule direction is missing.';
+        } else if (rule.reviewRequiredAt !== null || rule.repairReason !== null) {
+          failure = rule.repairReason ?? rule.reviewReason ?? 'Rule requires reviewed repair.';
+        } else {
+          try {
+            await validateExistingRuleAction(tx, companyId, rule);
+          } catch (error) {
+            failure = error instanceof Error ? error.message : 'Rule action validation failed.';
+          }
+        }
+        if (failure !== null) {
+          await disableRuleForSafetyInTransaction(tx, {
+            companyId,
+            ruleId: rule.id,
+            expectedRevision: rule.revision,
+            reason: `Canonical runtime validation failed: ${failure}`.slice(0, 500),
+            actor: 'system:canonical-runtime-validation',
+          });
+        }
+      }
+    }
+    await tx.transaction.updateMany({
+      where: {
+        companyId,
+        status: 'PENDING',
+        suggestion: { path: ['source'], equals: 'rule' },
+      },
+      data: { suggestion: Prisma.DbNull },
+    });
+  });
+}
+
+async function currentRuleRuntimeMode(companyId: string): Promise<string> {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    select: { ruleRuntimeMode: true },
+  });
+  if (company === null) throw new Error(`Company ${companyId} not found`);
+  return company.ruleRuntimeMode;
+}
+
+function permitsLegacySuggestions(mode: string): boolean {
+  return mode === 'legacy' || mode === 'bridge';
+}
+
+interface CanonicalRuleAutoPostCandidate {
+  transactionId: string;
+  ruleId: string;
+  ruleRevision: number;
+}
+
+interface CanonicalRuleAutoPostDeps {
+  recover(companyId: string): Promise<RecoveryReport>;
+  prepare(input: {
+    companyId: string;
+    transactionId: string;
+    ruleId: string;
+    ruleRevision: number;
+  }): Promise<{ preparationId: string }>;
+  resume(preparationId: string): Promise<void>;
+  loadState(preparationId: string): Promise<string | null>;
+  listCandidates(companyId: string): Promise<CanonicalRuleAutoPostCandidate[]>;
+}
+
+async function listCanonicalRuleAutoPostCandidates(
+  companyId: string,
+): Promise<CanonicalRuleAutoPostCandidate[]> {
+  const [transactions, rules] = await Promise.all([
+    prisma.transaction.findMany({
+      where: { companyId, status: 'PENDING' },
+      select: { id: true, qboType: true, payee: true },
+    }),
+    prisma.rule.findMany({
+      where: {
+        companyId,
+        enabled: true,
+        retiredAt: null,
+        reviewRequiredAt: null,
+        reviewReason: null,
+        repairReason: null,
+        canonicalVersion: 2,
+      },
+      select: {
+        id: true,
+        revision: true,
+        matchText: true,
+        direction: true,
+        priority: true,
+        createdAt: true,
+        autoPost: true,
+      },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+    }),
+  ]);
+  return transactions.flatMap((transaction) => {
+    const winner = rules
+      .filter((rule) => ruleMatches(
+        { matchText: rule.matchText, direction: rule.direction },
+        { description: transaction.payee, type: transaction.qboType },
+      ))
+      .sort(compareRuleWinner)[0];
+    return winner === undefined || !winner.autoPost ? [] : [{
+      transactionId: transaction.id,
+      ruleId: winner.id,
+      ruleRevision: winner.revision,
+    }];
+  });
+}
+
+const defaultCanonicalRuleAutoPostDeps: CanonicalRuleAutoPostDeps = {
+  recover: recoverRuleAutoPosts,
+  prepare: prepareRuleAutoPost,
+  resume: resumeRuleAutoPost,
+  loadState: async (preparationId) => (
+    await prisma.ruleAutoPostPreparation.findUnique({
+      where: { id: preparationId },
+      select: { state: true },
+    })
+  )?.state ?? null,
+  listCandidates: listCanonicalRuleAutoPostCandidates,
+};
+
+export async function runCanonicalRuleAutoPosts(
+  companyId: string,
+  dependencies: Partial<CanonicalRuleAutoPostDeps> = defaultCanonicalRuleAutoPostDeps,
+): Promise<{ recovered: number; autoPosted: number; failed: number }> {
+  const deps = { ...defaultCanonicalRuleAutoPostDeps, ...dependencies };
+  const recovery = await deps.recover(companyId);
+  let autoPosted = 0;
+  let failed = recovery.failed;
+  for (const candidate of await deps.listCandidates(companyId)) {
+    try {
+      const prepared = await deps.prepare({ companyId, ...candidate });
+      await deps.resume(prepared.preparationId);
+      const state = await deps.loadState(prepared.preparationId);
+      if (state === 'VERIFIED' || state === 'DRY_RUN') autoPosted += 1;
+      else if (state === 'REJECTED' || state === 'CANCELLED') failed += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { recovered: recovery.completed, autoPosted, failed };
 }
 
 export function syncCompany(
@@ -583,93 +774,43 @@ async function runSyncCompany(
     }
 
     // ---- 5. suggestion snapshots for the queue ----
-    await refreshSuggestions(companyId);
-
-    // ---- 6. auto-post rules (respects dry-run via the write-back service) ----
-    let autoPosted = 0;
-    const autoPostFailures: string[] = [];
-    const pending = await prisma.transaction.findMany({
-      where: { companyId, status: 'PENDING' },
-      include: { txnTags: true, _count: { select: { splitLines: true } } },
-    });
-    const rules = await prisma.rule.findMany({ where: { companyId }, include: { ruleTags: true } });
-    for (const txn of pending) {
-      const suggestion = txn.suggestion as unknown as SuggestionDto | null;
-      if (!suggestion || suggestion.source !== 'rule' || !suggestion.ruleId) continue;
-      const rule = rules.find((r) => r.id === suggestion.ruleId);
-      if (!rule?.autoPost) continue;
-      // A human is mid-flight on this txn (staged category/splits/tags) —
-      // never auto-post over their work.
-      if (txn.category !== null || txn._count.splitLines > 0 || txn.txnTags.length > 0) continue;
-      // One bad rule/txn must never kill the sync: post each in its own
-      // try/catch, log, note it in the SyncLog, and continue.
-      try {
-        const key = entityKey(companyId, txn);
-        const result = await withSyncEntityLease(
-          key,
-          mutationDependencies,
-          async (owner) => {
-            const staged = await prisma.$transaction(async (tx) => {
-              await mutationDependencies.fence(key, owner, tx);
-              const updated = await tx.transaction.updateMany({
-                where: {
-                  id: txn.id,
-                  status: 'PENDING',
-                  revision: txn.revision,
-                  qboSyncToken: txn.qboSyncToken,
-                  category: null,
-                  splitLines: { none: {} },
-                  txnTags: { none: {} },
-                  qboMutationAttempts: {
-                    none: {
-                      status: { in: [...ACTIVE_MUTATION_STATUSES] },
-                    },
-                  },
-                },
-                data: {
-                  category: rule.category,
-                  categoryQboId: rule.categoryQboId,
-                },
-              });
-              if (updated.count !== 1) return false;
-              for (const rt of rule.ruleTags) {
-                await tx.txnTag.upsert({
-                  where: {
-                    txnId_tagId: {
-                      txnId: txn.id,
-                      tagId: rt.tagId,
-                    },
-                  },
-                  create: { txnId: txn.id, tagId: rt.tagId },
-                  update: {},
-                });
-              }
-              return true;
-            });
-            if (!staged) return null;
-            return postTransaction(
-              txn.id,
-              { id: null, label: 'system' },
-              { auto: true },
-            );
-          },
-        );
-        if (result === null) continue;
-        if (result.ok) autoPosted += 1;
-        else autoPostFailures.push(`${txn.payee}: ${result.error?.message ?? 'unknown error'}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[sync] auto-post failed for txn ${txn.id} (${txn.payee}):`, err);
-        autoPostFailures.push(`${txn.payee}: ${msg}`);
+    // Keep legacy suggestion snapshots out of the canonical runtime. Its reads
+    // derive complete actions from the current immutable rule revisions.
+    let ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
+    if (permitsLegacySuggestions(ruleRuntimeMode)) {
+      await refreshSuggestions(companyId);
+      // A sync may span the operator's pause/backfill boundary. Re-read after
+      // the legacy writer completes and erase anything it created if the mode
+      // changed while the run was in flight.
+      ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
+      if (!permitsLegacySuggestions(ruleRuntimeMode)) {
+        await suppressLegacyRuleRuntime(companyId, ruleRuntimeMode === 'canonical');
+      }
+    } else {
+      await suppressLegacyRuleRuntime(companyId, ruleRuntimeMode === 'canonical');
+      if (ruleRuntimeMode === 'canonical') {
+        // AI/history remain non-authoritative hints. Complete rule proofs are
+        // derived from current revisions on reads, never stored by this path.
+        await refreshSuggestions(companyId, { includeRuleSuggestions: false });
+        ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
       }
     }
+
+    // ---- 6. auto-post rules ----
+    // The bridge auto-post path snapshots mutable, category-only rule data and
+    // cannot hold the company safety fence through the QuickBooks write. Keep
+    // it fail-closed outside the durable, revision-bound canonical path.
+    const autoPostReport = ruleRuntimeMode === 'canonical'
+      ? await runCanonicalRuleAutoPosts(companyId)
+      : { autoPosted: 0, failed: 0 };
+    const { autoPosted } = autoPostReport;
 
     // ---- 7. bookkeeping ----
     await prisma.company.update({ where: { id: companyId }, data: { lastSyncedAt: startedAt } });
     let message = buildMessage(created, dropped, autoPosted, accounts.length);
     if (taxDiagnostic) message += ` — ${taxDiagnostic}`;
-    if (autoPostFailures.length > 0) {
-      message += ` — ${plural(autoPostFailures.length, 'auto-post failure')} (${autoPostFailures[0]})`;
+    if (autoPostReport.failed > 0) {
+      message += ` — ${plural(autoPostReport.failed, 'auto-post failure')}`;
     }
     await prisma.syncLog.create({ data: { companyId, kind, ok: true, message } });
     return { ok: true, message, mirror: mirrorStats };

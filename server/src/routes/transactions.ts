@@ -15,6 +15,7 @@ import {
   type ProviderActionabilityDisposition,
   type CategorizationMutationResult,
   type CommitCategorizationBody,
+  type ManualStageCategorizationBody,
   type ReconcileCategorizationBody,
   type StageCategorizationBody,
   type TransactionDto,
@@ -26,7 +27,7 @@ import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { getTaxReadiness } from '../services/tax/reference.js';
-import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
+import { suggestForMany } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import {
   filterTransactionDtos,
@@ -48,6 +49,7 @@ import {
 
 export { transactionDtos } from '../services/companyReads.js';
 import { stageCategorization } from '../services/categorization.js';
+import { stageRuleSuggestion } from '../services/ruleSuggestionApplication.js';
 import {
   isLiveReconciliationOwnedRequest,
   loadLiveReconciliationRequest,
@@ -396,7 +398,7 @@ const requestIdSchema = z.string().uuid();
 const uniqueTagIdsSchema = z.array(z.string().uuid()).max(50)
   .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.');
 
-const stageCategorizationLineSchema: z.ZodType<StageCategorizationBody['lines'][number]> = z.object({
+const stageCategorizationLineSchema: z.ZodType<ManualStageCategorizationBody['lines'][number]> = z.object({
   grossCents: z.number().refine(Number.isSafeInteger, 'Line cents must be a safe integer.'),
   categoryQboId: qboReferenceSchema,
   taxCodeQboId: qboReferenceSchema.nullable(),
@@ -404,7 +406,7 @@ const stageCategorizationLineSchema: z.ZodType<StageCategorizationBody['lines'][
   tagIds: uniqueTagIdsSchema,
 }).strict();
 
-const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.object({
+const manualStageCategorizationBodySchema = z.object({
   expectedRevision: expectedRevisionSchema,
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(stageCategorizationLineSchema).min(1).max(20),
@@ -427,6 +429,48 @@ const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.obje
     }
   }
 });
+
+const ruleActionV2Schema = z.object({
+  version: z.literal(2),
+  direction: z.enum(['Purchase', 'Deposit']),
+  category: z.string().trim().min(1).max(500),
+  categoryQboId: qboReferenceSchema,
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+  taxCodeQboId: qboReferenceSchema.nullable(),
+  tagIds: uniqueTagIdsSchema,
+}).strict().superRefine((action, context) => {
+  if (action.taxCalculation === 'NotApplicable' && action.taxCodeQboId !== null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'NotApplicable rules cannot use a tax code.',
+      path: ['taxCodeQboId'],
+    });
+  }
+  if (action.taxCalculation !== 'NotApplicable' && action.taxCodeQboId === null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Taxed rules require a tax code.',
+      path: ['taxCodeQboId'],
+    });
+  }
+});
+
+const ruleSuggestionStageBodySchema = z.object({
+  expectedRevision: expectedRevisionSchema,
+  ruleSuggestion: z.object({
+    source: z.literal('rule'),
+    version: z.literal(2),
+    ruleId: z.string().trim().min(1).max(128),
+    ruleRevision: z.number().int().min(1).max(MAX_EXPECTED_TRANSACTION_REVISION),
+    action: ruleActionV2Schema,
+    autoPost: z.boolean(),
+  }).strict(),
+}).strict();
+
+const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.union([
+  ruleSuggestionStageBodySchema,
+  manualStageCategorizationBodySchema,
+]);
 
 const commitCategorizationBodySchema: z.ZodType<CommitCategorizationBody> = z.object({
   expectedRevision: expectedRevisionSchema,
@@ -615,7 +659,12 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
     message: 'This live mutation is no longer bound to the current transaction state.',
   },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
+  RULE_SUGGESTION_BUSY: { status: 409, message: 'Rule state is changing. Retry this suggestion.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
+  STALE_RULE_SUGGESTION: {
+    status: 409,
+    message: 'This rule suggestion changed. Reload before continuing.',
+  },
   SUPERSEDED: { status: 409, message: 'This transaction was already categorized in QuickBooks.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
   TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
@@ -759,13 +808,6 @@ async function resolveCategoryQboId(
   return acct?.qboId ?? null;
 }
 
-async function loadRuleLikes(companyId: string): Promise<RuleLike[]> {
-  return prisma.rule.findMany({
-    where: { companyId },
-    select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
-  });
-}
-
 export const transactionActionsRouter = Router();
 transactionActionsRouter.use(requireUser);
 
@@ -777,16 +819,25 @@ transactionActionsRouter.post(
     await assertCategorizationRouteAccess(requestUser(req), scope.companyId);
     await assertCompanyConnected(scope.companyId);
     try {
-      const staged = await stageCategorization({
-        transactionId: scope.transactionId,
-        companyId: scope.companyId,
-        expectedRevision: body.expectedRevision,
-        proposal: {
-          taxCalculation: body.taxCalculation,
-          lines: body.lines,
-          tagIds: body.tagIds,
-        },
-      });
+      // Staging is Recat-local. The commit path performs a fresh QBO safety
+      // check immediately before any provider write.
+      const staged = 'ruleSuggestion' in body
+        ? await stageRuleSuggestion({
+            transactionId: scope.transactionId,
+            companyId: scope.companyId,
+            expectedRevision: body.expectedRevision,
+            suggestion: body.ruleSuggestion,
+          })
+        : await stageCategorization({
+            transactionId: scope.transactionId,
+            companyId: scope.companyId,
+            expectedRevision: body.expectedRevision,
+            proposal: {
+              taxCalculation: body.taxCalculation,
+              lines: body.lines,
+              tagIds: body.tagIds,
+            },
+          });
       res.json(boundedStageCategorizationResponse(staged, scope.transactionId));
     } catch (error) {
       throwMappedServiceError(error);
@@ -808,6 +859,7 @@ transactionActionsRouter.post(
         expectedRevision: body.expectedRevision,
         requestId: body.requestId,
         actor: actorFor(user),
+        captureManualApproval: true,
       });
       sendMutationResult(res, result, {
         transactionId: scope.transactionId,
@@ -915,9 +967,10 @@ transactionActionsRouter.post(
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
     const companyId = txn.companyId;
+    // Draft categorization is Recat-local and remains available while a
+    // cached provider observation is missing or stale.
     const amount = Number(txn.amount);
     const data: Prisma.TransactionUpdateInput = {};
-    let stagedCategory: string | null = null;
 
     if (body.splits && body.splits.length > 0) {
       const splitCheck = validateSplits(amount, body.splits);
@@ -956,7 +1009,6 @@ transactionActionsRouter.post(
           data.category = null;
           data.categoryQboId = null;
         } else {
-          stagedCategory = body.category;
           data.category = body.category;
           data.categoryQboId = await resolveCategoryQboId(companyId, body.category, body.categoryQboId);
           data.splitLines = { deleteMany: {} }; // single category replaces any staged splits
@@ -977,22 +1029,8 @@ transactionActionsRouter.post(
       }
     }
 
-    // Prototype behavior: accepting a rule's suggested category also applies
-    // the rule's tags (merged into whatever is already staged).
-    if (stagedCategory !== null) {
-      const rules = await loadRuleLikes(companyId);
-      const match = ruleSuggestion(txn.payee, rules);
-      if (match?.ruleId !== undefined && match.category === stagedCategory) {
-        const ruleTags = await prisma.ruleTag.findMany({ where: { ruleId: match.ruleId } });
-        for (const rt of ruleTags) {
-          await prisma.txnTag.upsert({
-            where: { txnId_tagId: { txnId: id, tagId: rt.tagId } },
-            create: { txnId: id, tagId: rt.tagId },
-            update: {},
-          });
-        }
-      }
-    }
+    // Manual edits apply only explicit user choices. Complete rule actions
+    // (including tags and tax) require revision-verified rule suggestion staging.
 
     res.json(await dtoById(id));
   }),
@@ -1036,8 +1074,13 @@ transactionActionsRouter.post(
       dto.category !== null &&
       (dto.splits === null || dto.splits.length === 0)
     ) {
-      const rules = await loadRuleLikes(dto.companyId);
-      rulePromptEligible = ruleSuggestion(dto.payee, rules) === null;
+      const [suggestion] = await suggestForMany(dto.companyId, [{
+        payee: dto.payee,
+        memo: dto.memo,
+        amount: dto.amount,
+        qboType: dto.qboType,
+      }]);
+      rulePromptEligible = suggestion?.source !== 'rule';
     }
 
     res.status(202).json({ ...dto, rulePromptEligible });

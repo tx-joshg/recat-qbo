@@ -18,7 +18,9 @@ import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 import { resolvePublicUrl } from '../services/publicUrl.js';
+import { runClassificationOutcomeRecoveryTick } from '../services/classification/recovery.js';
 import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
+import { recoverRuleAutoPosts } from '../services/ruleAutoPost.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -29,6 +31,7 @@ const inFlight = new Set<string>();
 let lastNightlyDate = '';
 let lastDigestDate = '';
 let receiptTickInFlight = false;
+let ruleAutoPostRecoveryInFlight = false;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
@@ -168,12 +171,36 @@ export async function runReceiptTick(): Promise<void> {
   }
 }
 
+export async function runRuleAutoPostRecoveryTick(): Promise<void> {
+  if (ruleAutoPostRecoveryInFlight) return;
+  ruleAutoPostRecoveryInFlight = true;
+  try {
+    await recoverRuleAutoPosts();
+  } finally {
+    ruleAutoPostRecoveryInFlight = false;
+  }
+}
+
 async function tick(): Promise<void> {
   const now = new Date();
   try {
     await sweepQboTokenRevocations();
   } catch {
     console.error('[jobs] disconnect revocation recovery failed');
+  }
+  try {
+    // Drain or classify durable preparations before any sync can discover new
+    // canonical auto-post work. Paused runtime prevents fresh sends while the
+    // recovery service still permits reconciliation-only readback.
+    await runRuleAutoPostRecoveryTick();
+  } catch {
+    console.error('[jobs] rule auto-post recovery failed');
+  }
+  try {
+    const report = await runClassificationOutcomeRecoveryTick();
+    if (report.failed > 0) console.error('[jobs] classification outcome recovery incomplete');
+  } catch {
+    console.error('[jobs] classification outcome recovery failed');
   }
   try {
     await recoverStuckAttachmentOperations({ now });
@@ -216,6 +243,10 @@ export function startJobs(): void {
   runAttachmentCleanup().catch(() => console.error('[jobs] attachment cleanup failed'));
   runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
   runReceiptTick().catch(() => console.error('[jobs] boot receipt scheduler tick failed'));
+  runRuleAutoPostRecoveryTick()
+    .catch(() => console.error('[jobs] boot rule auto-post recovery failed'));
+  runClassificationOutcomeRecoveryTick()
+    .catch(() => console.error('[jobs] boot classification outcome recovery failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();

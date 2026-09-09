@@ -155,6 +155,78 @@ const acknowledgedTaxRefund = {
   manualRecordedAt: '2026-09-04T22:06:00.000Z',
 };
 
+const ruleOperationId = '11111111-1111-4111-8111-111111111111';
+const ruleId = '22222222-2222-4222-8222-222222222222';
+
+
+const rulePreview = {
+  operationId: ruleOperationId,
+  companyId,
+  ruleId,
+  candidateId: null,
+  mutation: 'create' as const,
+  originIntent: 'make_recurring' as const,
+  currentRevision: 0,
+  proposedRevision: 1,
+  condition: { matchField: 'payee' as const, matchText: 'Harbour Supply' },
+  direction: 'Purchase' as const,
+  action: {
+    categoryQboId: 'expense-account',
+    taxCalculation: 'NotApplicable' as const,
+    taxCodeQboId: null,
+    tagIds: [],
+  },
+  categoryName: 'Operating expense',
+  taxCodeName: null,
+  autoPost: false,
+  affectedPendingCount: 1,
+  affectedProcessedCount: 0,
+  sampleTransactions: [],
+  conflicts: [],
+  warnings: [],
+  expiresAt: '2026-08-31T20:15:00.000Z',
+  preparationDigest: 'c'.repeat(64),
+};
+
+const preparedRuleChange = {
+  ok: true,
+  operationId: ruleOperationId,
+  companyId,
+  mutation: 'create' as const,
+  originIntent: 'make_recurring' as const,
+  status: 'PREPARED' as const,
+  ruleId,
+  revision: 1,
+  rule: null,
+  candidate: null,
+  preview: rulePreview,
+  error: null,
+};
+
+const committedRuleChange = {
+  ...preparedRuleChange,
+  status: 'COMMITTED' as const,
+  rule: {
+    id: '33333333-3333-4333-8333-333333333333',
+    ruleId,
+    companyId,
+    revision: 1,
+    state: 'enabled' as const,
+    condition: rulePreview.condition,
+    direction: rulePreview.direction,
+    action: { ...rulePreview.action, version: 2 as const, direction: rulePreview.direction, category: rulePreview.categoryName },
+    taxCodeName: null,
+    autoPost: false,
+    originIntent: 'make_recurring' as const,
+    sourceCaseId: null,
+    sourceCandidateId: null,
+    changedBy: principal.userId,
+    createdAt: '2026-08-31T20:01:00.000Z',
+    repairReason: null,
+    affectedJournalEntryCount: 0,
+  },
+};
+
 function mutations(
   overrides: Partial<McpMutationOperations> = {},
 ): McpMutationOperations {
@@ -175,6 +247,8 @@ function mutations(
     prepareTaxRefund: vi.fn().mockResolvedValue(preparedTaxRefund),
     cancelTaxRefund: vi.fn().mockResolvedValue(cancelledTaxRefund),
     acknowledgeTaxRefundRecorded: vi.fn().mockResolvedValue(acknowledgedTaxRefund),
+    prepareRuleChange: vi.fn().mockResolvedValue(preparedRuleChange),
+    commitRuleChange: vi.fn().mockResolvedValue(committedRuleChange),
     ...overrides,
   };
 }
@@ -839,4 +913,34 @@ describe('Recat MCP mutation tools', () => {
       tool: 'get_operation',
     });
   });
+  it('prepares and commits a complete owned rule change through strict MCP schemas', async () => {
+    const operations = mutations();
+    const server = handler(operations);
+    const input = {
+      companyId, mutation: 'create', expectedRevision: 0, idempotencyKey: 'rule-create',
+      proposal: { matchText: 'Synthetic merchant', direction: 'Purchase',
+        categoryQboId: 'expense-account', taxCalculation: 'NotApplicable',
+        taxCodeQboId: null, tagIds: [], autoPost: false },
+    };
+    const prepared = await legacy(server, 'tools/call', { name: 'prepare_rule_change', arguments: input });
+    expect(prepared.result.isError).not.toBe(true);
+    expect(prepared.result.structuredContent).toMatchObject(preparedRuleChange);
+    expect(operations.prepareRuleChange).toHaveBeenCalledWith(principal, input);
+    const commit = { operationId: ruleOperationId, idempotencyKey: 'rule-commit' };
+    const result = await legacy(server, 'tools/call', { name: 'commit_rule_change', arguments: commit });
+    expect(result.result.isError).not.toBe(true);
+    expect(result.result.structuredContent).toMatchObject(committedRuleChange);
+    expect(operations.commitRuleChange).toHaveBeenCalledWith(principal, commit);
+
+    for (const invalid of [
+      { ...input, ruleId },
+      { ...input, proposal: { ...input.proposal, autoPost: true } },
+      { ...input, proposal: { ...input.proposal, taxCodeQboId: 'unexpected-tax' } },
+    ]) {
+      const rejected = await legacy(server, 'tools/call', { name: 'prepare_rule_change', arguments: invalid });
+      expect(rejected.result.isError).toBe(true);
+    }
+    expect(operations.prepareRuleChange).toHaveBeenCalledTimes(1);
+  });
+
 });

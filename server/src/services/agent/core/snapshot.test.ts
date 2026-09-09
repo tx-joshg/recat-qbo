@@ -40,13 +40,20 @@ function validSource(overrides: Partial<AgentSnapshotSource> = {}): AgentSnapsho
     rules: [
       {
         id: IDS.rule,
+        ruleRevision: 3,
         priority: 10,
         matchField: 'payee',
         matchText: '  Cafe ',
-        categoryQboId: '100',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: '200',
-        tagIds: [IDS.tag],
+        action: {
+          version: 2,
+          direction: 'Purchase',
+          category: 'Alpha expense',
+          categoryQboId: '100',
+          taxCalculation: 'TaxExcluded',
+          taxCodeQboId: '200',
+          tagIds: [IDS.tag],
+        },
+        autoPost: false,
       },
     ],
     similarVerifiedTransactions: [
@@ -92,7 +99,7 @@ describe('buildAgentSnapshot', () => {
     const snapshot = buildAgentSnapshot(validSource());
 
     expect(snapshot).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       transaction: { id: IDS.transaction, revision: 7 },
       date: '2026-07-09',
       signedAmountCents: -12345,
@@ -113,13 +120,20 @@ describe('buildAgentSnapshot', () => {
       rules: [
         {
           id: IDS.rule,
+          ruleRevision: 3,
           priority: 10,
           matchField: 'payee',
           matchText: 'Cafe',
-          categoryQboId: '100',
-          taxCalculation: 'TaxExcluded',
-          taxCodeQboId: '200',
-          tagIds: [IDS.tag],
+          action: {
+            version: 2,
+            direction: 'Purchase',
+            category: 'Alpha expense',
+            categoryQboId: '100',
+            taxCalculation: 'TaxExcluded',
+            taxCodeQboId: '200',
+            tagIds: [IDS.tag],
+          },
+          autoPost: false,
         },
       ],
       similarVerifiedTransactions: [
@@ -153,7 +167,7 @@ describe('buildAgentSnapshot', () => {
     expect(serialized).not.toMatch(/accountNumber|accessToken|apiKey|rawQbo|unrelated/i);
   });
 
-  it('sorts every bounded collection deterministically and caps it at twenty entries', () => {
+  it('sorts unordered bounded collections, preserves canonical rule order, and caps each at twenty entries', () => {
     const candidates = Array.from({ length: 21 }, (_, index) => ({
       qboId: String(index + 1),
       name: `Category ${String(21 - index).padStart(2, '0')}`,
@@ -167,15 +181,22 @@ describe('buildAgentSnapshot', () => {
           eligibleReferences: candidates.map(({ qboId, name }) => ({ qboId, label: name })),
         },
         tags: candidates.map(({ name }, index) => ({ id: itemUuid(index + 1), name })),
-        rules: candidates.map(({ qboId, name }, index) => ({
+        rules: [...candidates].reverse().map(({ qboId, name }, index) => ({
           id: itemUuid(index + 1),
-          priority: 21 - index,
+          ruleRevision: 1,
+          priority: index + 1,
           matchField: 'payee' as const,
           matchText: name,
-          categoryQboId: qboId,
-          taxCalculation: 'NotApplicable' as const,
-          taxCodeQboId: null,
-          tagIds: [],
+          action: {
+            version: 2 as const,
+            direction: 'Purchase' as const,
+            category: name,
+            categoryQboId: qboId,
+            taxCalculation: 'NotApplicable' as const,
+            taxCodeQboId: null,
+            tagIds: [],
+          },
+          autoPost: false,
         })),
         similarVerifiedTransactions: candidates.map(({ qboId }, index) => ({
           transactionId: itemUuid(index + 1),
@@ -202,6 +223,23 @@ describe('buildAgentSnapshot', () => {
     expect(snapshot.rules.map((item) => item.priority)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
   });
 
+  it('does not replace the loader winner order with match-text or id ordering', () => {
+    const base = validSource();
+    const canonicalWinner = {
+      ...base.rules[0]!,
+      id: '99999999-9999-4999-8999-999999999999',
+      matchText: 'Zulu',
+    };
+    const laterRule = {
+      ...base.rules[0]!,
+      id: '00000000-0000-4000-8000-000000000001',
+      matchText: 'Alpha',
+    };
+
+    expect(buildAgentSnapshot(validSource({ rules: [canonicalWinner, laterRule] })).rules.map((rule) => rule.id))
+      .toEqual([canonicalWinner.id, laterRule.id]);
+  });
+
   it('accepts bounded numeric QBO references but rejects unknown fields, duplicates, and invalid values safely', () => {
     const secret = 'sensitive-example-token';
     const cases: Array<() => unknown> = [
@@ -216,7 +254,7 @@ describe('buildAgentSnapshot', () => {
 
     expect(buildAgentSnapshot(validSource({
       candidateCategories: [{ qboId: '42', name: 'Numeric reference' }],
-      rules: [{ ...validSource().rules[0]!, categoryQboId: '42' }],
+      rules: [{ ...validSource().rules[0]!, action: { ...validSource().rules[0]!.action, category: 'Numeric reference', categoryQboId: '42' } }],
       similarVerifiedTransactions: [{ ...validSource().similarVerifiedTransactions[0]!, lines: [{ ...validSource().similarVerifiedTransactions[0]!.lines[0]!, categoryQboId: '42' }] }],
     })).candidateCategories[0]!.qboId).toBe('42');
     expect(buildAgentSnapshot(validSource({ transaction: { id: '018f8c70-0000-7000-8000-000000000000', revision: 7 } })).transaction.id).toBe('018f8c70-0000-7000-8000-000000000000');
@@ -244,7 +282,7 @@ describe('buildAgentSnapshot', () => {
     expect(() => {
       (snapshot.similarVerifiedTransactions[0]!.lines[0] as { memo: string }).memo = 'mutation';
     }).toThrow(TypeError);
-    expect(Object.isFrozen(snapshot.rules[0]!.tagIds)).toBe(true);
+    expect(Object.isFrozen(snapshot.rules[0]!.action.tagIds)).toBe(true);
     expect(Object.isFrozen(snapshot.similarVerifiedTransactions[0]!.tagIds)).toBe(true);
     expect(Object.isFrozen(snapshot.similarVerifiedTransactions[0]!.lines[0]!.tagIds)).toBe(true);
   });
@@ -252,11 +290,11 @@ describe('buildAgentSnapshot', () => {
   it('rejects orphaned retained references and inconsistent verified tax history safely', () => {
     const base = validSource();
     const cases: Array<() => unknown> = [
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, categoryQboId: '999' }] })),
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, tagIds: [itemUuid(99)] }] })),
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, taxCodeQboId: '999' }] })),
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, taxCodeQboId: null }] })),
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, taxCalculation: 'NotApplicable', taxCodeQboId: '200' }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, categoryQboId: '999' } }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, tagIds: [itemUuid(99)] } }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, taxCodeQboId: '999' } }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, taxCodeQboId: null } }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, taxCalculation: 'NotApplicable', taxCodeQboId: '200' } }] })),
       () => buildAgentSnapshot(validSource({ similarVerifiedTransactions: [{ ...base.similarVerifiedTransactions[0]!, tagIds: [itemUuid(99)] }] })),
       () => buildAgentSnapshot(validSource({ similarVerifiedTransactions: [{ ...base.similarVerifiedTransactions[0]!, lines: [] }] })),
       () => buildAgentSnapshot(validSource({ similarVerifiedTransactions: [{ ...base.similarVerifiedTransactions[0]!, lines: [{ ...base.similarVerifiedTransactions[0]!.lines[0]!, signedGrossCents: 12000 }] }] })),
@@ -270,7 +308,10 @@ describe('buildAgentSnapshot', () => {
 
   it('models readiness status and only exposes taxable capability when ready', () => {
     const base = validSource();
-    const notApplicableRule = { ...base.rules[0]!, taxCalculation: 'NotApplicable' as const, taxCodeQboId: null };
+    const notApplicableRule = {
+      ...base.rules[0]!,
+      action: { ...base.rules[0]!.action, taxCalculation: 'NotApplicable' as const, taxCodeQboId: null },
+    };
     const notApplicableHistory = {
       ...base.similarVerifiedTransactions[0]!,
       taxCalculation: 'NotApplicable' as const,
@@ -316,7 +357,7 @@ describe('buildAgentSnapshot', () => {
       'AGENT_SNAPSHOT_INVALID',
     );
     expectSnapshotError(
-      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, tagIds: Array.from({ length: 21 }, (_, index) => itemUuid(index + 1)) }] })),
+      () => buildAgentSnapshot(validSource({ rules: [{ ...base.rules[0]!, action: { ...base.rules[0]!.action, tagIds: Array.from({ length: 21 }, (_, index) => itemUuid(index + 1)) } }] })),
       'AGENT_SNAPSHOT_INVALID',
     );
   });

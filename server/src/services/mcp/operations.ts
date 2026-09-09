@@ -1,3 +1,4 @@
+import type { HistoricalRuleMutationKind, RuleMutationKind } from '@recat/shared';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import type { McpPrincipal } from '../../mcp/auth.js';
@@ -23,6 +24,26 @@ const OPERATION_KINDS = new Set<McpOperationKind>([
   'undo',
   'tax_refund',
 ]);
+
+const RULE_RESOURCE_TYPES = new Set<McpRuleResourceType>([
+  'rule',
+  'rule_order',
+  'rule_candidate',
+]);
+
+const HISTORICAL_RULE_MUTATION_KINDS = new Set<HistoricalRuleMutationKind>([
+  'create',
+  'update',
+  'review',
+  'enable',
+  'disable',
+  'reorder',
+  'retire',
+  'activate_candidate',
+  'dismiss_candidate',
+]);
+
+const SHA256 = /^[0-9a-f]{64}$/u;
 
 export type McpOperationKind = 'categorization' | 'transfer' | 'undo' | 'tax_refund';
 
@@ -62,6 +83,100 @@ export interface McpOperationRecord {
   manualRecordedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export type McpRuleResourceType = 'rule' | 'rule_order' | 'rule_candidate';
+
+export interface McpRuleOperationRecord {
+  id: string;
+  authKind: 'mcp' | 'session';
+  tokenId: string | null;
+  tokenPrefix: string | null;
+  sessionId: string | null;
+  userId: string;
+  companyId: string;
+  resourceType: McpRuleResourceType;
+  resourceId: string;
+  mutation: HistoricalRuleMutationKind;
+  idempotencyKey: string;
+  inputHash: string;
+  payload: McpOperationJsonValue;
+  payloadHash: string;
+  sourceRevision: number;
+  proposedRevision: number;
+  proposedSnapshotHash: string;
+  expiresAt: Date;
+  retryOfId: string | null;
+  committedAt: Date | null;
+  commitResult: McpOperationJsonValue | null;
+  commitResultHash: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type RuleOperationPrincipal =
+  | Pick<McpPrincipal, 'tokenId' | 'tokenPrefix' | 'userId'> & { kind?: 'mcp' }
+  | { kind: 'session'; sessionId: string; userId: string };
+
+type McpRuleOperationWhere = Partial<Pick<
+  McpRuleOperationRecord,
+  | 'id'
+  | 'tokenId'
+  | 'sessionId'
+  | 'authKind'
+  | 'userId'
+  | 'companyId'
+  | 'idempotencyKey'
+  | 'retryOfId'
+>>;
+
+type McpRuleOperationCreateData = Omit<
+  McpRuleOperationRecord,
+  | 'id'
+  | 'payload'
+  | 'committedAt'
+  | 'commitResult'
+  | 'commitResultHash'
+  | 'createdAt'
+  | 'updatedAt'
+> & { payload: McpOperationJsonObject };
+
+type McpRuleOperationInsertData = McpRuleOperationCreateData & { id: string };
+
+export interface McpRuleOperationStore {
+  mcpRuleOperation: {
+    findFirst(args: {
+      where: McpRuleOperationWhere;
+    }): Promise<McpRuleOperationRecord | null>;
+    createMany(args: {
+      data: McpRuleOperationInsertData;
+      skipDuplicates: true;
+    }): Promise<{ count: number }>;
+  };
+}
+
+export type McpRuleOperationPersistence =
+  | McpRuleOperationStore
+  | Pick<PrismaClient, never>
+  | Pick<Prisma.TransactionClient, never>;
+
+export interface McpRuleOperationDependencies {
+  store?: McpRuleOperationPersistence;
+  now?: () => Date;
+}
+
+export interface CreatePreparedRuleOperationInput {
+  principal: RuleOperationPrincipal;
+  companyId: string;
+  resourceType: McpRuleResourceType;
+  resourceId: string;
+  mutation: RuleMutationKind;
+  idempotencyKey: string;
+  payload: unknown;
+  sourceRevision: number;
+  proposedRevision: number;
+  proposedSnapshotHash: string;
+  retryOfId?: string | null;
 }
 
 type McpOperationWhere = Partial<Pick<
@@ -291,6 +406,237 @@ export async function loadOwnedOperation(
   });
   if (operation === null) throw new McpOperationError('OPERATION_NOT_FOUND');
   return operation;
+}
+
+export function hasValidMcpRuleOperationIntegrity(
+  operation: McpRuleOperationRecord,
+): boolean {
+  try {
+    const payloadHash = hashOperationPayload(operation.payload);
+    if (payloadHash !== operation.payloadHash) return false;
+    if (!isValidDate(operation.expiresAt)) return false;
+    const currentHash = hashOperationPayload({
+        authKind: operation.authKind,
+        tokenId: operation.tokenId,
+        tokenPrefix: operation.tokenPrefix,
+        sessionId: operation.sessionId,
+        userId: operation.userId,
+        companyId: operation.companyId,
+        resourceType: operation.resourceType,
+        resourceId: operation.resourceId,
+        mutation: operation.mutation,
+        idempotencyKey: operation.idempotencyKey,
+        payloadHash,
+        sourceRevision: operation.sourceRevision,
+        proposedRevision: operation.proposedRevision,
+        proposedSnapshotHash: operation.proposedSnapshotHash,
+        expiresAt: operation.expiresAt.toISOString(),
+        retryOfId: operation.retryOfId,
+      });
+    const legacyHash = operation.authKind === 'mcp' && operation.sessionId === null
+      ? hashOperationPayload({
+          tokenId: operation.tokenId, tokenPrefix: operation.tokenPrefix,
+          userId: operation.userId, companyId: operation.companyId,
+          resourceType: operation.resourceType, resourceId: operation.resourceId,
+          mutation: operation.mutation, idempotencyKey: operation.idempotencyKey,
+          payloadHash, sourceRevision: operation.sourceRevision,
+          proposedRevision: operation.proposedRevision,
+          proposedSnapshotHash: operation.proposedSnapshotHash,
+          expiresAt: operation.expiresAt.toISOString(), retryOfId: operation.retryOfId,
+        }) : null;
+    if (operation.inputHash !== currentHash && operation.inputHash !== legacyHash) return false;
+
+    const commitFields = [
+      operation.committedAt,
+      operation.commitResult,
+      operation.commitResultHash,
+    ];
+    if (commitFields.every((value) => value === null)) return true;
+    if (commitFields.some((value) => value === null)) return false;
+    return isValidDate(operation.committedAt!)
+      && operation.commitResultHash === hashOperationPayload(operation.commitResult);
+  } catch {
+    return false;
+  }
+}
+
+export async function createPreparedRuleOperation(
+  input: CreatePreparedRuleOperationInput,
+  dependencies: McpRuleOperationDependencies = {},
+): Promise<McpRuleOperationRecord> {
+  const store = (dependencies.store ?? prisma) as unknown as McpRuleOperationStore;
+  const now = dependencies.now?.() ?? new Date();
+  if (!isValidDate(now)) invalidInput();
+
+  const authKind = input.principal.kind === 'session' ? 'session' : 'mcp';
+  const tokenId = authKind === 'mcp'
+    ? boundedText((input.principal as Extract<RuleOperationPrincipal, { kind?: 'mcp' }>).tokenId, MAX_IDENTIFIER_LENGTH)
+    : null;
+  const tokenPrefix = authKind === 'mcp'
+    ? boundedText((input.principal as Extract<RuleOperationPrincipal, { kind?: 'mcp' }>).tokenPrefix, MAX_TOKEN_PREFIX_LENGTH)
+    : null;
+  const sessionId = authKind === 'session'
+    ? boundedText((input.principal as Extract<RuleOperationPrincipal, { kind: 'session' }>).sessionId, MAX_IDENTIFIER_LENGTH)
+    : null;
+  const userId = boundedText(input.principal?.userId, MAX_IDENTIFIER_LENGTH);
+  const companyId = boundedText(input.companyId, MAX_IDENTIFIER_LENGTH);
+  const resourceType = normalizedRuleResourceType(input.resourceType);
+  const resourceId = boundedText(input.resourceId, MAX_IDENTIFIER_LENGTH);
+  const mutation = normalizedRuleMutation(input.mutation);
+  const idempotencyKey = normalizeMcpOperationIdempotencyKey(input.idempotencyKey);
+  if (idempotencyKey === null) invalidInput();
+  const sourceRevision = normalizedRevision(input.sourceRevision);
+  const proposedRevision = normalizedRevision(input.proposedRevision);
+  if (proposedRevision !== sourceRevision + 1) invalidInput();
+  const proposedSnapshotHash = normalizedSha256(input.proposedSnapshotHash);
+  const retryOfId = normalizedOptionalIdentifier(input.retryOfId);
+  const { value: payload, canonical } = normalizeOperationPayload(input.payload);
+  if (payload === null || Array.isArray(payload) || typeof payload !== 'object') {
+    invalidInput();
+  }
+  const payloadHash = sha256(canonical);
+  const expiresAt = new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
+  if (!isValidDate(expiresAt)) invalidInput();
+  const hashInput = {
+    tokenId, tokenPrefix, userId, companyId, resourceType, resourceId,
+    mutation, idempotencyKey, payloadHash, sourceRevision, proposedRevision,
+    proposedSnapshotHash, expiresAt: expiresAt.toISOString(), retryOfId,
+  };
+  // During rolling deployment, a pre-Task-6A committer must be able to read
+  // MCP preparations emitted by a new instance. Session rows have no legacy
+  // representation and therefore use the discriminator-aware hash.
+  const inputHash = hashOperationPayload(authKind === 'mcp'
+    ? hashInput
+    : { authKind, ...hashInput, sessionId });
+  const data: McpRuleOperationCreateData = {
+    authKind,
+    tokenId,
+    tokenPrefix,
+    sessionId,
+    userId,
+    companyId,
+    resourceType,
+    resourceId,
+    mutation,
+    idempotencyKey,
+    inputHash,
+    payload,
+    payloadHash,
+    sourceRevision,
+    proposedRevision,
+    proposedSnapshotHash,
+    expiresAt,
+    retryOfId,
+  };
+
+  await assertValidRuleRetryParent(store, data);
+  const existing = await findRuleReplayCandidate(store, data);
+  if (existing !== null) return assertExactRuleReplay(existing, data);
+
+  const id = randomUUID();
+  const inserted = await store.mcpRuleOperation.createMany({
+    data: { id, ...data },
+    skipDuplicates: true,
+  });
+  if (inserted.count === 1) {
+    const created = await store.mcpRuleOperation.findFirst({ where: { id } });
+    if (created === null) throw new McpOperationError('OPERATION_CONFLICT');
+    return created;
+  }
+  const raced = await findRuleReplayCandidate(store, data);
+  if (raced === null) throw new McpOperationError('OPERATION_CONFLICT');
+  return assertExactRuleReplay(raced, data);
+}
+
+export async function loadOwnedRuleOperation(
+  operationId: string,
+  principal: RuleOperationPrincipal,
+  dependencies: Pick<McpRuleOperationDependencies, 'store'> = {},
+): Promise<McpRuleOperationRecord> {
+  const store = (dependencies.store ?? prisma) as unknown as McpRuleOperationStore;
+  const owner = principal.kind === 'session'
+    ? { authKind: 'session' as const, sessionId: boundedText(principal.sessionId, MAX_IDENTIFIER_LENGTH) }
+    : { authKind: 'mcp' as const, tokenId: boundedText(principal.tokenId, MAX_IDENTIFIER_LENGTH) };
+  const operation = await store.mcpRuleOperation.findFirst({
+    where: {
+      id: boundedText(operationId, MAX_IDENTIFIER_LENGTH),
+      userId: boundedText(principal?.userId, MAX_IDENTIFIER_LENGTH),
+      ...owner,
+    },
+  });
+  if (operation === null) throw new McpOperationError('OPERATION_NOT_FOUND');
+  return operation;
+}
+
+async function assertValidRuleRetryParent(
+  store: McpRuleOperationStore,
+  data: McpRuleOperationCreateData,
+): Promise<void> {
+  if (data.retryOfId === null) return;
+  const parent = await store.mcpRuleOperation.findFirst({
+    where: {
+      id: data.retryOfId,
+      authKind: data.authKind,
+      ...(data.authKind === 'session' ? { sessionId: data.sessionId } : { tokenId: data.tokenId }),
+      userId: data.userId,
+    },
+  });
+  if (parent === null) throw new McpOperationError('OPERATION_NOT_FOUND');
+  if (
+    parent.retryOfId !== null
+    || parent.companyId !== data.companyId
+    || parent.resourceType !== data.resourceType
+    || parent.resourceId !== data.resourceId
+    || parent.mutation !== data.mutation
+  ) invalidInput();
+}
+
+async function findRuleReplayCandidate(
+  store: McpRuleOperationStore,
+  data: McpRuleOperationCreateData,
+): Promise<McpRuleOperationRecord | null> {
+  const byIdempotency = await store.mcpRuleOperation.findFirst({
+    where: {
+      authKind: data.authKind,
+      ...(data.authKind === 'session' ? { sessionId: data.sessionId } : { tokenId: data.tokenId }),
+      companyId: data.companyId,
+      idempotencyKey: data.idempotencyKey,
+    },
+  });
+  const byRetry = data.retryOfId === null
+    ? null
+    : await store.mcpRuleOperation.findFirst({ where: { retryOfId: data.retryOfId } });
+  if (
+    byIdempotency !== null
+    && byRetry !== null
+    && byIdempotency.id !== byRetry.id
+  ) throw new McpOperationError('IDEMPOTENCY_CONFLICT');
+  return byIdempotency ?? byRetry;
+}
+
+function assertExactRuleReplay(
+  existing: McpRuleOperationRecord,
+  requested: McpRuleOperationCreateData,
+): McpRuleOperationRecord {
+  if (
+    !hasValidMcpRuleOperationIntegrity(existing)
+    || existing.authKind !== requested.authKind
+    || existing.payloadHash !== requested.payloadHash
+    || existing.tokenId !== requested.tokenId
+    || existing.tokenPrefix !== requested.tokenPrefix
+    || existing.sessionId !== requested.sessionId
+    || existing.userId !== requested.userId
+    || existing.companyId !== requested.companyId
+    || existing.resourceType !== requested.resourceType
+    || existing.resourceId !== requested.resourceId
+    || existing.mutation !== requested.mutation
+    || existing.idempotencyKey !== requested.idempotencyKey
+    || existing.sourceRevision !== requested.sourceRevision
+    || existing.proposedRevision !== requested.proposedRevision
+    || existing.proposedSnapshotHash !== requested.proposedSnapshotHash
+    || existing.retryOfId !== requested.retryOfId
+  ) throw new McpOperationError('IDEMPOTENCY_CONFLICT');
+  return existing;
 }
 
 async function assertValidRetryParent(
@@ -563,6 +909,27 @@ function normalizedKind(value: unknown): McpOperationKind {
     invalidInput();
   }
   return value as McpOperationKind;
+}
+
+function normalizedRuleResourceType(value: unknown): McpRuleResourceType {
+  if (
+    typeof value !== 'string'
+    || !RULE_RESOURCE_TYPES.has(value as McpRuleResourceType)
+  ) invalidInput();
+  return value as McpRuleResourceType;
+}
+
+function normalizedRuleMutation(value: unknown): HistoricalRuleMutationKind {
+  if (
+    typeof value !== 'string'
+    || !HISTORICAL_RULE_MUTATION_KINDS.has(value as HistoricalRuleMutationKind)
+  ) invalidInput();
+  return value as HistoricalRuleMutationKind;
+}
+
+function normalizedSha256(value: unknown): string {
+  if (typeof value !== 'string' || !SHA256.test(value)) invalidInput();
+  return value;
 }
 
 function boundedText(value: unknown, maximum: number): string {

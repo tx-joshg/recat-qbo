@@ -52,7 +52,15 @@ import type {
   ReceiptStatsRange,
   Role,
   ReconcileCategorizationBody,
-  RuleDto,
+  RuleDetailDto,
+  RuleRevisionPageDto,
+  RuleAffectedTransactionFilter,
+  RuleAffectedTransactionPageDto,
+  RuleLifecycleFilter,
+  RuleLifecyclePageDto,
+  RuleMutationKind,
+  RuleMutationResult,
+  ClassificationCase,
   RuleCandidateDto,
   RuleTestResult,
   SavedReportConfig,
@@ -884,31 +892,71 @@ export const tags = {
     api.del<void>(`/api/companies/${companyId}/tags/${tagId}`),
 };
 
-export interface RuleBody {
-  matchText: string;
-  category: string;
-  categoryQboId?: string | null;
-  tagIds?: string[];
-  autoPost?: boolean;
-  /** Match order — lowest number wins when several rules match. */
-  priority?: number;
+export const classificationMemory = {
+  currentCase: (companyId: string, transactionId: string) =>
+    api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`),
+};
+
+export interface PrepareRuleOperationBody {
+  mutation: Exclude<RuleMutationKind, 'create'>;
+  ruleId?: string;
+  candidateId?: string;
+  expectedRevision: number;
+  idempotencyKey: string;
+  retryOfId?: string;
+  proposal?: {
+    matchText?: string;
+    direction?: 'Purchase' | 'Deposit';
+    categoryQboId?: string;
+    taxCalculation?: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+    taxCodeQboId?: string | null;
+    tagIds?: string[];
+    autoPost?: boolean;
+    reviewReason?: string;
+  };
 }
 
+export const ruleOperations = {
+  prepare: (companyId: string, body: PrepareRuleOperationBody) =>
+    api.post<RuleMutationResult>(`/api/companies/${companyId}/rule-operations/prepare`, body),
+  commit: (companyId: string, operationId: string, idempotencyKey: string) =>
+    api.post<RuleMutationResult>(
+      `/api/companies/${companyId}/rule-operations/${operationId}/commit`,
+      { idempotencyKey },
+    ),
+  prepareFromCase: (
+    companyId: string,
+    caseId: string,
+    body: { matchText: string; idempotencyKey: string; retryOfId?: string },
+  ) => api.post<RuleMutationResult>(
+    `/api/companies/${companyId}/rule-operations/from-case/${caseId}/prepare`,
+    body,
+  ),
+};
+
 export const rules = {
-  /** Returns rules in match order (priority asc) — render as-is, no re-sort. */
-  list: (companyId: string) => api.get<RuleDto[]>(`/api/companies/${companyId}/rules`),
-  create: (companyId: string, body: RuleBody) =>
-    api.post<RuleDto>(`/api/companies/${companyId}/rules`, body),
-  patch: (companyId: string, ruleId: string, body: Partial<RuleBody>) =>
-    api.patch<RuleDto>(`/api/companies/${companyId}/rules/${ruleId}`, body),
-  del: (companyId: string, ruleId: string) =>
-    api.del<void>(`/api/companies/${companyId}/rules/${ruleId}`),
-  /** Persist a full match order: ids[0] = topmost (wins first). Returns the reordered list. */
-  reorder: (companyId: string, ids: string[]) =>
-    api.put<RuleDto[]>(`/api/companies/${companyId}/rules/order`, { ids }),
-  /** Dry-run a draft rule (placed at top priority) against recent transactions. */
-  test: (companyId: string, matchText: string) =>
-    api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),
+  lifecycle: (
+    companyId: string,
+    state: RuleLifecycleFilter = 'all',
+    cursor?: string,
+    limit = 100,
+  ) => api.get<RuleLifecyclePageDto>(
+    `/api/companies/${companyId}/rules/lifecycle${qs({ state, cursor, limit })}`,
+  ),
+  detail: (companyId: string, ruleId: string) =>
+    api.get<RuleDetailDto>(`/api/companies/${companyId}/rules/${ruleId}`),
+  revisions: (companyId: string, ruleId: string, cursor?: string, limit = 20) =>
+    api.get<RuleRevisionPageDto>(
+      `/api/companies/${companyId}/rules/${ruleId}/revisions${qs({ cursor, limit })}`,
+    ),
+  affectedTransactions: (companyId: string, ruleId: string, params: {
+    status?: RuleAffectedTransactionFilter; limit?: number; cursor?: string;
+  }) => api.get<RuleAffectedTransactionPageDto>(
+    `/api/companies/${companyId}/rules/${ruleId}/affected-transactions${qs(params)}`,
+  ),
+  /** Test a draft vendor condition for one transaction direction without writing. */
+  test: (companyId: string, matchText: string, direction: 'Purchase' | 'Deposit') =>
+    api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText, direction }),
 };
 
 export const ruleCandidates = {
@@ -919,14 +967,6 @@ export const ruleCandidates = {
   get: (companyId: string, candidateId: string) =>
     api.get<RuleCandidateDto>(
       `/api/companies/${companyId}/rule-candidates/${candidateId}`,
-    ),
-  dismiss: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/dismiss`,
-    ),
-  activate: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/activate`,
     ),
 };
 

@@ -8,9 +8,24 @@
 //                name list, NEVER the books. Cached per (companyId, payee).
 
 import { Prisma } from '@prisma/client';
-import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
+import type {
+  CanonicalSuggestionDto,
+  CategoryHintSuggestionDto,
+  RuleDirection,
+  RuleSuggestionDto,
+  SuggestionDto,
+  SuggestionSetting,
+  TaxCalculation,
+} from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { completeCategory, type CategoryProviderSettings } from './ai/provider.js';
+import {
+  actionabilityObservationFromRow,
+  effectiveProviderDisposition,
+  transactionIdentityFromRow,
+} from './providerActionability.js';
+import { compareRuleWinner, ruleMatches } from './ruleMatching.js';
+import { RuleServiceError, validateExistingRuleAction, loadRuleActionReferenceSnapshot } from './rules.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -46,10 +61,58 @@ export interface HistoryTxnLike {
   categoryQboId: string | null;
 }
 
+export interface CanonicalRuleLike {
+  id: string;
+  revision: number;
+  matchText: string;
+  category: string;
+  categoryQboId: string;
+  taxCalculation: TaxCalculation;
+  taxCodeQboId: string | null;
+  tagIds: string[];
+  direction: RuleDirection;
+  autoPost: boolean;
+  priority: number;
+  createdAt: Date;
+}
+
+export function canonicalRuleSuggestion(
+  transaction: { payee: string; qboType: string },
+  rules: CanonicalRuleLike[],
+): RuleSuggestionDto | null {
+  const winner = rules
+    .filter((rule) => ruleMatches(
+      { matchText: rule.matchText, direction: rule.direction },
+      { description: transaction.payee, type: transaction.qboType },
+    ))
+    .sort(compareRuleWinner)[0];
+  if (winner === undefined) return null;
+  return {
+    source: 'rule',
+    version: 2,
+    ruleId: winner.id,
+    ruleRevision: winner.revision,
+    action: {
+      version: 2,
+      direction: winner.direction,
+      category: winner.category,
+      categoryQboId: winner.categoryQboId,
+      taxCalculation: winner.taxCalculation,
+      taxCodeQboId: winner.taxCodeQboId,
+      tagIds: [...winner.tagIds],
+    },
+    autoPost: winner.autoPost,
+  };
+}
+
 /**
  * Lowest-priority-number matching rule wins (createdAt desc as tiebreak).
  * Also reports how many rules matched in total (matchedRules) and the winner's
  * matchText (winnerMatchText) so the queue can surface multi-rule overlaps.
+ *
+ * @deprecated Bridge-only v1 matcher. Do not reuse for canonical rules. Route
+ * through ruleMatching.ts only after Company.ruleRuntimeMode gates canonical
+ * integration following nullable-direction backfill.
  */
 export function ruleSuggestion(payee: string, rules: RuleLike[]): SuggestionDto | null {
   const needle = payee.toLowerCase();
@@ -73,7 +136,7 @@ export function ruleSuggestion(payee: string, rules: RuleLike[]): SuggestionDto 
 }
 
 /** Most frequent category among previously posted txns of the same normalized payee. */
-export function historySuggestion(payee: string, history: HistoryTxnLike[]): SuggestionDto | null {
+export function historySuggestion(payee: string, history: HistoryTxnLike[]): CategoryHintSuggestionDto | null {
   const norm = normalizePayee(payee);
   if (norm.length === 0) return null;
   const counts = new Map<string, { count: number; categoryQboId: string | null }>();
@@ -146,7 +209,7 @@ async function loadSettings(): Promise<SuggestionSettings> {
 // Bind cached answers to the effective model settings and allowed categories,
 // in addition to company and normalized payee. Resolved answers (including a valid
 // "no idea") are cached; transport errors are not, so a flaky endpoint retries.
-const aiCache = new Map<string, { binding: string; result: SuggestionDto | null }>();
+const aiCache = new Map<string, { binding: string; result: CategoryHintSuggestionDto | null }>();
 
 interface CategoryOption {
   qboId: string;
@@ -168,7 +231,7 @@ async function aiSuggestion(
   txn: { payee: string; memo?: string | null; amount: number },
   settings: CategoryProviderSettings | null,
   optionsIn?: CategoryOption[],
-): Promise<SuggestionDto | null> {
+): Promise<CategoryHintSuggestionDto | null> {
   if (settings === null) return null;
   const options = optionsIn ?? await categoryOptions(companyId);
   if (options.length === 0) return null;
@@ -202,7 +265,7 @@ async function aiSuggestion(
   // Only accept an exact (case-insensitive) category name — anything else is
   // a hallucination and must not reach the queue.
   const hit = options.find((o) => o.name.toLowerCase() === answer?.toLowerCase());
-  const result: SuggestionDto | null = hit
+  const result: CategoryHintSuggestionDto | null = hit
     ? { category: hit.name, categoryQboId: hit.qboId, source: 'ai' }
     : null;
   // Retain one binding per payee, not every obsolete settings/category version.
@@ -218,12 +281,57 @@ function jsonStringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
 }
 
-async function loadRules(companyId: string): Promise<RuleLike[]> {
-  return prisma.rule.findMany({
-    where: { companyId },
-    select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
-    orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
-  });
+async function loadCanonicalRules(companyId: string): Promise<CanonicalRuleLike[]> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY');
+    const company = await tx.company.findUnique({
+      where: { id: companyId }, select: { ruleRuntimeMode: true, holdingAccountIds: true },
+    });
+    if (company?.ruleRuntimeMode !== 'canonical') return [];
+    const rules = await tx.rule.findMany({
+      where: {
+        companyId,
+        enabled: true,
+        retiredAt: null,
+        reviewRequiredAt: null,
+        repairReason: null,
+        canonicalVersion: 2,
+        direction: { in: ['Purchase', 'Deposit'] },
+      },
+      include: { ruleTags: true, candidateOrigin: true },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+    });
+    if (rules.length === 0) return [];
+    const references = await loadRuleActionReferenceSnapshot(
+      tx, companyId, company.holdingAccountIds,
+      rules.some((rule) => rule.taxCalculation !== 'NotApplicable'),
+    );
+    const valid: CanonicalRuleLike[] = [];
+    for (const rule of rules) {
+      try {
+        const resolved = await validateExistingRuleAction(tx, companyId, rule, references);
+        valid.push({
+          id: rule.id,
+          revision: rule.revision,
+          matchText: rule.matchText,
+          category: resolved.categoryName,
+          categoryQboId: resolved.action.categoryQboId,
+          taxCalculation: resolved.action.taxCalculation,
+          taxCodeQboId: resolved.action.taxCodeQboId,
+          tagIds: [...resolved.action.tagIds],
+          direction: resolved.direction,
+          autoPost: rule.autoPost,
+          priority: rule.priority,
+          createdAt: rule.createdAt,
+        });
+      } catch (error) {
+        if (!(error instanceof RuleServiceError)) throw error;
+        // Read diagnostics omit invalid actions. Stage/commit retain their own
+        // current reference checks and durable safety transitions.
+      }
+    }
+    return valid;
+  }, { isolationLevel: 'RepeatableRead' });
 }
 
 async function loadHistory(companyId: string): Promise<HistoryTxnLike[]> {
@@ -236,14 +344,18 @@ async function loadHistory(companyId: string): Promise<HistoryTxnLike[]> {
 
 export async function suggestFor(
   companyId: string,
-  txn: { payee: string; memo?: string | null; amount: number },
-): Promise<SuggestionDto | null> {
+  txn: { payee: string; memo?: string | null; amount: number; qboType?: string },
+): Promise<CanonicalSuggestionDto | null> {
   const settings = await loadSettings();
   const historyEnabled = settings.suggestionSource !== 'off';
-  const rules = await loadRules(companyId);
+  const rules = await loadCanonicalRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
-  const picked = pickSuggestion(txn.payee, rules, history, historyEnabled);
+  const picked = txn.qboType === undefined
+    ? null
+    : canonicalRuleSuggestion({ payee: txn.payee, qboType: txn.qboType }, rules);
   if (picked) return picked;
+  const historyHint = historyEnabled ? historySuggestion(txn.payee, history) : null;
+  if (historyHint) return historyHint;
   if (settings.suggestionSource === 'ai') return aiSuggestion(companyId, txn, settings.aiSettings);
   return null;
 }
@@ -257,28 +369,62 @@ export async function suggestFor(
  */
 export async function suggestForMany(
   companyId: string,
-  txns: { payee: string; memo?: string | null; amount: number }[],
-): Promise<(SuggestionDto | null)[]> {
+  txns: { payee: string; memo?: string | null; amount: number; qboType?: string }[],
+): Promise<(CanonicalSuggestionDto | null)[]> {
   if (txns.length === 0) return [];
   const settings = await loadSettings();
   const historyEnabled = settings.suggestionSource !== 'off';
-  const rules = await loadRules(companyId);
+  const rules = await loadCanonicalRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
-  return txns.map((t) => pickSuggestion(t.payee, rules, history, historyEnabled));
+  return txns.map((t) => (
+    (t.qboType === undefined
+      ? null
+      : canonicalRuleSuggestion({ payee: t.payee, qboType: t.qboType }, rules))
+    ?? (historyEnabled ? historySuggestion(t.payee, history) : null)
+  ));
 }
 
 /** Recompute the suggestion snapshot for every PENDING txn (called by sync). */
-export async function refreshSuggestions(companyId: string): Promise<void> {
+export async function refreshSuggestions(
+  companyId: string,
+  options: { includeRuleSuggestions?: boolean } = {},
+): Promise<void> {
   const settings = await loadSettings();
   const historyEnabled = settings.suggestionSource !== 'off';
-  const rules = await loadRules(companyId);
+  const rules = options.includeRuleSuggestions === false ? [] : await loadCanonicalRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
-  const pending = await prisma.transaction.findMany({ where: { companyId, status: 'PENDING' } });
+  // Production applies the additive actionability migration before starting
+  // the app. The delegate fallback exists only for legacy unit-test stores.
+  const supportsActionability = Boolean(
+    (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
+  );
+  const pending = await prisma.transaction.findMany({
+    where: { companyId, status: 'PENDING' },
+    ...(supportsActionability ? { include: { providerActionability: true } } : {}),
+  });
   let aiOptions: CategoryOption[] | undefined;
 
   for (const t of pending) {
+    const providerWritable = !supportsActionability || effectiveProviderDisposition(
+      actionabilityObservationFromRow(
+        (t as unknown as { providerActionability?: unknown }).providerActionability,
+      ),
+      transactionIdentityFromRow(t),
+    ) === 'WRITABLE';
+    if (!providerWritable) {
+      if (t.suggestion !== null) {
+        await prisma.transaction.update({
+          where: { id: t.id },
+          data: { suggestion: Prisma.DbNull },
+        });
+      }
+      continue;
+    }
     const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
-    let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
+    let suggestion: CanonicalSuggestionDto | null = canonicalRuleSuggestion(
+      { payee: t.payee, qboType: t.qboType },
+      rules,
+    ) ?? (historyEnabled ? historySuggestion(t.payee, history) : null);
     if (!suggestion && settings.suggestionSource === 'ai') {
       aiOptions ??= await categoryOptions(companyId);
       suggestion = await aiSuggestion(companyId, input, settings.aiSettings, aiOptions);

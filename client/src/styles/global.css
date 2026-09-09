@@ -300,3 +300,36 @@ input, select, button { font-family:inherit; }
 .rr .queue-recovery-actions { display:inline-flex; flex-wrap:nowrap; justify-content:center; gap:7px; max-width:100%; }
 .rr .queue-recovery-actions .btn-ghost { padding:8px 10px; font-size:13px; white-space:nowrap; }
 .rr .queue-mobile-actions { flex-wrap:wrap; }
+/* Canonical Rules editor and lifecycle cards. */
+.rr .rules-page-header { display:flex; align-items:flex-end; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:18px; }
+.rr .rule-editor-list { display:grid; gap:12px; }
+.rr .rule-editor-card,.rr .rule-candidate-card { border:1px solid var(--bd2); border-radius:10px; padding:15px; }
+.rr .rule-editor-header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
+.rr .rule-editor-meta { color:var(--mut); font-size:12.5px; margin-top:4px; }
+.rr .rule-status-pill { cursor:pointer; font:inherit; }
+.rr .rule-editor-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:end; gap:12px; margin-top:14px; }
+.rr .rule-editor-grid > .control-trigger,.rr .rule-editor-grid > span .control-trigger,.rr .rule-editor-grid > div .control-trigger { width:100%; box-sizing:border-box; }
+.rr .rule-tag-field { display:flex; flex-direction:column; gap:7px; border:1px solid var(--bd2); border-radius:8px; padding:9px 11px; margin:0; }
+.rr .rule-tag-field legend { color:var(--mut); font-size:13px; }
+.rr .rule-tag-field label,.rr .rule-auto-post { display:flex; gap:7px; align-items:center; font-size:13px; }
+.rr .rule-auto-post { align-self:center; flex-wrap:wrap; }
+.rr .rule-auto-post-note { color:var(--mut); flex-basis:100%; font-size:12px; }
+.rr .rule-editor-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:13px; }
+.rr .rule-editor-notices,.rr .rule-test-result { margin-top:10px; }
+.rr .rule-warning { color:var(--amT); margin-top:5px; }
+.rr .rule-error,.rr .rule-field-error { color:var(--erT); }
+.rr .rule-field-error { font-size:12px; margin-top:5px; }
+.rr .rule-test-result { color:var(--mut); font-size:13px; }
+@media (max-width:640px) { .rr .rule-editor-grid { grid-template-columns:1fr; } }
+
+/* Labelled text fields within the canonical rule editor. */
+.rr .rule-editor-grid .field { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.rr .rule-editor-grid .field-label { color:var(--mut); font-size:13px; font-weight:500; }
+.rr .rule-editor-grid .text-control { box-sizing:border-box; border:1px solid var(--bd); border-radius:7px; padding:8px 11px; font-size:14px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }
+.rr .rule-editor-grid .text-control:focus { border-color:var(--acc); }
+.rr[data-theme="dark"] .rule-editor-grid .text-control { color-scheme:dark; }
+
+@media (max-width:640px) {
+  .rr .rule-details-footer { gap:6px; }
+  .rr .rule-details-footer > button { padding:8px 6px; font-size:13px; min-height:36px; white-space:nowrap; }
+}

@@ -1,10 +1,13 @@
 import type {
-  StageCategorizationBody,
+  ManualStageCategorizationBody,
+  RuleSuggestionStageCategorizationBody,
   StagedCategorization,
   TransactionDto,
 } from '@recat/shared';
 
-export type DesiredStage = Omit<StageCategorizationBody, 'expectedRevision'>;
+export type DesiredStage =
+  | Omit<ManualStageCategorizationBody, 'expectedRevision'>
+  | Omit<RuleSuggestionStageCategorizationBody, 'expectedRevision'>;
 export type RowStageStatus = 'idle' | 'calculating' | 'ready' | 'error' | 'conflict';
 
 export interface RowStageView {
@@ -17,7 +20,7 @@ export interface RowStageView {
 
 export interface RowStageTransport {
   stage(expectedRevision: number, desired: DesiredStage): Promise<StagedCategorization>;
-  reload(): Promise<TransactionDto | null>;
+  reload(rejectedDesired?: DesiredStage): Promise<TransactionDto | null>;
   isMutable(transaction: TransactionDto): boolean;
 }
 
@@ -31,6 +34,23 @@ function sameStrings(left: string[], right: string[]): boolean {
 }
 
 export function sameDesired(left: DesiredStage, right: DesiredStage): boolean {
+  if ('ruleSuggestion' in left || 'ruleSuggestion' in right) {
+    if (!('ruleSuggestion' in left) || !('ruleSuggestion' in right)) return false;
+    const leftSuggestion = left.ruleSuggestion;
+    const rightSuggestion = right.ruleSuggestion;
+    return leftSuggestion.source === rightSuggestion.source
+      && leftSuggestion.version === rightSuggestion.version
+      && leftSuggestion.ruleId === rightSuggestion.ruleId
+      && leftSuggestion.ruleRevision === rightSuggestion.ruleRevision
+      && leftSuggestion.autoPost === rightSuggestion.autoPost
+      && leftSuggestion.action.version === rightSuggestion.action.version
+      && leftSuggestion.action.direction === rightSuggestion.action.direction
+      && leftSuggestion.action.category === rightSuggestion.action.category
+      && leftSuggestion.action.categoryQboId === rightSuggestion.action.categoryQboId
+      && leftSuggestion.action.taxCalculation === rightSuggestion.action.taxCalculation
+      && leftSuggestion.action.taxCodeQboId === rightSuggestion.action.taxCodeQboId
+      && sameStrings(leftSuggestion.action.tagIds, rightSuggestion.action.tagIds);
+  }
   return left.taxCalculation === right.taxCalculation
     && sameStrings(left.tagIds, right.tagIds)
     && left.lines.length === right.lines.length
@@ -46,6 +66,17 @@ export function sameDesired(left: DesiredStage, right: DesiredStage): boolean {
 }
 
 function snapshot(desired: DesiredStage): DesiredStage {
+  if ('ruleSuggestion' in desired) {
+    return {
+      ruleSuggestion: {
+        ...desired.ruleSuggestion,
+        action: {
+          ...desired.ruleSuggestion.action,
+          tagIds: [...desired.ruleSuggestion.action.tagIds],
+        },
+      },
+    };
+  }
   return {
     taxCalculation: desired.taxCalculation,
     lines: desired.lines.map((line) => ({
@@ -67,9 +98,16 @@ function requiresReload(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return true;
   const candidate = error as CodedHttpError;
   if (candidate.code === 'STALE_REVISION' || candidate.code === 'MUTATION_BLOCKED') return true;
+  if (candidate.code === 'STALE_RULE_SUGGESTION') return true;
   if (!Number.isInteger(candidate.status)) return true;
   const status = candidate.status as number;
   return status === 408 || (status >= 500 && status <= 599);
+}
+
+function isStaleRuleSuggestion(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && (error as CodedHttpError).code === 'STALE_RULE_SUGGESTION';
 }
 
 export function createRowStageCoordinator(
@@ -89,6 +127,7 @@ export function createRowStageCoordinator(
   let desiredGeneration = 0;
   let recoveryAttemptedGeneration: number | null = null;
   let reloadRequired = false;
+  let rejectedRuleReload: { desired: DesiredStage; error: unknown } | null = null;
 
   const emit = () => {
     if (disposed) return;
@@ -118,7 +157,9 @@ export function createRowStageCoordinator(
     emit();
   };
 
-  function startReload(): void {
+  function startReload(rejection?: { desired: DesiredStage; error: unknown }): void {
+    if (rejection !== undefined) rejectedRuleReload = rejection;
+    const rejected = rejectedRuleReload;
     status = 'calculating';
     staged = null;
     result = null;
@@ -129,7 +170,9 @@ export function createRowStageCoordinator(
 
     let reloadPromise: Promise<TransactionDto | null>;
     try {
-      reloadPromise = transport.reload();
+      reloadPromise = rejected === null
+        ? transport.reload()
+        : transport.reload(rejected.desired);
     } catch (reloadError) {
       reloadPromise = Promise.reject(reloadError);
     }
@@ -152,6 +195,19 @@ export function createRowStageCoordinator(
 
       canonicalRevision = latest.revision;
       reloadRequired = false;
+      rejectedRuleReload = null;
+      if (rejected !== null) {
+        const next = queued ?? desired;
+        queued = null;
+        if (next !== null && !('ruleSuggestion' in next)) {
+          inFlight = null;
+          start(next);
+          return;
+        }
+        desired = null;
+        settleError(rejected.error, false);
+        return;
+      }
       const next = queued ?? desired;
       queued = null;
       inFlight = null;
@@ -219,6 +275,11 @@ export function createRowStageCoordinator(
         }
 
         reloadRequired = true;
+        if (isStaleRuleSuggestion(stageError)) {
+          inFlight = null;
+          startReload({ desired: requested, error: stageError });
+          return;
+        }
         if (recoveryAttemptedGeneration === desiredGeneration) {
           settleError(stageError, true);
           return;

@@ -99,7 +99,7 @@ function mockReads(overrides: Partial<CompanyReadOperations> = {}): CompanyReadO
       nextCursor: null,
     }),
     listTags: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
-    listRules: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listRules: vi.fn().mockResolvedValue({ runtimeMode: 'canonical', items: [], nextCursor: null }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     ...overrides,
   };
@@ -701,32 +701,19 @@ describe('stateless MCP handler', () => {
     { era: 'legacy', mirroredOnly: true },
     { era: 'modern', mirroredOnly: true },
   ])('bounds Unicode $era output (mirrored-only overflow: $mirroredOnly)', async ({ era, mirroredOnly }) => {
-    const largeUnicodeText = '😀'.repeat(mirroredOnly ? 16 : 1_024);
+    const largeUnicodeText = '😀'.repeat(mirroredOnly ? 36 : 1_024);
     const largeRules = Array.from({ length: 100 }, (_, index) => ({
-      id: `rule-${index}`,
-      companyId: 'company-a',
-      priority: index,
-      matchField: 'payee' as const,
-      matchText: largeUnicodeText,
-      category: largeUnicodeText,
-      categoryQboId: largeUnicodeText,
-      taxCalculation: 'TaxExcluded' as const,
-      taxCode: largeUnicodeText,
-      taxCodeQboId: largeUnicodeText,
-      tagIds: Array.from(
-        { length: mirroredOnly ? 4 : 100 },
-        (_, tagIndex) => `tag-${tagIndex}`.padEnd(128, 'x'),
-      ),
-      autoPost: false,
-      createdAt: '2026-07-28T00:00:00.000Z',
-      reviewRequiredAt: null,
-      reviewReason: null,
-      origin: null,
-      valid: false,
-      invalidReasons: Array.from(
-        { length: 4 },
-        () => largeUnicodeText,
-      ),
+      state: 'disabled', reviewRequiredAt: null, reviewReason: null, repairReason: null,
+      revision: {
+        id: `revision-${index}`, ruleId: `rule-${index}`, companyId: 'company-a',
+        revision: 1, state: 'disabled',
+        condition: { matchField: 'payee', matchText: largeUnicodeText },
+        direction: null, action: null, taxCodeName: largeUnicodeText,
+        autoPost: false, originIntent: null, sourceCaseId: null, sourceCandidateId: null,
+        changedBy: null, createdAt: '2026-07-28T00:00:00.000Z', repairReason: null,
+        affectedJournalEntryCount: 0, valid: false,
+        invalidReasons: Array.from({ length: 4 }, () => largeUnicodeText),
+      },
     }));
     const value = { items: largeRules, nextCursor: null };
     if (mirroredOnly) {
@@ -736,6 +723,7 @@ describe('stateless MCP handler', () => {
     }
     const operations = mockReads({
       listRules: vi.fn().mockResolvedValue({
+        runtimeMode: 'canonical',
         items: largeRules,
         nextCursor: null,
       }),

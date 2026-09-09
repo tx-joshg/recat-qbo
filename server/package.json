@@ -11,7 +11,9 @@
     "test": "npm run test:unit && npm run test:pg",
     "seed": "tsx src/seed.ts",
     "test:unit": "vitest run",
-    "test:pg": "vitest run --config vitest.pg.config.ts"
+    "test:pg": "vitest run --config vitest.pg.config.ts",
+    "rules:canonical-backfill": "node dist/cli/backfillCanonicalRules.js",
+    "rules:rollback-guard": "node dist/cli/prepareRuleRollback.js"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",

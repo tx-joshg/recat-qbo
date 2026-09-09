@@ -1,3 +1,4 @@
+import { hashRuleAutoPostValue } from './ruleAutoPostBinding.js';
 import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { mapPurchaseTaxSnapshot, preparePurchaseRecategorization, preparePurchaseRestore } from '../lib/qbo/purchaseTax.js';
 import { describe, expect, it, vi } from 'vitest';
@@ -17,6 +18,7 @@ import {
 } from '../lib/qbo/types.js';
 import {
   bulkPost,
+  commitRuleAutoPostPreparation,
   commitStagedCategorization,
   hashPreparedWriteBinding,
   hashStagedCategorization,
@@ -1893,6 +1895,40 @@ function commitInput(requestId = 'request-generic') {
   };
 }
 
+function decisionContext() {
+  return {
+    vendorIdentityHint: {
+      displayName: '  Generic\u00a0 Supplier  ',
+      qboVendorId: '  vendor-generic  ',
+    },
+    rationale: '  Reviewed against the synthetic receipt.  ',
+    requiredEvidence: ['  Synthetic receipt  '],
+    examples: ['  Synthetic invoice  '],
+    counterexamples: ['  Personal purchase  '],
+    citations: [{
+      url: 'https://example.invalid/policy',
+      title: '  Synthetic policy  ',
+      publisher: '  Example publisher  ',
+      retrievedAt: '2026-07-28T10:00:00.000Z',
+      claimSummary: '  The synthetic purchase is an expense.  ',
+    }],
+    reviewer: {
+      userId: DURABLE_ACTOR_ID,
+      configVersion: '  classification-v1  ',
+      decision: 'approved' as const,
+    },
+    originIntent: 'apply_once' as const,
+    jurisdiction: '  CA-BC  ',
+    currency: 'CAD',
+    context: {
+      transactionDirection: 'out' as const,
+      qboType: 'Purchase' as const,
+      sourceAccountName: '  Generic bank  ',
+      businessPurpose: '  Team supplies  ',
+    },
+  };
+}
+
 function seedAttempt(
   db: FakeDurableDb,
   status: string,
@@ -1997,6 +2033,390 @@ function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number)
 }
 
 describe('commitStagedCategorization durable lifecycle', () => {
+  it('derives null-actor authority only from the persisted rule auto-post preparation', async () => {
+    const fixture = durableDeps();
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockResolvedValue(structuredClone(verifiedPurchase));
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -1_000, taxCents: -50, totalCents: -1_050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1_000,
+        taxCents: -50,
+        totalCents: -1_050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        memo: 'Prepared purchase',
+        tagIds: [DURABLE_TAG_ID],
+      }],
+      tagIds: [DURABLE_TAG_ID],
+    };
+    const preparation = {
+      id: 'rule-preparation-generic',
+      companyId: DURABLE_COMPANY_ID,
+      transactionId: DURABLE_TRANSACTION_ID,
+      ruleId: 'rule-generic',
+      ruleRevision: 3,
+      requestId: 'rule-preparation-generic',
+      state: 'PREPARED',
+      inputHash: hashRuleAutoPostValue({
+        companyId: DURABLE_COMPANY_ID,
+        transactionId: DURABLE_TRANSACTION_ID,
+        ruleId: 'rule-generic',
+        ruleRevision: 3,
+      }),
+      proposal: {
+        taxCalculation: 'TaxInclusive',
+        lines: [{
+          grossCents: -1_050,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'tax-generic',
+          tagIds: [DURABLE_TAG_ID],
+        }],
+        tagIds: [DURABLE_TAG_ID],
+      },
+      proposalHash: '',
+      stagedGraphHash: hashStagedCategorization(staged),
+      sourceRevision: 0,
+      preparedRevision: 1,
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      qboSyncToken: '7',
+      commitStartedAt: null,
+    };
+    preparation.proposalHash = hashRuleAutoPostValue(preparation.proposal);
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    Object.assign(fixture.db, {
+      ruleAutoPostPreparation: {
+        findUnique: vi.fn(async () => preparation),
+        updateMany,
+      },
+    });
+
+    await commitRuleAutoPostPreparation(preparation.id, fixture.deps as never);
+
+    expect(fixture.authorize).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: preparation.id }),
+      data: expect.objectContaining({ state: 'COMMITTING' }),
+    }));
+  });
+
+  it('re-arms a persisted pre-send rule auto-post retry without caller authorization', async () => {
+    const fixture = durableDeps();
+    const preparation = {
+      id: 'rule-preparation-retry',
+      companyId: DURABLE_COMPANY_ID,
+      transactionId: DURABLE_TRANSACTION_ID,
+      ruleId: 'rule-generic',
+      ruleRevision: 3,
+      requestId: 'rule-preparation-retry',
+      state: 'RETRYABLE',
+      inputHash: hashRuleAutoPostValue({
+        companyId: DURABLE_COMPANY_ID,
+        transactionId: DURABLE_TRANSACTION_ID,
+        ruleId: 'rule-generic',
+        ruleRevision: 3,
+      }),
+      proposal: {
+        taxCalculation: 'TaxInclusive',
+        lines: [{
+          grossCents: -1_050,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'tax-generic',
+          tagIds: [DURABLE_TAG_ID],
+        }],
+        tagIds: [DURABLE_TAG_ID],
+      },
+      proposalHash: '',
+      stagedGraphHash: hashStagedCategorization({
+        ...stagedPurchase,
+        lines: stagedPurchase.lines.map((line) => ({ ...line, tagIds: [DURABLE_TAG_ID] })),
+        tagIds: [DURABLE_TAG_ID],
+      }),
+      sourceRevision: 0,
+      preparedRevision: 1,
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      qboSyncToken: '7',
+      commitStartedAt: new Date('2026-07-28T12:00:00.000Z'),
+    };
+    preparation.proposalHash = hashRuleAutoPostValue(preparation.proposal);
+    seedAttempt(fixture.db, 'RETRYABLE', preparation.requestId);
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    Object.assign(fixture.db, {
+      ruleAutoPostPreparation: {
+        findUnique: vi.fn(async () => preparation),
+        updateMany,
+      },
+    });
+
+    await commitRuleAutoPostPreparation(preparation.id, fixture.deps as never);
+
+    expect(fixture.authorize).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.db.attempts[0]!.status).toBe('VERIFIED');
+  });
+
+  it('captures only a new explicit browser approval and replays its original bound context', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.rawData = { CurrencyRef: { value: 'CAD' } };
+    const input = { ...commitInput(), captureManualApproval: true as const };
+    await commitStagedCategorization(input, fixture.deps);
+    const payload = fixture.db.attempts[0]!.requestPayload as Record<string, any>;
+    expect(payload.classificationDecision?.context).toMatchObject({
+      rationale: 'User approved the exact staged categorization in Recat.',
+      citations: [], requiredEvidence: [], examples: [], counterexamples: [],
+      reviewer: { userId: DURABLE_ACTOR_ID, configVersion: 'browser-staged-approval-v1', decision: 'approved' },
+      originIntent: 'apply_once', jurisdiction: 'unknown', currency: 'CAD',
+      context: { qboType: 'Purchase', transactionDirection: 'out', sourceAccountName: null, businessPurpose: null },
+    });
+    const original = structuredClone(payload.classificationDecision);
+    fixture.db.transactionRow.payee = 'Changed after approval';
+    fixture.db.transactionRow.rawData = { CurrencyRef: { value: 'USD' } };
+    await commitStagedCategorization(input, fixture.deps);
+    expect((fixture.db.attempts[0]!.requestPayload as Record<string, any>).classificationDecision).toEqual(original);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('records unknown currency and omits an unsafe payee without blocking a valid browser approval', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.rawData = { CurrencyRef: { value: 'not-a-currency' } };
+    fixture.db.transactionRow.payee = 'Unsafe\u0000payee';
+    await commitStagedCategorization({ ...commitInput(), captureManualApproval: true }, fixture.deps);
+    expect((fixture.db.attempts[0]!.requestPayload as Record<string, any>).classificationDecision.context)
+      .toMatchObject({ currency: 'XXX', jurisdiction: 'unknown', vendorIdentityHint: null });
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not invent approval context when a preexisting context-free request is replayed from the browser', async () => {
+    const fixture = durableDeps();
+    await commitStagedCategorization(commitInput(), fixture.deps);
+    const original = structuredClone(fixture.db.attempts[0]!.requestPayload);
+    await commitStagedCategorization({ ...commitInput(), captureManualApproval: true }, fixture.deps);
+    expect(fixture.db.attempts[0]!.requestPayload).toEqual(original);
+    expect((original as Record<string, unknown>).classificationDecision).toBeUndefined();
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects synthetic browser approval capture for MCP callers or an anonymous actor', async () => {
+    for (const overrides of [
+      { actor: { id: null, label: 'System' } },
+      { authorization: { kind: 'mcp' as const, tokenId: 'token', tokenPrefix: 'prefix' } },
+      { decisionContext: decisionContext() },
+    ]) {
+      const fixture = durableDeps();
+      await expect(commitStagedCategorization({ ...commitInput(), ...overrides, captureManualApproval: true }, fixture.deps))
+        .rejects.toMatchObject({ code: 'INVALID_DECISION_CONTEXT' });
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.db.attempts).toHaveLength(0);
+    }
+  });
+
+  it('persists normalized bounded decision context and binds every field without redefining the QBO request hash', async () => {
+    const fixture = durableDeps();
+    const input = {
+      ...commitInput(),
+      decisionContext: decisionContext(),
+    };
+
+    await commitStagedCategorization(input, fixture.deps);
+
+    const attempt = fixture.db.attempts[0]!;
+    const payload = attempt.requestPayload as Record<string, unknown>;
+    const prepared = payload as unknown as QboPreparedWrite;
+    expect(attempt.requestHash).toBe(hashPreparedWriteBody(prepared.body));
+    expect(payload.classificationDecision).toEqual({
+      version: 1,
+      context: {
+        vendorIdentityHint: {
+          displayName: 'Generic\u00a0 Supplier',
+          normalizedName: 'generic supplier',
+          qboVendorId: 'vendor-generic',
+        },
+        rationale: 'Reviewed against the synthetic receipt.',
+        requiredEvidence: ['Synthetic receipt'],
+        examples: ['Synthetic invoice'],
+        counterexamples: ['Personal purchase'],
+        citations: [{
+          url: 'https://example.invalid/policy',
+          title: 'Synthetic policy',
+          publisher: 'Example publisher',
+          retrievedAt: '2026-07-28T10:00:00.000Z',
+          claimSummary: 'The synthetic purchase is an expense.',
+        }],
+        reviewer: {
+          userId: DURABLE_ACTOR_ID,
+          configVersion: 'classification-v1',
+          decision: 'approved',
+        },
+        originIntent: 'apply_once',
+        jurisdiction: 'CA-BC',
+        currency: 'CAD',
+        context: {
+          transactionDirection: 'out',
+          qboType: 'Purchase',
+          sourceAccountName: 'Generic bank',
+          businessPurpose: 'Team supplies',
+        },
+      },
+      contextHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: 'request-generic',
+        decisionContext: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+          originIntent: 'apply_once',
+        }),
+      }),
+    );
+
+    const changes: Array<(value: ReturnType<typeof decisionContext>) => void> = [
+      (value) => { value.vendorIdentityHint.displayName = 'Different supplier'; },
+      (value) => { value.rationale = 'Different rationale'; },
+      (value) => { value.requiredEvidence = ['Different evidence']; },
+      (value) => { value.examples = ['Different example']; },
+      (value) => { value.counterexamples = ['Different counterexample']; },
+      (value) => { value.citations[0]!.claimSummary = 'Different cited claim'; },
+      (value) => { value.reviewer.configVersion = 'classification-v2'; },
+      (value) => { value.originIntent = 'make_recurring'; },
+      (value) => { value.jurisdiction = 'CA-ON'; },
+      (value) => { value.currency = 'USD'; },
+      (value) => { value.context.businessPurpose = 'Different purpose'; },
+    ];
+    for (const change of changes) {
+      const changed = decisionContext();
+      change(changed);
+      await expect(commitStagedCategorization({
+        ...commitInput(),
+        decisionContext: changed,
+      }, fixture.deps)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    }
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('anchors the bound outcome format even when decision context is omitted', async () => {
+    const fixture = durableDeps();
+
+    await commitStagedCategorization(commitInput('request-bound-without-decision'), fixture.deps);
+
+    const attempt = fixture.db.attempts[0]! as unknown as Record<string, unknown>;
+    expect(attempt).toMatchObject({
+      classificationEnvelopeVersion: 2,
+      classificationEnvelopeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      requestPayload: {
+        ruleCandidateFold: { version: 2 },
+        classificationEvidenceBinding: {
+          version: 1,
+          preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      },
+    });
+    expect((attempt.requestPayload as Record<string, unknown>).classificationDecision).toBeUndefined();
+  });
+
+  it('persists and replay-binds normalized decision context for dry runs without provider access', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.company.dryRun = true;
+    const context = decisionContext();
+
+    await commitStagedCategorization({
+      ...commitInput('request-dry-run-context'),
+      decisionContext: context,
+    }, fixture.deps);
+
+    expect(fixture.db.attempts[0]!.requestPayload).toMatchObject({
+      outcome: 'DRY_RUN',
+      classificationDecision: {
+        version: 1,
+        context: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+          currency: 'CAD',
+        }),
+        contextHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-dry-run-context'),
+      decisionContext: {
+        ...context,
+        rationale: 'A different dry-run rationale.',
+      },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects unbounded, unsafe, unapproved, or transaction-mismatched decision context before QBO access', async () => {
+    const base = decisionContext();
+    const invalidContexts = [
+      { ...base, rationale: 'x'.repeat(2_001) },
+      { ...base, examples: Array.from({ length: 21 }, (_, index) => `Example ${index}`) },
+      {
+        ...base,
+        citations: [{ ...base.citations[0]!, url: 'http://example.invalid/policy' }],
+      },
+      {
+        ...base,
+        reviewer: { ...base.reviewer, userId: '00000000-0000-4000-8000-000000000999' },
+      },
+      {
+        ...base,
+        context: { ...base.context, qboType: 'Deposit' as const },
+      },
+      {
+        ...base,
+        vendorIdentityHint: { ...base.vendorIdentityHint, displayName: 'Bad\u0000vendor' },
+      },
+    ];
+
+    for (const invalid of invalidContexts) {
+      const fixture = durableDeps();
+      await expect(commitStagedCategorization({
+        ...commitInput(),
+        decisionContext: invalid,
+      }, fixture.deps)).rejects.toMatchObject({ code: 'INVALID_DECISION_CONTEXT' });
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.attempts).toHaveLength(0);
+    }
+  });
+
+  it('emits an approved verified case even when the payee cannot form a rule candidate', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.payee = 'x';
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...currentQboTxn(),
+      payee: 'x',
+    });
+
+    await commitStagedCategorization({
+      ...commitInput(),
+      decisionContext: decisionContext(),
+    }, fixture.deps);
+
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: 'request-generic',
+        candidateContext: null,
+        decisionContext: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+        }),
+      }),
+    );
+  });
+
   it('keeps null actors forbidden on the public durable write path', async () => {
     const fixture = durableDeps();
     fixture.authorize.mockImplementation(async (actorId) => actorId !== null);

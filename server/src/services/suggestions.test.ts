@@ -3,10 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getInstanceSettings: vi.fn(),
   fetch: vi.fn(),
-  company: { findUnique: vi.fn() },
-  qboAccount: { findMany: vi.fn() },
+  company: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn() },
+  qboAccount: { findMany: vi.fn(), findFirst: vi.fn() },
+  tag: { count: vi.fn(), findMany: vi.fn() },
   rule: { findMany: vi.fn() },
   transaction: { findMany: vi.fn(), update: vi.fn() },
+  executeRawUnsafe: vi.fn(),
+  queryRaw: vi.fn(),
+  queryRawUnsafe: vi.fn(),
 }));
 
 vi.mock('./instanceSettings.js', () => ({ getInstanceSettings: mocks.getInstanceSettings }));
@@ -16,19 +20,50 @@ vi.mock('../lib/prisma.js', () => ({
     qboAccount: mocks.qboAccount,
     rule: mocks.rule,
     transaction: mocks.transaction,
+    transactionActionability: {},
+    $transaction: (callback: (tx: unknown) => Promise<unknown>) => callback({
+      company: mocks.company,
+      qboAccount: mocks.qboAccount,
+      tag: mocks.tag,
+      rule: mocks.rule,
+      transaction: mocks.transaction,
+      $executeRawUnsafe: mocks.executeRawUnsafe,
+      $queryRaw: mocks.queryRaw,
+      $queryRawUnsafe: mocks.queryRawUnsafe,
+    }),
   },
 }));
 
 import {
   historySuggestion,
+  canonicalRuleSuggestion,
   normalizePayee,
   pickSuggestion,
-  ruleSuggestion,
   refreshSuggestions,
+  ruleSuggestion,
   suggestFor,
+  suggestForMany,
   type HistoryTxnLike,
+  type CanonicalRuleLike,
   type RuleLike,
 } from './suggestions.js';
+
+function canonicalRule(
+  overrides: Partial<CanonicalRuleLike> & Pick<CanonicalRuleLike, 'id' | 'matchText' | 'direction'>,
+): CanonicalRuleLike {
+  return {
+    revision: 4,
+    category: overrides.direction === 'Deposit' ? 'Sales' : 'Meals',
+    categoryQboId: overrides.direction === 'Deposit' ? 'INCOME_ACCOUNT' : 'EXPENSE_ACCOUNT',
+    taxCalculation: 'NotApplicable',
+    taxCodeQboId: null,
+    tagIds: [],
+    autoPost: false,
+    priority: 10,
+    createdAt: new Date('2026-09-01T00:00:00.000Z'),
+    ...overrides,
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -39,10 +74,17 @@ beforeEach(() => {
     aiApiKey: 'test-key',
     suggestionModel: 'gpt-4o-mini',
   });
-  mocks.company.findUnique.mockResolvedValue({ holdingAccountIds: [] });
+  mocks.company.findUnique.mockResolvedValue({ holdingAccountIds: [], ruleRuntimeMode: 'legacy' });
+  mocks.queryRaw.mockResolvedValue([{ ruleRuntimeMode: 'legacy' }]);
+  mocks.queryRawUnsafe.mockResolvedValue([{ locked: 1 }]);
+  mocks.company.findUniqueOrThrow.mockResolvedValue({ holdingAccountIds: [] });
   mocks.qboAccount.findMany.mockResolvedValue([
     { qboId: '1', name: 'Office supplies' },
   ]);
+  mocks.qboAccount.findFirst.mockResolvedValue({ name: 'Meals', classification: 'Expenses' });
+  mocks.tag.count.mockResolvedValue(0);
+  mocks.tag.findMany.mockResolvedValue([]);
+  mocks.executeRawUnsafe.mockResolvedValue(0);
   mocks.rule.findMany.mockResolvedValue([]);
   mocks.transaction.findMany.mockResolvedValue([]);
   mocks.fetch.mockResolvedValue({
@@ -126,6 +168,142 @@ describe('ruleSuggestion', () => {
     const newer = rule({ id: 'new', matchText: 'SQUARE', category: 'Sales — beverage', priority: 0, createdAt: new Date('2026-06-01') });
     const got = ruleSuggestion('SQ *SQUARE INC', [older, newer]);
     expect(got).toMatchObject({ category: 'Sales — beverage', ruleId: 'new' });
+  });
+});
+
+describe('canonicalRuleSuggestion', () => {
+  it('loads only current enabled canonical rule rows for live advice', async () => {
+    mocks.company.findUnique.mockResolvedValue({ ruleRuntimeMode: 'canonical', holdingAccountIds: [] });
+    mocks.qboAccount.findMany.mockResolvedValue([{ qboId: 'EXPENSE_ACCOUNT', name: 'Meals', classification: 'Expenses' }]);
+    mocks.rule.findMany.mockResolvedValue([{
+      ...canonicalRule({ id: 'live-rule', matchText: 'Coffee', direction: 'Purchase' }),
+      companyId: 'company-1', enabled: true, retiredAt: null, reviewRequiredAt: null,
+      canonicalVersion: 2, ruleTags: [], candidateOrigin: null,
+    }]);
+
+    await expect(suggestForMany('company-1', [{
+      payee: 'Coffee House', amount: -10.5, qboType: 'Purchase',
+    }])).resolves.toEqual([expect.objectContaining({
+      source: 'rule', version: 2, ruleId: 'live-rule', ruleRevision: 4,
+    })]);
+    expect(mocks.rule.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        companyId: 'company-1', enabled: true, retiredAt: null,
+        reviewRequiredAt: null, repairReason: null, canonicalVersion: 2,
+      }),
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+    }));
+  });
+
+  it('never requests AI during a canonical page read even when AI hints are enabled', async () => {
+    mocks.company.findUnique.mockResolvedValue({ ruleRuntimeMode: 'canonical', holdingAccountIds: [] });
+    await expect(suggestForMany('canonical-page-hints', [{ payee: 'Unmatched supplier', amount: -17, qboType: 'Purchase' }]))
+      .resolves.toEqual([null]);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('uses a read-only snapshot and batch references without company mutation locks', async () => {
+    mocks.company.findUnique.mockResolvedValue({ ruleRuntimeMode: 'canonical', holdingAccountIds: [] });
+    mocks.qboAccount.findMany.mockResolvedValue([{ qboId: 'EXPENSE_ACCOUNT', name: 'Meals', classification: 'Expenses' }]);
+    mocks.rule.findMany.mockResolvedValue([{
+      ...canonicalRule({ id: 'live-rule', matchText: 'Coffee', direction: 'Purchase' }),
+      companyId: 'company-1', enabled: true, retiredAt: null, reviewRequiredAt: null,
+      canonicalVersion: 2, ruleTags: [], candidateOrigin: null,
+    }]);
+
+    await suggestForMany('company-1', [{
+      payee: 'Coffee House', amount: -10.5, qboType: 'Purchase',
+    }]);
+
+    expect(mocks.executeRawUnsafe).toHaveBeenCalledWith('SET TRANSACTION READ ONLY');
+    expect(mocks.queryRawUnsafe).not.toHaveBeenCalled();
+    expect(mocks.queryRaw).not.toHaveBeenCalled();
+    expect(mocks.qboAccount.findFirst).not.toHaveBeenCalled();
+    expect(mocks.qboAccount.findMany).toHaveBeenCalledTimes(1);
+    expect(mocks.tag.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns a revision-bound complete Purchase action', () => {
+    const purchase = canonicalRule({
+      id: 'purchase-rule',
+      matchText: 'Coffee',
+      direction: 'Purchase',
+      taxCalculation: 'TaxExcluded',
+      taxCodeQboId: 'PURCHASE_TAX',
+      tagIds: ['00000000-0000-4000-8000-000000000001'],
+      autoPost: true,
+    });
+
+    expect(canonicalRuleSuggestion(
+      { payee: 'Coffee House', qboType: 'Purchase' },
+      [purchase],
+    )).toEqual({
+      source: 'rule',
+      version: 2,
+      ruleId: 'purchase-rule',
+      ruleRevision: 4,
+      action: {
+        version: 2,
+        direction: 'Purchase',
+        category: 'Meals',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'PURCHASE_TAX',
+        tagIds: ['00000000-0000-4000-8000-000000000001'],
+      },
+      autoPost: true,
+    });
+  });
+
+  it('returns Deposit and No-tax actions without weakening either snapshot', () => {
+    const deposit = canonicalRule({
+      id: 'deposit-rule', matchText: 'Customer', direction: 'Deposit',
+      taxCalculation: 'TaxInclusive', taxCodeQboId: 'SALES_TAX',
+    });
+    const noTax = canonicalRule({
+      id: 'no-tax-rule', matchText: 'Bank fee', direction: 'Purchase',
+    });
+
+    expect(canonicalRuleSuggestion(
+      { payee: 'Customer payment', qboType: 'Deposit' },
+      [deposit, noTax],
+    )?.action).toMatchObject({
+      direction: 'Deposit', taxCalculation: 'TaxInclusive', taxCodeQboId: 'SALES_TAX',
+    });
+    expect(canonicalRuleSuggestion(
+      { payee: 'Monthly bank fee', qboType: 'Purchase' },
+      [deposit, noTax],
+    )?.action).toMatchObject({
+      direction: 'Purchase', taxCalculation: 'NotApplicable', taxCodeQboId: null,
+    });
+  });
+
+  it('uses priority, newest creation, then rule ID for the exact winner', () => {
+    const candidates = [
+      canonicalRule({ id: 'z-rule', matchText: 'Coffee', direction: 'Purchase' }),
+      canonicalRule({ id: 'a-rule', matchText: 'Coffee', direction: 'Purchase' }),
+      canonicalRule({
+        id: 'lower-priority', matchText: 'Coffee', direction: 'Purchase', priority: 11,
+        createdAt: new Date('2026-09-02T00:00:00.000Z'),
+      }),
+      canonicalRule({
+        id: 'older', matchText: 'Coffee', direction: 'Purchase',
+        createdAt: new Date('2026-08-31T00:00:00.000Z'),
+      }),
+    ];
+
+    expect(canonicalRuleSuggestion(
+      { payee: 'Coffee House', qboType: 'Purchase' },
+      candidates,
+    )?.ruleId).toBe('a-rule');
+  });
+
+  it('never matches a rule across transaction directions', () => {
+    const deposit = canonicalRule({ id: 'deposit', matchText: 'Coffee', direction: 'Deposit' });
+    expect(canonicalRuleSuggestion(
+      { payee: 'Coffee House', qboType: 'Purchase' },
+      [deposit],
+    )).toBeNull();
   });
 });
 
@@ -324,12 +502,20 @@ describe('AI cache binding', () => {
     expect(mocks.fetch).toHaveBeenCalledTimes(3);
   });
 
-  it('loads one category snapshot for all AI suggestions in a sync refresh', async () => {
-    const companyId = 'cache-batch-categories';
+  it.each([true, false])('loads one category snapshot and persists AI hints with rule snapshots %s', async (includeRuleSuggestions) => {
+    const companyId = `cache-batch-categories-${includeRuleSuggestions}`;
+    mocks.company.findUnique.mockResolvedValue({ holdingAccountIds: [], ruleRuntimeMode: 'canonical' });
+    mocks.rule.findMany.mockResolvedValue([]);
     const rows = [
       { id: 'txn-a', payee: 'Example supplier alpha', memo: null, amount: -25, suggestion: null },
       { id: 'txn-b', payee: 'Example supplier beta', memo: null, amount: -30, suggestion: null },
-    ];
+    ].map((row) => {
+      const date = new Date('2026-09-01T00:00:00.000Z');
+      const identity = { companyId, revision: 0, qboSyncToken: '1', qboType: 'Purchase', qboId: row.id };
+      return { ...row, ...identity, date, providerActionability: {
+        ...identity, transactionId: row.id, disposition: 'WRITABLE', checkedAt: new Date(), txnDate: date,
+      } };
+    });
     mocks.transaction.findMany.mockImplementation(async (args: { where: { status: unknown } }) => (
       args.where.status === 'PENDING' ? rows : []
     ));
@@ -338,13 +524,71 @@ describe('AI cache binding', () => {
       written.push(args.data.suggestion);
     });
 
-    await refreshSuggestions(companyId);
+    await refreshSuggestions(companyId, { includeRuleSuggestions });
+    if (!includeRuleSuggestions) expect(mocks.rule.findMany).not.toHaveBeenCalled();
 
     expect(written).toEqual([
       { category: 'Office supplies', categoryQboId: '1', source: 'ai' },
       { category: 'Office supplies', categoryQboId: '1', source: 'ai' },
     ]);
-    expect(mocks.company.findUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.getInstanceSettings).toHaveBeenCalledTimes(1);
     expect(mocks.qboAccount.findMany).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('legacy rule suggestion runtime gate', () => {
+  it.each(['legacy', 'bridge', 'paused', 'canonical'])(
+    'does not project category-only rules in %s mode',
+    async (mode) => {
+      mocks.company.findUnique.mockResolvedValue({
+        holdingAccountIds: [],
+        ruleRuntimeMode: mode,
+      });
+      mocks.queryRaw.mockResolvedValue([{ ruleRuntimeMode: mode }]);
+      mocks.rule.findMany.mockResolvedValue(
+        mode === 'canonical' ? [] : [rule({ matchText: 'VENDOR', category: 'Meals' })],
+      );
+
+      await expect(suggestForMany('company-1', [{ payee: 'VENDOR', amount: -10 }]))
+        .resolves.toEqual([null]);
+      if (mode === 'canonical') expect(mocks.rule.findMany).toHaveBeenCalledTimes(1);
+      else expect(mocks.rule.findMany).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('refreshSuggestions provider eligibility', () => {
+  it('treats a legacy cleared snapshot as eligible for a suggestion', async () => {
+    const now = new Date();
+    mocks.transaction.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        id: 'txn-blocked',
+        companyId: 'company-1',
+        revision: 0,
+        qboSyncToken: '1',
+        qboType: 'Purchase',
+        qboId: '100',
+        date: now,
+        payee: 'PRIVATE BLOCKED PAYEE',
+        memo: null,
+        amount: -10,
+        suggestion: { category: 'Old', source: 'ai' },
+        providerActionability: {
+          companyId: 'company-1',
+          transactionId: 'txn-blocked',
+          disposition: 'BLOCKED_CLEARED',
+          checkedAt: now,
+          revision: 0,
+          qboSyncToken: '1',
+          qboType: 'Purchase',
+          qboId: '100',
+          txnDate: now,
+        },
+      }]);
+
+    await refreshSuggestions('company-1');
+
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   actionabilityEnabled: vi.fn(),
+  recoverRuleAutoPosts: vi.fn(),
   audit: vi.fn(),
   refreshTaxReference: vi.fn(),
   refreshSuggestions: vi.fn(),
@@ -74,11 +75,22 @@ vi.mock('./tax/reference.js', () => ({ refreshTaxReference: mocks.refreshTaxRefe
 vi.mock('./audit.js', () => ({ writeAudit: mocks.audit }));
 vi.mock('./writeback.js', () => ({
   postTransaction: mocks.postTransaction,
+  commitRuleAutoPostPreparation: vi.fn(),
+  reconcileRuleAutoPostPreparation: vi.fn(),
+  hashStagedCategorization: vi.fn(() => 'a'.repeat(64)),
+}));
+vi.mock('./ruleAutoPost.js', () => ({
+  recoverRuleAutoPosts: mocks.recoverRuleAutoPosts,
+  prepareRuleAutoPost: vi.fn(), resumeRuleAutoPost: vi.fn(),
+}));
+vi.mock('./ruleSafetyTransition.js', () => ({
+  disableRuleForSafetyInTransaction: mocks.disableRuleForSafety,
 }));
 
 import {
   refreshMirroredTransaction,
   replaceAccountReferenceCache,
+  runCanonicalRuleAutoPosts,
   syncCompany,
 } from './sync.js';
 
@@ -136,6 +148,7 @@ function qboTxn(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.actionabilityEnabled.mockReturnValue(false);
+  mocks.recoverRuleAutoPosts.mockResolvedValue({ examined: 0, completed: 0, pending: 0, failed: 0 });
   mocks.companyFindUnique.mockResolvedValue({
     id: 'company-1', holdingAccountIds: [], lastSyncedAt: null,
     ruleRuntimeMode: 'legacy',
@@ -161,7 +174,117 @@ beforeEach(() => {
 });
 
 describe('syncCompany', () => {
-  it('replaces the account cache and inactivates omitted accounts', async () => {
+  it('recovers durable rule writes before preparing new canonical winners and isolates row failures', async () => {
+    const events: string[] = [];
+    const recover = vi.fn(async () => {
+      events.push('recover');
+      return { examined: 1, completed: 1, pending: 0, failed: 0 };
+    });
+    const prepare = vi.fn(async ({ transactionId }) => {
+      events.push(`prepare:${transactionId}`);
+      if (transactionId === 'txn-fail') throw new Error('stale row');
+      return { preparationId: `prep:${transactionId}` };
+    });
+    const resume = vi.fn(async (preparationId) => {
+      events.push(`resume:${preparationId}`);
+    });
+    const loadState = vi.fn(async () => 'VERIFIED');
+
+    await expect(runCanonicalRuleAutoPosts('company-1', {
+      recover,
+      prepare,
+      resume,
+      loadState,
+      listCandidates: vi.fn(async () => [
+        { transactionId: 'txn-ok', ruleId: 'rule-ok', ruleRevision: 3 },
+        { transactionId: 'txn-fail', ruleId: 'rule-fail', ruleRevision: 4 },
+      ]),
+    })).resolves.toEqual({ recovered: 1, autoPosted: 1, failed: 1 });
+
+    expect(events).toEqual([
+      'recover',
+      'prepare:txn-ok',
+      'resume:prep:txn-ok',
+      'prepare:txn-fail',
+    ]);
+  });
+
+  it('does not count an unresolved durable preparation as auto-posted', async () => {
+    await expect(runCanonicalRuleAutoPosts('company-1', {
+      recover: vi.fn(async () => ({ examined: 0, completed: 0, pending: 0, failed: 0 })),
+      prepare: vi.fn(async () => ({ preparationId: 'prep-pending' })),
+      resume: vi.fn(async () => undefined),
+      loadState: vi.fn(async () => 'UNCERTAIN'),
+      listCandidates: vi.fn(async () => [
+        { transactionId: 'txn-pending', ruleId: 'rule-pending', ruleRevision: 3 },
+      ]),
+    })).resolves.toEqual({ recovered: 0, autoPosted: 0, failed: 0 });
+  });
+
+  it('retains canonical automatic write failures in the durable sync message', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1', holdingAccountIds: [], lastSyncedAt: null,
+      ruleRuntimeMode: 'canonical',
+    });
+    mocks.recoverRuleAutoPosts.mockResolvedValue({ examined: 2, completed: 0, pending: 0, failed: 2 });
+    const result = await syncWithMutations('company-1', 'manual', mutationDeps());
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain('2 auto-post failures');
+    expect(mocks.syncLogCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({ message: result.message }),
+    });
+  });
+
+  it('refreshes canonical AI/history hints without restoring rule snapshots or legacy auto-post', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1', holdingAccountIds: [], lastSyncedAt: null,
+      ruleRuntimeMode: 'canonical',
+    });
+
+    await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(mocks.refreshSuggestions).toHaveBeenCalledWith('company-1', { includeRuleSuggestions: false });
+    expect(mocks.postTransaction).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdateMany).toHaveBeenCalledWith({
+      where: {
+        companyId: 'company-1',
+        status: 'PENDING',
+        suggestion: { path: ['source'], equals: 'rule' },
+      },
+      data: { suggestion: expect.anything() },
+    });
+  });
+
+  it('clears legacy suggestions when a sync crosses the paused cutover boundary', async () => {
+    const bridge = {
+      id: 'company-1', holdingAccountIds: [], lastSyncedAt: null,
+      ruleRuntimeMode: 'bridge',
+    };
+    mocks.companyFindUnique
+      .mockResolvedValueOnce(bridge)
+      .mockResolvedValueOnce({ ruleRuntimeMode: 'bridge' })
+      .mockResolvedValueOnce({ ruleRuntimeMode: 'paused' });
+
+    await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(mocks.refreshSuggestions).toHaveBeenCalledTimes(1);
+    expect(mocks.transactionUpdateMany).toHaveBeenCalledWith({
+      where: {
+        companyId: 'company-1',
+        status: 'PENDING',
+        suggestion: { path: ['source'], equals: 'rule' },
+      },
+      data: { suggestion: expect.anything() },
+    });
+    expect(mocks.postTransaction).not.toHaveBeenCalled();
+  });
+
+  it('inactivates omitted accounts and safety-disables rules with invalid category references', async () => {
+    mocks.ruleReferenceFindMany.mockResolvedValue([
+      { id: 'purchase-missing', revision: 3, direction: 'Purchase', categoryQboId: 'missing' },
+      { id: 'deposit-wrong-direction', revision: 7, direction: 'Deposit', categoryQboId: 'expense' },
+      { id: 'purchase-valid', revision: 4, direction: 'Purchase', categoryQboId: 'expense' },
+    ]);
 
     await replaceAccountReferenceCache('company-1', [{
       qboId: 'expense',
@@ -176,8 +299,14 @@ describe('syncCompany', () => {
       where: { companyId: 'company-1', qboId: { notIn: ['expense'] } },
       data: { active: false },
     });
-    expect(mocks.qboAccountUpsert).toHaveBeenCalledWith(expect.objectContaining({
-      update: expect.objectContaining({ fullName: 'Expenses · Meals', active: true }),
+    expect(mocks.disableRuleForSafety).toHaveBeenCalledTimes(2);
+    expect(mocks.disableRuleForSafety).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: 'company-1', ruleId: 'purchase-missing', expectedRevision: 3,
+      actor: 'system:account-reference-refresh',
+    }));
+    expect(mocks.disableRuleForSafety).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: 'company-1', ruleId: 'deposit-wrong-direction', expectedRevision: 7,
+      actor: 'system:account-reference-refresh',
     }));
   });
 
@@ -488,25 +617,6 @@ describe('syncCompany', () => {
     expect(mocks.audit).not.toHaveBeenCalled();
   });
 
-  it('retains automatic write failures in the durable sync message', async () => {
-    mocks.transactionFindMany.mockImplementation(async ({ where }) => where?.status === 'PENDING' ? [{
-      ...qboTxn(), id: 'sync-failure-fixture', companyId: 'company-1',
-      qboSyncToken: '7', revision: 4, status: 'PENDING', category: null,
-      txnTags: [], _count: { splitLines: 0 },
-      suggestion: { source: 'rule', ruleId: 'rule-fixture', category: 'Office supplies' },
-    }] : []);
-    mocks.ruleFindMany.mockResolvedValue([{
-      id: 'rule-fixture', autoPost: true, category: 'Office supplies',
-      categoryQboId: 'expense-fixture', ruleTags: [],
-    }]);
-    mocks.postTransaction.mockResolvedValue({ ok: false, error: { message: 'Synthetic validation failure' } });
-    await syncWithMutations('company-1', 'nightly', mutationDeps());
-    expect(mocks.postTransaction).toHaveBeenCalledOnce();
-    expect(mocks.syncLogCreate).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ message: expect.stringContaining('1 auto-post failure') }),
-    }));
-  });
-
   it('does not stage auto-post fields while a transfer owns the entity', async () => {
     const pending = {
       ...qboTxn(),
@@ -559,4 +669,68 @@ describe('syncCompany', () => {
     expect(mocks.postTransaction).not.toHaveBeenCalled();
   });
 
+  it('keeps the legacy category-only auto-post path fail-closed', async () => {
+    mocks.actionabilityEnabled.mockReturnValue(true);
+    const checkedAt = new Date();
+    const pending = (id: string, ruleId: string, disposition: 'WRITABLE' | 'UNKNOWN') => ({
+      ...qboTxn({ qboId: `qbo-${id}` }),
+      id,
+      companyId: 'company-1',
+      qboSyncToken: '7',
+      revision: 4,
+      status: 'PENDING',
+      suggestion: { source: 'rule', ruleId, category: 'Generic category' },
+      category: null,
+      categoryQboId: null,
+      txnTags: [],
+      _count: { splitLines: 0 },
+      providerActionability: {
+        companyId: 'company-1',
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 4,
+        qboSyncToken: '7',
+        qboType: 'Purchase',
+        qboId: `qbo-${id}`,
+        txnDate: '2026-07-29',
+        bankAccountQboId: 'bank-generic',
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+        unavailableCode: null,
+        unavailableReason: null,
+      },
+    });
+    const activeWritable = pending('active-writable', 'rule-active', 'WRITABLE');
+    const retiredWritable = pending('retired-writable', 'rule-retired', 'WRITABLE');
+    const activeUnknown = pending('active-unknown', 'rule-active', 'UNKNOWN');
+    mocks.transactionFindMany.mockImplementation(async ({ where, select }) => {
+      if (select?.qboType) return [];
+      if (where?.status?.in) return [];
+      if (where?.status === 'PENDING') return [activeWritable, retiredWritable, activeUnknown];
+      return [];
+    });
+    mocks.ruleFindMany.mockImplementation(async ({ where }) => {
+      const rules = [
+        {
+          id: 'rule-active', enabled: true, retiredAt: null, autoPost: true,
+          category: 'Generic category', categoryQboId: 'account-generic', ruleTags: [],
+        },
+        {
+          id: 'rule-retired', enabled: false, retiredAt: checkedAt, autoPost: true,
+          category: 'Retired category', categoryQboId: 'account-retired', ruleTags: [],
+        },
+      ];
+      return where.enabled === true && where.retiredAt === null
+        ? rules.filter((rule) => rule.enabled && rule.retiredAt === null)
+        : rules;
+    });
+
+    await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(mocks.ruleFindMany).not.toHaveBeenCalled();
+    expect(mocks.postTransaction).not.toHaveBeenCalled();
+    expect(mocks.txnTagUpsert).not.toHaveBeenCalled();
+  });
 });

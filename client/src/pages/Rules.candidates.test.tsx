@@ -1,306 +1,404 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { RuleCandidateDto } from '@recat/shared';
+import type { RuleCandidateDto, RuleDetailDto, RuleMutationKind, RuleMutationResult } from '@recat/shared';
 
 const mocks = vi.hoisted(() => ({
-  listRules: vi.fn(),
-  listCandidates: vi.fn(),
-  activate: vi.fn(),
-  dismiss: vi.fn(),
+  lifecycle: vi.fn(), detail: vi.fn(), testRule: vi.fn(),
+  candidates: vi.fn(), getCandidate: vi.fn(), prepare: vi.fn(), commit: vi.fn(),
   toast: vi.fn(),
-  activeCompanyId: 'COMPANY_GENERIC',
-  activeCompany: { id: 'COMPANY_GENERIC', holdingAccountIds: ['DESIGNATED_HOLDING'] } as never,
+  activeCompanyId: 'company-a' as string | null,
+  activeCompany: { id: 'company-a', holdingAccountIds: ['holding-designated'] } as { id: string; holdingAccountIds: string[] } | null,
 }));
 
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({
-    activeCompanyId: mocks.activeCompanyId,
-    activeCompany: mocks.activeCompany,
+    activeCompanyId: mocks.activeCompanyId, activeCompany: mocks.activeCompany,
     accounts: [
-      {
-        qboId: 'ACCOUNT_GENERIC',
-        name: 'Office expense',
-        classification: 'Expenses',
-      },
-      {
-        qboId: 'LOCALIZED_HOLDING',
-        name: 'Uncategorised Expense',
-        classification: 'Expenses',
-      },
-      {
-        qboId: 'DESIGNATED_HOLDING',
-        name: 'Uncategorized Expenses Pending Review',
-        classification: 'Expenses',
-      },
+      { id: 'expense-db', qboId: 'expense-a', name: 'Office expense', classification: 'Expenses' },
+      { id: 'holding-localized', qboId: 'holding-localized', name: 'Uncategorised Expense', classification: 'Expenses' },
+      { id: 'holding-designated', qboId: 'holding-designated', name: 'Pending Review', classification: 'Expenses' },
     ],
-    tags: [{
-      id: '11111111-1111-4111-8111-111111111111',
-      name: 'Reviewed',
-      color: '#64748b',
-    }],
+    tags: [{ id: 'tag-a', companyId: 'company-a', name: 'Reviewed', color: '#64748b' }],
     taxReadiness: {
-      status: 'ready',
-      reason: null,
-      usingSalesTax: true,
-      refreshedAt: '2026-07-30T00:00:00.000Z',
-      taxCodes: [],
+      status: 'ready', reason: null, usingSalesTax: true, refreshedAt: '2026-09-01T00:00:00.000Z', taxCodes: [],
+      salesStatus: 'ready', salesReason: null, salesTaxCodes: [],
     },
     toast: mocks.toast,
   }),
 }));
 
 vi.mock('../lib/api', () => ({
+  createCategorizationRequestId: vi.fn(() => '99999999-9999-4999-8999-999999999999'),
+  ruleOperations: { prepare: mocks.prepare, commit: mocks.commit },
   rules: {
-    list: mocks.listRules,
-    create: vi.fn(),
-    patch: vi.fn(),
-    del: vi.fn(),
-    reorder: vi.fn(),
-    test: vi.fn(),
+    lifecycle: mocks.lifecycle, detail: mocks.detail,
+    test: mocks.testRule,
   },
-  ruleCandidates: {
-    list: mocks.listCandidates,
-    activate: mocks.activate,
-    dismiss: mocks.dismiss,
-  },
+  ruleCandidates: { list: mocks.candidates, get: mocks.getCandidate },
 }));
 
 import Rules from './Rules';
 
-beforeEach(() => {
-  vi.clearAllMocks();
-  mocks.activeCompanyId = 'COMPANY_GENERIC';
-  mocks.activeCompany = { id: 'COMPANY_GENERIC', holdingAccountIds: ['DESIGNATED_HOLDING'] } as never;
-});
-
-function candidate(overrides: Partial<RuleCandidateDto> = {}): RuleCandidateDto {
+function rule(overrides: Partial<RuleDetailDto> = {}): RuleDetailDto {
   return {
-    id: '22222222-2222-4222-8222-222222222222',
-    companyId: 'COMPANY_GENERIC',
-    state: 'ready',
-    matchField: 'payee',
-    matchText: 'northwind market',
-    category: 'Office expense',
-    categoryQboId: 'ACCOUNT_GENERIC',
-    taxCalculation: 'NotApplicable',
-    taxCode: null,
-    taxCodeQboId: null,
-    tagIds: ['11111111-1111-4111-8111-111111111111'],
-    evidenceCount: 3,
-    conflictingEvidenceCount: 0,
-    evidenceThreshold: 3,
-    schemaVersion: 'rule-candidate-v1',
-    configVersion: 'config-neutral',
-    staleReasons: [],
-    canActivate: true,
-    activatedRuleId: null,
-    provenance: {
-      user: 2,
-      autopilot: 1,
-      mcp: 0,
+    state: 'enabled', reviewRequiredAt: null, reviewReason: null, repairReason: null,
+    revision: {
+      id: 'revision-3', ruleId: 'rule-a', companyId: 'company-a', revision: 3,
+      state: 'enabled', condition: { matchField: 'payee', matchText: 'Generic supplier' }, direction: 'Purchase',
+      action: {
+        version: 2, direction: 'Purchase', category: 'Office expense', categoryQboId: 'expense-a',
+        taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [],
+      },
+      taxCodeName: null, autoPost: false, originIntent: null, sourceCaseId: null,
+      sourceCandidateId: null, changedBy: 'user-a', createdAt: '2026-09-01T00:00:00.000Z',
+      repairReason: null, affectedJournalEntryCount: 0, valid: true, invalidReasons: [],
     },
-    evidence: [
-      {
-        transactionId: '33333333-3333-4333-8333-333333333333',
-        source: 'user',
-        observedAt: '2026-07-30T00:00:00.000Z',
-      },
-      {
-        transactionId: '44444444-4444-4444-8444-444444444444',
-        source: 'autopilot',
-        observedAt: '2026-07-29T00:00:00.000Z',
-      },
-      {
-        transactionId: '55555555-5555-4555-8555-555555555555',
-        source: 'user',
-        observedAt: '2026-07-28T00:00:00.000Z',
-      },
-    ],
-    updatedAt: '2026-07-30T00:00:00.000Z',
     ...overrides,
   };
 }
 
+function candidate(overrides: Partial<RuleCandidateDto> = {}): RuleCandidateDto {
+  return {
+    id: 'candidate-a', companyId: 'company-a', state: 'ready', matchField: 'payee',
+    matchText: 'northwind market', category: 'Office expense', categoryQboId: 'expense-a',
+    taxCalculation: 'NotApplicable', taxCode: null, taxCodeQboId: null, tagIds: ['tag-a'],
+    evidenceCount: 3, conflictingEvidenceCount: 0, evidenceThreshold: 3,
+    schemaVersion: 'rule-candidate-v1', configVersion: 'config-neutral', staleReasons: [],
+    canActivate: true, activatedRuleId: null,
+    provenance: { user: 2, autopilot: 1, mcp: 0 },
+    evidence: [{ transactionId: 'transaction-a', source: 'user', observedAt: '2026-09-01T00:00:00.000Z' }],
+    updatedAt: '2026-09-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function prepared(mutation: RuleMutationKind): RuleMutationResult {
+  return {
+    ok: true, operationId: `operation-${mutation}`, companyId: 'company-a', mutation,
+    originIntent: mutation.includes('candidate') ? 'auto_candidate' : null,
+    status: 'PREPARED', ruleId: mutation.includes('candidate') ? null : 'rule-a',
+    revision: null, rule: null, candidate: null, error: null,
+    preview: {
+      operationId: `operation-${mutation}`, companyId: 'company-a',
+      ruleId: mutation.includes('candidate') ? null : 'rule-a',
+      candidateId: mutation.includes('candidate') ? 'candidate-a' : null,
+      mutation, originIntent: mutation.includes('candidate') ? 'auto_candidate' : null,
+      currentRevision: mutation.includes('candidate') ? 0 : 3, proposedRevision: 4,
+      condition: { matchField: 'payee', matchText: 'northwind market' }, direction: 'Purchase',
+      action: { categoryQboId: 'expense-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: ['tag-a'] },
+      categoryName: 'Office expense', taxCodeName: null, autoPost: false,
+      affectedPendingCount: 2, affectedProcessedCount: 1, sampleTransactions: [], conflicts: [], warnings: [],
+      expiresAt: '2026-09-01T01:00:00.000Z', preparationDigest: 'digest',
+    },
+  };
+}
+
+function renderRules() { return render(<MemoryRouter><Rules /></MemoryRouter>); }
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.activeCompanyId = 'company-a';
+  mocks.activeCompany = { id: 'company-a', holdingAccountIds: ['holding-designated'] };
+  mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [], nextCursor: null });
+  mocks.detail.mockResolvedValue(rule());
+  mocks.candidates.mockResolvedValue({ candidates: [], nextCursor: null });
+  mocks.getCandidate.mockResolvedValue(candidate());
+  window.history.replaceState({}, '', '/rules');
+});
+
 describe('Rules candidate review', () => {
-  // The name test only knows QuickBooks' built-ins. An account the operator
-  // designated as a holding account under their own name must still never be a
-  // rule destination — an auto-post rule would file transactions straight back
-  // into the account Recat is watching.
-  it('excludes a designated holding account whatever the operator named it', async () => {
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
+  it('excludes configured and localized holding accounts from rule destinations', async () => {
+    mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
+    const user = userEvent.setup();
+    renderRules();
 
-    render(<Rules />);
-
-    await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
-    expect(screen.queryAllByRole('option', {
-      name: /Uncategorized Expenses Pending Review/,
-    })).toHaveLength(0);
-    // The ordinary account is still offered, so this is exclusion and not an
-    // empty list.
-    expect(screen.getAllByRole('option', {
-      name: 'Expenses · Office expense',
-    })).not.toHaveLength(0);
+    await user.click(await screen.findByRole('combobox', { name: 'Category' }));
+    expect(screen.getByRole('option', { name: 'Expenses · Office expense' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Uncategorised Expense|Pending Review/ })).not.toBeInTheDocument();
   });
 
-  it('excludes localized Uncategorised holding accounts from category destinations', async () => {
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
-
-    render(<Rules />);
-
-    await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
-    expect(screen.queryAllByRole('option', {
-      name: /Uncategorised Expense/,
-    })).toHaveLength(0);
-    expect(screen.getAllByRole('option', {
-      name: 'Expenses · Office expense',
-    })).not.toHaveLength(0);
-  });
-
-  it('explains verified provenance and activates an inert candidate explicitly', async () => {
+  it('explains candidate provenance and activates through prepare then commit', async () => {
     const ready = candidate();
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockResolvedValue({
-      candidates: [ready],
-      nextCursor: null,
+    mocks.candidates.mockResolvedValueOnce({ candidates: [ready], nextCursor: null })
+      .mockResolvedValue({ candidates: [], nextCursor: null });
+    mocks.prepare.mockResolvedValue(prepared('activate_candidate'));
+    mocks.commit.mockResolvedValue({
+      ...prepared('activate_candidate'), status: 'COMMITTED', preview: null,
+      candidate: { candidateId: ready.id, state: 'activated', ruleId: 'rule-created' },
     });
-    mocks.activate.mockResolvedValue({
-      ...ready,
-      state: 'activated',
-      canActivate: false,
-      activatedRuleId: '66666666-6666-4666-8666-666666666666',
+    const user = userEvent.setup();
+    renderRules();
+
+    expect(await screen.findByText('northwind market')).toBeInTheDocument();
+    expect(screen.getByText(/3 verified outcomes.*2 reviewed by a person.*1 by autopilot/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Activate rule' }));
+    expect(mocks.prepare).toHaveBeenCalledWith('company-a', {
+      mutation: 'activate_candidate', candidateId: ready.id, expectedRevision: 0,
+      idempotencyKey: '99999999-9999-4999-8999-999999999999',
     });
-
-    render(<Rules />);
-
-    expect(await screen.findByText('Learned rule candidates')).toBeInTheDocument();
-    expect(screen.getByText('northwind market')).toBeInTheDocument();
-    expect(screen.getByText(/3 verified outcomes/i)).toBeInTheDocument();
-    expect(screen.getByText(/2 reviewed by a person · 1 by autopilot/i)).toBeInTheDocument();
-    expect(screen.getByText(/never posts automatically/i)).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole('button', { name: 'Activate rule' }));
-
-    await waitFor(() => {
-      expect(mocks.activate).toHaveBeenCalledWith(
-        'COMPANY_GENERIC',
-        ready.id,
-      );
-    });
+    expect(screen.getByText(/2 pending.*1 processed/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Confirm activate candidate' }));
+    await waitFor(() => expect(mocks.commit).toHaveBeenCalled());
     expect(screen.queryByText('northwind market')).not.toBeInTheDocument();
-    expect(mocks.listRules).toHaveBeenCalledTimes(2);
   });
 
-  it('shows conflicts and stale references without an activation control', async () => {
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockResolvedValue({
-      candidates: [candidate({
-        state: 'conflict',
-        canActivate: false,
-        conflictingEvidenceCount: 1,
-        staleReasons: ['The category reference is no longer active.'],
-      })],
+  it('shows conflicting evidence and stale references without activation', async () => {
+    mocks.candidates.mockResolvedValue({
+      candidates: [candidate({ state: 'conflict', canActivate: false, conflictingEvidenceCount: 1, staleReasons: ['Category unavailable.'] })],
       nextCursor: null,
     });
-
-    render(<Rules />);
-
+    renderRules();
     expect(await screen.findByText(/1 conflicting outcome/i)).toBeInTheDocument();
-    expect(screen.getByText(/category reference is no longer active/i)).toBeInTheDocument();
+    expect(screen.getByText('Category unavailable.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Activate rule' })).not.toBeInTheDocument();
   });
 
-  it('loads every bounded page for review on demand', async () => {
-    const first = candidate();
-    const second = candidate({
-      id: '77777777-7777-4777-8777-777777777777',
-      matchText: 'contoso services',
-    });
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockImplementation(async (
-      _companyId: string,
-      cursor?: string,
-    ) => cursor
-      ? { candidates: [second], nextCursor: null }
-      : { candidates: [first], nextCursor: first.id });
-
-    render(<Rules />);
-
-    expect(await screen.findByText('northwind market')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Load more candidates' }));
-
-    expect(await screen.findByText('contoso services')).toBeInTheDocument();
-    expect(mocks.listCandidates).toHaveBeenLastCalledWith(
-      'COMPANY_GENERIC',
-      first.id,
-    );
-    expect(screen.queryByRole('button', { name: 'Load more candidates' })).not.toBeInTheDocument();
+  it('rehydrates a linked rule that is outside the current state page', async () => {
+    const linked = rule({ revision: { ...rule().revision, ruleId: 'rule-linked', condition: { matchField: 'payee', matchText: 'Linked supplier' } } });
+    mocks.detail.mockResolvedValue(linked);
+    window.history.replaceState({}, '', '/rules?source=rule&sourceId=rule-linked');
+    renderRules();
+    expect(await screen.findByText('Linked supplier')).toBeInTheDocument();
+    expect(mocks.detail).toHaveBeenCalledWith('company-a', 'rule-linked');
   });
 
-  it('keeps the next page reachable after acting on the final visible candidate', async () => {
-    const ready = candidate();
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockResolvedValue({
-      candidates: [ready],
-      nextCursor: ready.id,
+  it('routes a linked disabled rule requiring reactivation review through Review and save only', async () => {
+    const linked = rule({
+      state: 'disabled',
+      reviewReason: 'This rule requires review before reactivation.',
+      revision: { ...rule().revision, state: 'disabled', ruleId: 'rule-linked', condition: { matchField: 'payee', matchText: 'Linked supplier' } },
     });
-    mocks.activate.mockResolvedValue({
-      ...ready,
-      state: 'activated',
-      canActivate: false,
-      activatedRuleId: '66666666-6666-4666-8666-666666666666',
-    });
+    mocks.detail.mockResolvedValue(linked);
+    window.history.replaceState({}, '', '/rules?source=rule&sourceId=rule-linked');
+    renderRules();
+    expect(await screen.findByText('Linked supplier')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disabled' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Save rule' })).not.toBeInTheDocument();
+    expect(screen.getByText(/This rule requires review before reactivation/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Review and save' }));
+    expect(mocks.prepare).toHaveBeenCalledWith('company-a', expect.objectContaining({
+      mutation: 'review', ruleId: 'rule-linked', proposal: expect.objectContaining({ reviewReason: 'Reviewed and saved.' }),
+    }));
+  });
 
-    render(<Rules />);
+  it('tests the current draft with its required direction', async () => {
+    mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
+    mocks.testRule.mockResolvedValue({
+      matches: [], pendingCount: 4, processedCount: 2,
+      conflicts: [{ ruleId: 'other', matchText: 'supplier', category: 'Travel', priority: 2 }],
+    });
+    renderRules();
+    await userEvent.click(await screen.findByRole('button', { name: 'Test rule' }));
+    expect(mocks.testRule).toHaveBeenCalledWith('company-a', 'Generic supplier', 'Purchase');
+    expect(await screen.findByText(/4 pending.*2 processed.*1 conflicts/i)).toBeInTheDocument();
+  });
+
+  it('dismisses a candidate through the governed preview', async () => {
+    mocks.candidates.mockResolvedValue({ candidates: [candidate()], nextCursor: null });
+    mocks.prepare.mockResolvedValue(prepared('dismiss_candidate'));
+    mocks.commit.mockResolvedValue({
+      ...prepared('dismiss_candidate'), status: 'COMMITTED', preview: null,
+      candidate: { candidateId: 'candidate-a', state: 'dismissed', ruleId: null },
+    });
+    const user = userEvent.setup();
+    renderRules();
+    await user.click(await screen.findByRole('button', { name: 'Dismiss' }));
+    expect(mocks.prepare).toHaveBeenCalledWith('company-a', expect.objectContaining({ mutation: 'dismiss_candidate' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm dismiss candidate' }));
+    expect(mocks.commit).toHaveBeenCalled();
+  });
+
+  it('loads and deduplicates bounded candidate pages', async () => {
+    const first = candidate();
+    const second = candidate({ id: 'candidate-b', matchText: 'contoso services' });
+    mocks.candidates.mockImplementation(async (_companyId: string, cursor?: string) => cursor
+      ? { candidates: [first, second], nextCursor: null }
+      : { candidates: [first], nextCursor: 'next' });
+    renderRules();
+    await userEvent.click(await screen.findByRole('button', { name: 'Load more candidates' }));
+    expect(await screen.findByText('contoso services')).toBeInTheDocument();
+    expect(screen.getAllByText('northwind market')).toHaveLength(1);
+  });
+
+  it('keeps a candidate load failure visible and retries it independently', async () => {
+    mocks.candidates.mockRejectedValueOnce(new Error('Candidates failed.'))
+      .mockResolvedValueOnce({ candidates: [candidate()], nextCursor: null });
+    const user = userEvent.setup();
+    renderRules();
+
+    expect(await screen.findByRole('alert', { name: 'Candidates unavailable' }))
+      .toHaveTextContent('Candidates failed.');
+    await user.click(screen.getByRole('button', { name: 'Retry candidates' }));
+
     expect(await screen.findByText('northwind market')).toBeInTheDocument();
+    expect(screen.queryByRole('alert', { name: 'Candidates unavailable' })).not.toBeInTheDocument();
+  });
 
-    await userEvent.click(screen.getByRole('button', { name: 'Activate rule' }));
+  it('caps visible lifecycle pages at 200 rules and stops before another request', async () => {
+    const allRules = Array.from({ length: 300 }, (_, index) => rule({
+      revision: {
+        ...rule().revision,
+        id: `revision-cap-${index}`,
+        ruleId: `rule-cap-${index}`,
+        condition: { matchField: 'payee', matchText: `Capped supplier ${index}` },
+      },
+    }));
+    mocks.lifecycle.mockImplementation(async (_companyId: string, _state: string, cursor?: string) => {
+      if (!cursor) return { runtimeMode: 'canonical', items: allRules.slice(0, 100), nextCursor: 'rule-page-2' };
+      if (cursor === 'rule-page-2') return { runtimeMode: 'canonical', items: allRules.slice(100, 200), nextCursor: 'rule-page-3' };
+      return { runtimeMode: 'canonical', items: allRules.slice(200), nextCursor: null };
+    });
+    const user = userEvent.setup();
+    renderRules();
 
-    expect(await screen.findByRole('button', {
-      name: 'Load more candidates',
-    })).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
+
+    expect(await screen.findByText('Capped supplier 199')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-rule-cap-"]')).toHaveLength(200);
+    expect(screen.getByRole('status', { name: 'Rule lifecycle truncated' }))
+      .toHaveTextContent(/showing first 200 rules.*more rules exist/i);
+    expect(screen.queryByRole('button', { name: 'Load more rules' })).not.toBeInTheDocument();
+    expect(mocks.lifecycle).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
+  it('caps visible candidate pages at 100 candidates and stops before another request', async () => {
+    const allCandidates = Array.from({ length: 120 }, (_, index) => candidate({
+      id: `candidate-cap-${index}`,
+      matchText: `Capped candidate ${index}`,
+    }));
+    mocks.candidates.mockImplementation(async (_companyId: string, cursor?: string) => {
+      const page = cursor ? Number(cursor.replace('candidate-page-', '')) : 0;
+      return {
+        candidates: allCandidates.slice(page * 20, page * 20 + 20),
+        nextCursor: `candidate-page-${page + 1}`,
+      };
+    });
+    const user = userEvent.setup();
+    renderRules();
+
+    for (let page = 1; page < 5; page += 1) {
+      await user.click(await screen.findByRole('button', { name: 'Load more candidates' }));
+    }
+
+    expect(await screen.findByText('Capped candidate 99')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-candidate-candidate-cap-"]')).toHaveLength(100);
+    expect(screen.getByRole('status', { name: 'Rule candidates truncated' }))
+      .toHaveTextContent(/showing newest 100 candidates.*older candidates exist/i);
+    expect(screen.queryByRole('button', { name: 'Load more candidates' })).not.toBeInTheDocument();
+    expect(mocks.candidates).toHaveBeenCalledTimes(5);
+  }, 30_000);
+
+  it('fences late lifecycle and candidate pages after a company switch', async () => {
+    let resolveRules!: (value: { runtimeMode: 'canonical', items: RuleDetailDto[]; nextCursor: null }) => void;
+    let resolveCandidates!: (value: { candidates: RuleCandidateDto[]; nextCursor: null }) => void;
+    mocks.lifecycle.mockImplementation((companyId: string, _state: string, cursor?: string) => {
+      if (companyId === 'company-b') return Promise.resolve({ runtimeMode: 'canonical', items: [], nextCursor: null });
+      if (cursor) return new Promise((resolve) => { resolveRules = resolve; });
+      return Promise.resolve({ runtimeMode: 'canonical', items: [rule()], nextCursor: 'old-rule-page' });
+    });
+    mocks.candidates.mockImplementation((companyId: string, cursor?: string) => {
+      if (companyId === 'company-b') return Promise.resolve({ candidates: [], nextCursor: null });
+      if (cursor) return new Promise((resolve) => { resolveCandidates = resolve; });
+      return Promise.resolve({ candidates: [candidate()], nextCursor: 'old-candidate-page' });
+    });
+    const user = userEvent.setup();
+    const view = renderRules();
+    await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
+    await user.click(screen.getByRole('button', { name: 'Load more candidates' }));
+
+    mocks.activeCompanyId = 'company-b';
+    mocks.activeCompany = { id: 'company-b', holdingAccountIds: [] };
+    view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+    await waitFor(() => expect(mocks.candidates).toHaveBeenCalledWith('company-b'));
+
+    await act(async () => {
+      resolveRules({ runtimeMode: 'canonical', items: [rule({ revision: { ...rule().revision, ruleId: 'late-rule', condition: { matchField: 'payee', matchText: 'Late old rule' } } })], nextCursor: null });
+      resolveCandidates({ candidates: [candidate({ id: 'late-candidate', matchText: 'Late old candidate' })], nextCursor: null });
+    });
+
+    expect(screen.queryByText('Late old rule')).not.toBeInTheDocument();
+    expect(screen.queryByText('Late old candidate')).not.toBeInTheDocument();
+  });
+
+  it('clears a linked candidate after activation so stale actions cannot reappear', async () => {
+    const linked = candidate({ id: 'candidate-linked', matchText: 'Linked candidate' });
+    window.history.replaceState({}, '', `/rules?source=rule_candidate&sourceId=${linked.id}`);
+    mocks.getCandidate.mockResolvedValue(linked);
+    mocks.prepare.mockResolvedValue({ ...prepared('activate_candidate'), preview: { ...prepared('activate_candidate').preview!, candidateId: linked.id } });
+    mocks.commit.mockResolvedValue({
+      ...prepared('activate_candidate'), status: 'COMMITTED', preview: null,
+      candidate: { candidateId: linked.id, state: 'activated', ruleId: 'rule-created' },
+    });
+    const user = userEvent.setup();
+    renderRules();
+
+    const region = await screen.findByRole('region', { name: 'Linked source candidate' });
+    await user.click(screen.getByRole('button', { name: 'Activate rule' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm activate candidate' }));
+
+    await waitFor(() => expect(region).not.toBeInTheDocument());
+    expect(screen.queryByText('Linked candidate')).not.toBeInTheDocument();
+  });
+
+  it('keeps the next candidate page reachable while acting on the final visible candidate', async () => {
+    const ready = candidate();
+    mocks.candidates.mockResolvedValue({ candidates: [ready], nextCursor: 'next-candidate-page' });
+    mocks.prepare.mockResolvedValue(prepared('activate_candidate'));
+    renderRules();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Activate rule' }));
+
+    expect(await screen.findByRole('button', { name: 'Load more candidates' })).toBeInTheDocument();
   });
 
   it('ignores a completed candidate action after the active company changes', async () => {
     const ready = candidate();
-    let resolveActivation!: (value: RuleCandidateDto) => void;
-    mocks.listRules.mockResolvedValue([]);
-    mocks.listCandidates.mockImplementation(async (companyId: string) => ({
-      candidates: companyId === 'COMPANY_GENERIC' ? [ready] : [],
-      nextCursor: null,
+    let resolveActivation!: (value: RuleMutationResult) => void;
+    mocks.candidates.mockImplementation(async (companyId: string) => ({
+      candidates: companyId === 'company-a' ? [ready] : [], nextCursor: null,
     }));
-    mocks.activate.mockReturnValue(new Promise<RuleCandidateDto>((resolve) => {
-      resolveActivation = resolve;
-    }));
+    mocks.prepare.mockReturnValue(new Promise<RuleMutationResult>((resolve) => { resolveActivation = resolve; }));
+    const view = renderRules();
+    await userEvent.click(await screen.findByRole('button', { name: 'Activate rule' }));
+    await waitFor(() => expect(mocks.prepare).toHaveBeenCalled());
 
-    const view = render(<Rules />);
-    expect(await screen.findByText('northwind market')).toBeInTheDocument();
+    mocks.activeCompanyId = 'company-b';
+    mocks.activeCompany = { id: 'company-b', holdingAccountIds: [] };
+    view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+    await waitFor(() => expect(mocks.candidates).toHaveBeenCalledWith('company-b'));
 
-    await userEvent.click(screen.getByRole('button', { name: 'Activate rule' }));
-    await waitFor(() => {
-      expect(mocks.activate).toHaveBeenCalledWith('COMPANY_GENERIC', ready.id);
-    });
+    await act(async () => resolveActivation(prepared('activate_candidate')));
 
-    mocks.activeCompanyId = 'COMPANY_OTHER';
-    view.rerender(<Rules />);
-    await waitFor(() => {
-      expect(mocks.listCandidates).toHaveBeenCalledWith('COMPANY_OTHER');
-    });
-
-    await act(async () => {
-      resolveActivation({
-        ...ready,
-        state: 'activated',
-        canActivate: false,
-        activatedRuleId: '66666666-6666-4666-8666-666666666666',
-      });
-    });
-
-    expect(
-      mocks.listRules.mock.calls.filter(([companyId]) => companyId === 'COMPANY_GENERIC'),
-    ).toHaveLength(1);
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Confirm activate candidate' })).not.toBeInTheDocument();
     expect(mocks.toast).not.toHaveBeenCalledWith('Rule activated — auto-post remains off');
   });
+});
+
+it('does not commit a late immediate operation after the Rules page unmounts', async () => {
+  mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
+  let resolve!: (value: RuleMutationResult) => void;
+  mocks.prepare.mockReturnValue(new Promise<RuleMutationResult>(done => { resolve = done; }));
+  const view = render(<MemoryRouter><Rules /></MemoryRouter>);
+  await userEvent.click(await screen.findByRole('button', { name: 'Enabled' }));
+  view.unmount();
+  await act(async () => resolve(prepared('disable')));
+  expect(mocks.commit).not.toHaveBeenCalled();
+  expect(mocks.toast).not.toHaveBeenCalled();
+});
+
+it('does not restore a stale test result after switching away and back', async () => {
+  mocks.lifecycle.mockResolvedValue({ runtimeMode: 'canonical', items: [rule()], nextCursor: null });
+  let resolve!: (value: unknown) => void;
+  mocks.testRule.mockReturnValue(new Promise(done => { resolve = done; }));
+  const view = render(<MemoryRouter><Rules /></MemoryRouter>);
+  await userEvent.click(await screen.findByRole('button', { name: 'Test rule' }));
+  mocks.activeCompanyId = 'company-b';
+  view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+  mocks.activeCompanyId = 'company-a';
+  view.rerender(<MemoryRouter><Rules /></MemoryRouter>);
+  await act(async () => resolve({ pendingCount: 777, processedCount: 0, conflicts: [], matches: [] }));
+  expect(screen.queryByText(/777 pending/)).not.toBeInTheDocument();
 });

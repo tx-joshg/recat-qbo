@@ -198,8 +198,8 @@ describe('Queue shared controls', () => {
         categoryQboId: null,
         suggestion: {
           source: 'rule',
-          category: 'Office expense', categoryQboId: 'EXPENSE_OFFICE',
-          matchedRules: 2, winnerMatchText: 'office supply',
+          version: 2, ruleId: 'RULE_OFFICE', ruleRevision: 2, autoPost: false,
+          action: { version: 2, direction: 'Purchase', category: 'Office expense', categoryQboId: 'EXPENSE_OFFICE', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
         },
       })],
       nextCursor: null,
@@ -210,11 +210,11 @@ describe('Queue shared controls', () => {
     const category = screen.getByRole('combobox', { name: 'Category for Generic supplier' });
     expect(category).toHaveTextContent('Office expense');
     expect(category).toHaveAccessibleDescription(
-      'Suggested category: Office expense. Suggested by rule. Matched 2 rules — “office supply” won (topmost). Reorder in Rules.',
+      'Suggested category: Office expense. Suggested by rule. Rule revision 2',
     );
     expect(screen.getByText('rule')).toHaveAttribute(
       'data-tip',
-      'Matched 2 rules — “office supply” won (topmost). Reorder in Rules.',
+      'Rule revision 2',
     );
   });
 

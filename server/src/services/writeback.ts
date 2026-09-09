@@ -64,6 +64,15 @@ import { pauseLiveCompanyInTransaction } from './agent/circuitBreaker.js';
 import { isCanonicalLiveCheckpoint } from './agent/liveCheckpoint.js';
 import { candidateContextFor } from './agent/ruleCandidates.js';
 import {
+  CLASSIFICATION_ENVELOPE_VERSION,
+  categorizationDecisionContextHash,
+  classificationEnvelopeHashForPreparedWrite,
+  classificationDecisionForPreparedWrite,
+  classificationEvidenceBindingForPreparedWrite,
+  normalizeCategorizationDecisionContext,
+  persistedClassificationDecision,
+  type CategorizationDecisionContext,
+  type NormalizedCategorizationDecisionContext,
   persistedEvidenceProposal,
   persistedRuleCandidateContext,
 } from './categorizationEvidence.js';
@@ -79,6 +88,8 @@ import {
   createUnknownProviderActionabilityIfMissing,
   type ProviderActionabilityDb,
 } from './providerActionability.js';
+
+import { hashRuleAutoPostValue } from './ruleAutoPostBinding.js';
 
 export interface Actor {
   /** userId, or null for 'system' */
@@ -972,6 +983,8 @@ export interface DurableAttempt {
   verification: unknown;
   errorCode: string | null;
   errorMessage: string | null;
+  classificationEnvelopeVersion?: number | null;
+  classificationEnvelopeHash?: string | null;
 }
 
 interface DurableTransaction {
@@ -1087,6 +1100,8 @@ export interface DurableWritebackDb {
         verification?: unknown;
         errorCode?: string | null;
         errorMessage?: string | null;
+        classificationEnvelopeVersion?: number | null;
+        classificationEnvelopeHash?: string | null;
       };
     }): Promise<DurableAttempt>;
     update(args: {
@@ -1095,6 +1110,13 @@ export interface DurableWritebackDb {
     }): Promise<DurableAttempt>;
     updateMany(args: {
       where: { id: string; status: string | { in: string[] } };
+      data: Record<string, unknown>;
+    }): Promise<{ count: number }>;
+  };
+  ruleAutoPostPreparation?: {
+    findUnique(args: { where: { id: string } }): Promise<RuleAutoPostPreparationBinding | null>;
+    updateMany(args: {
+      where: { id: string; state: string | { in: string[] } };
       data: Record<string, unknown>;
     }): Promise<{ count: number }>;
   };
@@ -1187,7 +1209,32 @@ export interface CommitStagedCategorizationInput {
   expectedTaxDisposition?: TaxDisposition;
   expectedQboBinding?: ExpectedQboBinding;
   authorization?: DurableMutationAuthorization;
+  decisionContext?: CategorizationDecisionContext;
+  /** Internal REST boundary signal; never accepted from a request body. */
+  captureManualApproval?: true;
 }
+
+interface RuleAutoPostPreparationBinding {
+  id: string;
+  companyId: string;
+  transactionId: string;
+  ruleId: string;
+  ruleRevision: number;
+  requestId: string;
+  state: string;
+  inputHash: string;
+  proposal: unknown;
+  proposalHash: string;
+  stagedGraphHash: string;
+  sourceRevision: number;
+  preparedRevision: number;
+  qboType: string;
+  qboId: string;
+  qboSyncToken: string;
+  commitStartedAt: Date | null;
+}
+
+export type RuleAutoPostWritebackDeps = Omit<DurableWritebackDeps, 'authorize'>;
 
 export interface ReconcileMutationAttemptInput {
   requestId: string;
@@ -1313,6 +1360,11 @@ const AUTOPILOT_ACTOR: Actor = Object.freeze({
   label: 'Recat autopilot',
 });
 
+const RULE_AUTO_POST_ACTOR: Actor = Object.freeze({
+  id: null,
+  label: 'Recat rule auto-post',
+});
+
 async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
   const [{ prisma }, { qboFactory }, { writeAudit }, { env }] = await Promise.all([
     import('../lib/prisma.js'),
@@ -1364,14 +1416,14 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
     onVerifiedCategorizationOutcome: async (outcome) => {
       const [
         { evaluateShadowRunAgainstOutcome },
-        { recordVerifiedRuleCandidateOutcome },
+        { recordVerifiedClassificationOutcome },
       ] = await Promise.all([
         import('./agent/evaluation.js'),
-        import('./agent/ruleCandidatePersistence.js'),
+        import('./classification/outcomeRecorder.js'),
       ]);
       const results = await Promise.allSettled([
         evaluateShadowRunAgainstOutcome(outcome),
-        recordVerifiedRuleCandidateOutcome(outcome),
+        recordVerifiedClassificationOutcome(outcome),
       ]);
       const failure = results.find(
         (result): result is PromiseRejectedResult => result.status === 'rejected',
@@ -2368,7 +2420,7 @@ function validateDryRunBinding(
   attempt: DurableAttempt,
   txn: DurableTransaction,
 ): void {
-  const expectedPayload = {
+  const expectedSummary = {
     operation: 'recategorize',
     qboType: txn.qboType,
     qboId: txn.qboId,
@@ -2378,6 +2430,21 @@ function validateDryRunBinding(
       taxCodeQboIds: uniqueStrings(txn.splitLines.map((line) => line.taxCodeQboId)),
     },
     outcome: 'DRY_RUN',
+  };
+  const payload = isRuntimeRecord(attempt.requestPayload)
+    ? attempt.requestPayload
+    : lifecycleError('ATTEMPT_CORRUPT', 'Stored dry-run summary is malformed.');
+  const hasDecision = payload.classificationDecision !== undefined;
+  const decision = persistedClassificationDecision(
+    attempt.requestPayload,
+    hashDryRunClassificationSummary(expectedSummary),
+  );
+  if (hasDecision && decision === null) {
+    lifecycleError('ATTEMPT_CORRUPT', 'Stored dry-run decision context is inconsistent.');
+  }
+  const expectedPayload = {
+    ...expectedSummary,
+    ...(decision === null ? {} : { classificationDecision: decision }),
   };
   if (
     attempt.status !== 'DRY_RUN' ||
@@ -2399,6 +2466,30 @@ function validateDryRunBinding(
       'Stored dry-run attempt is not bound to its transaction and summary.',
     );
   }
+}
+
+function hashDryRunClassificationSummary(summary: unknown): string {
+  return createHash('sha256').update(canonicalJson(summary)).digest('hex');
+}
+
+function persistedDryRunClassificationDecision(
+  attempt: DurableAttempt,
+): ReturnType<typeof persistedClassificationDecision> {
+  const payload = isRuntimeRecord(attempt.requestPayload)
+    ? attempt.requestPayload
+    : null;
+  if (payload === null) return null;
+  return persistedClassificationDecision(
+    attempt.requestPayload,
+    hashDryRunClassificationSummary({
+      operation: payload.operation,
+      qboType: payload.qboType,
+      qboId: payload.qboId,
+      requestId: payload.requestId,
+      references: payload.references,
+      outcome: payload.outcome,
+    }),
+  );
 }
 
 function validateRecordedAttemptBinding(
@@ -2611,9 +2702,14 @@ async function emitVerifiedCategorizationOutcome(
   const candidateContext = operation === 'posted'
     ? persistedRuleCandidateContext(attempt.requestPayload)
     : null;
+  const prepared = validateAttemptPersistence(attempt);
+  const classificationDecision = persistedClassificationDecision(
+    attempt.requestPayload,
+    hashClassificationPreparedWrite(prepared),
+  );
   // Legacy or corrupt recategorization attempts cannot prove the exact staged
   // proposal, so they are deliberately excluded instead of guessed from QBO.
-  if (operation === 'posted' && (proposal === null || candidateContext === null)) return;
+  if (operation === 'posted' && proposal === null) return;
   try {
     await d.onVerifiedCategorizationOutcome({
       companyId: txn.companyId,
@@ -2623,6 +2719,9 @@ async function emitVerifiedCategorizationOutcome(
       operation,
       proposal,
       candidateContext,
+      ...(classificationDecision === null
+        ? {}
+        : { decisionContext: classificationDecision.context }),
     });
   } catch {
     // The QuickBooks readback and local VERIFIED state are already durable.
@@ -2650,6 +2749,7 @@ interface RequestIntent {
   operation: 'recategorize' | 'restore';
   expectedRevision: number;
   requestHash?: string;
+  decisionContextHash?: string | null;
 }
 
 function assertRequestIdentity(attempt: DurableAttempt, intent: RequestIntent): void {
@@ -2661,8 +2761,24 @@ function assertRequestIdentity(attempt: DurableAttempt, intent: RequestIntent): 
   ) {
     lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
   }
-  if (attempt.status !== 'DRY_RUN') {
-    validateAttemptPersistence(attempt);
+  if (attempt.status === 'DRY_RUN') {
+    if (intent.decisionContextHash !== undefined) {
+      const decision = persistedDryRunClassificationDecision(attempt);
+      if ((decision?.contextHash ?? null) !== intent.decisionContextHash) {
+        lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
+      }
+    }
+  } else {
+    const prepared = validateAttemptPersistence(attempt);
+    if (intent.decisionContextHash !== undefined) {
+      const decision = persistedClassificationDecision(
+        attempt.requestPayload,
+        hashClassificationPreparedWrite(prepared),
+      );
+      if ((decision?.contextHash ?? null) !== intent.decisionContextHash) {
+        lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
+      }
+    }
   }
 }
 
@@ -3190,6 +3306,7 @@ async function persistPrepared(
     payee: string;
     source: 'user' | 'autopilot' | 'mcp';
   },
+  decisionContext?: NormalizedCategorizationDecisionContext | null,
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
     const attempt = await d.db.$transaction(async (tx) => {
@@ -3207,6 +3324,18 @@ async function persistPrepared(
             config?.configVersion ?? 'verified-writeback-v1',
             candidateInput.source,
           );
+      const preparedWriteHash = hashClassificationPreparedWrite(prepared);
+      const classificationDecision = decisionContext === undefined || decisionContext === null
+        ? null
+        : classificationDecisionForPreparedWrite(decisionContext, preparedWriteHash);
+      const proposal = staged === undefined ? null : evidenceProposal(staged);
+      const classificationEvidenceBinding = proposal === null
+        ? null
+        : classificationEvidenceBindingForPreparedWrite(
+            proposal,
+            candidateContext,
+            preparedWriteHash,
+          );
       return tx.qboMutationAttempt.create({
         data: {
           transactionId,
@@ -3216,15 +3345,25 @@ async function persistPrepared(
           expectedRevision,
           expectedSyncToken: prepared.body.SyncToken,
           requestHash: prepared.requestHash,
+          classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+          classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+            preparedWriteHash,
+            classificationDecision,
+            classificationEvidenceBinding,
+          ),
           requestPayload: {
             ...prepared,
-            ruleCandidateFold: { version: 1 },
-            ...(staged === undefined
+            ...(classificationDecision === null
+              ? {}
+              : { classificationDecision }),
+            ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+            ...(proposal === null
               ? {}
               : {
+                classificationEvidenceBinding,
                 categorizationEvidence: {
                   version: 1,
-                  proposal: evidenceProposal(staged),
+                  proposal,
                 },
                 ...(candidateContext === null
                   ? {}
@@ -3276,6 +3415,9 @@ async function persistPrepared(
       operation: prepared.operation,
       expectedRevision,
       requestHash: prepared.requestHash,
+      decisionContextHash: decisionContext === undefined || decisionContext === null
+        ? null
+        : categorizationDecisionContextHash(decisionContext),
     });
     return { attempt: raced, created: false };
   }
@@ -3405,6 +3547,7 @@ async function enterCommitting(
     readonly input: AutopilotWritebackAuthorityInput;
   },
   expectedTaxDisposition: TaxDisposition = 'set',
+  ruleAutoPost?: RuleAutoPostPreparationBinding,
 ): Promise<
   | { won: true; attempt: DurableAttempt }
   | { won: false; attempt: DurableAttempt }
@@ -3439,8 +3582,8 @@ async function enterCommitting(
       error instanceof QboWriteSafetyError
       && error.code === 'QBO_WRITE_SAFETY_UNAVAILABLE'
     ) {
-      // No mutation was attempted. Keep the exact prepared request resumable
-      // once QuickBooks can provide its fresh safety evidence.
+      // No mutation was attempted and the provider could not prove safety.
+      // Keep the exact prepared request resumable once QBO recovers.
       throw error;
     }
     const retryable = await markRetryable(
@@ -3482,6 +3625,26 @@ async function enterCommitting(
           expectedStageHash,
           expectedQboBinding,
         );
+      }
+      if (ruleAutoPost !== undefined) {
+        await assertRuleAutoPostCommitAuthority(tx, ruleAutoPost);
+        const preparation = tx.ruleAutoPostPreparation;
+        if (preparation === undefined) {
+          lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post preparation is unavailable.');
+        }
+        const preparationTransition = await preparation.updateMany({
+          where: {
+            id: ruleAutoPost.id,
+            state: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING'] },
+          },
+          data: {
+            state: 'COMMITTING',
+            ...(ruleAutoPost.commitStartedAt === null ? { commitStartedAt: d.now() } : {}),
+          },
+        });
+        if (preparationTransition.count !== 1) {
+          lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post authority changed before send.');
+        }
       }
       return tx.qboMutationAttempt.updateMany({
         where: { id: attempt.id, status: 'PREPARED' },
@@ -3744,16 +3907,29 @@ async function recordDryRun(
   txn: DurableTransaction,
   staged: StagedCategorization,
   d: DurableWritebackDeps,
+  decisionContext: NormalizedCategorizationDecisionContext | null,
+  ruleAutoPost?: RuleAutoPostPreparationBinding,
 ): Promise<DurableMutationResult> {
   const accountQboIds = uniqueStrings(staged.lines.map((line) => line.categoryQboId));
   const taxCodeQboIds = uniqueStrings(staged.lines.map((line) => line.taxCodeQboId));
-  const requestPayload = {
+  const summary = {
     operation: 'recategorize',
     qboType: txn.qboType,
     qboId: txn.qboId,
     requestId: input.requestId,
     references: { accountQboIds, taxCodeQboIds },
     outcome: 'DRY_RUN',
+  };
+  const requestPayload = {
+    ...summary,
+    ...(decisionContext === null
+      ? {}
+      : {
+          classificationDecision: classificationDecisionForPreparedWrite(
+            decisionContext,
+            hashDryRunClassificationSummary(summary),
+          ),
+        }),
   };
   const mutation: MutationAuditInput = {
     requestId: input.requestId,
@@ -3768,6 +3944,19 @@ async function recordDryRun(
   };
   await d.db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, txn.companyId);
+    if (ruleAutoPost !== undefined) {
+      await assertRuleAutoPostCommitAuthority(tx, ruleAutoPost);
+      const transitioned = await tx.ruleAutoPostPreparation?.updateMany({
+        where: { id: ruleAutoPost.id, state: 'PREPARED' },
+        data: { state: 'DRY_RUN', completedAt: d.now() },
+      });
+      if (transitioned?.count !== 1) {
+        lifecycleError(
+          'RULE_AUTO_POST_AUTHORITY_DENIED',
+          'Rule auto-post dry-run authority changed before recording.',
+        );
+      }
+    }
     await tx.qboMutationAttempt.create({
       data: {
         transactionId: txn.id,
@@ -3818,6 +4007,172 @@ export async function commitStagedCategorization(
  * authorization function: exact authority is hard-wired to persisted
  * job/config/lease/reference state and fenced with PREPARED→COMMITTING.
  */
+async function loadRuleAutoPostBinding(
+  db: DurableWritebackDb,
+  preparationId: string,
+): Promise<RuleAutoPostPreparationBinding> {
+  const preparation = await db.ruleAutoPostPreparation?.findUnique({
+    where: { id: preparationId },
+  });
+  if (preparation === null || preparation === undefined) {
+    lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post preparation is unavailable.');
+  }
+  return preparation;
+}
+
+function assertRuleAutoPostScalarBinding(
+  preparation: RuleAutoPostPreparationBinding,
+): void {
+  if (
+    !['PREPARED', 'RETRYABLE', 'COMMITTING'].includes(preparation.state)
+    || preparation.requestId !== preparation.id
+    || preparation.preparedRevision !== preparation.sourceRevision + 1
+    || (preparation.qboType !== 'Purchase' && preparation.qboType !== 'Deposit')
+    || preparation.inputHash !== hashRuleAutoPostValue({
+      companyId: preparation.companyId,
+      transactionId: preparation.transactionId,
+      ruleId: preparation.ruleId,
+      ruleRevision: preparation.ruleRevision,
+    })
+    || preparation.proposalHash !== hashRuleAutoPostValue(preparation.proposal)
+  ) {
+    lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post preparation is unavailable.');
+  }
+}
+
+async function assertRuleAutoPostCommitAuthority(
+  tx: DurableWritebackDb,
+  preparation: RuleAutoPostPreparationBinding,
+): Promise<void> {
+  const rows = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `WITH winner AS (
+       SELECT candidate."id"
+         FROM "Rule" candidate
+         JOIN "Transaction" target
+           ON target."id" = $3
+          AND target."companyId" = $2
+        WHERE candidate."companyId" = $2
+          AND candidate."enabled" = TRUE
+          AND candidate."retiredAt" IS NULL
+          AND candidate."reviewRequiredAt" IS NULL
+          AND candidate."reviewReason" IS NULL
+          AND candidate."repairReason" IS NULL
+          AND candidate."canonicalVersion" = 2
+          AND candidate."direction"::text = target."qboType"
+          AND strpos(rule_match_key(target."payee"), rule_match_key(candidate."matchText")) > 0
+        ORDER BY candidate."priority" ASC, candidate."createdAt" DESC, candidate."id" ASC
+        LIMIT 1
+     )
+     SELECT preparation."id"
+       FROM "RuleAutoPostPreparation" preparation
+       JOIN "Company" company ON company."id" = preparation."companyId"
+       JOIN "Transaction" target
+         ON target."id" = preparation."transactionId"
+        AND target."companyId" = preparation."companyId"
+       JOIN "Rule" rule
+         ON rule."id" = preparation."ruleId"
+        AND rule."companyId" = preparation."companyId"
+       JOIN winner ON winner."id" = rule."id"
+      WHERE preparation."id" = $1
+        AND preparation."companyId" = $2
+        AND preparation."transactionId" = $3
+        AND preparation."ruleId" = $4
+        AND preparation."ruleRevision" = $5
+        AND preparation."requestId" = $6
+        AND preparation."preparedRevision" = $7
+        AND preparation."qboType" = $8
+        AND preparation."qboId" = $9
+        AND preparation."qboSyncToken" = $10
+        AND preparation."state" IN ('PREPARED', 'RETRYABLE', 'COMMITTING')
+        AND company."ruleRuntimeMode" = 'canonical'
+        AND company."disconnectedAt" IS NULL
+        AND rule."revision" = preparation."ruleRevision"
+        AND rule."enabled" = TRUE
+        AND rule."autoPost" = TRUE
+        AND rule."retiredAt" IS NULL
+        AND rule."reviewRequiredAt" IS NULL
+        AND rule."reviewReason" IS NULL
+        AND rule."repairReason" IS NULL
+        AND rule."canonicalVersion" = 2
+        AND rule."direction"::text = preparation."qboType"
+        AND target."revision" = preparation."preparedRevision"
+        AND target."status" = 'PENDING'
+        AND target."qboType" = preparation."qboType"
+        AND target."qboId" = preparation."qboId"
+        AND target."qboSyncToken" = preparation."qboSyncToken"
+        AND preparation."proposal"->>'taxCalculation' = rule."taxCalculation"
+        AND preparation."proposal"->'lines'->0->>'categoryQboId' = rule."categoryQboId"
+        AND COALESCE(preparation."proposal"->'lines'->0->>'taxCodeQboId', '')
+            = COALESCE(rule."taxCodeQboId", '')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM "RuleTag" current_tag
+           WHERE current_tag."ruleId" = rule."id"
+             AND NOT (preparation."proposal"->'tagIds' ? current_tag."tagId")
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM jsonb_array_elements_text(preparation."proposal"->'tagIds') proposed_tag("tagId")
+           WHERE NOT EXISTS (
+             SELECT 1 FROM "RuleTag" current_tag
+              WHERE current_tag."ruleId" = rule."id"
+                AND current_tag."tagId" = proposed_tag."tagId"
+           )
+        )
+      FOR SHARE OF company, target, rule`,
+    preparation.id,
+    preparation.companyId,
+    preparation.transactionId,
+    preparation.ruleId,
+    preparation.ruleRevision,
+    preparation.requestId,
+    preparation.preparedRevision,
+    preparation.qboType,
+    preparation.qboId,
+    preparation.qboSyncToken,
+  );
+  if (rows.length !== 1) {
+    lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post authority changed before send.');
+  }
+}
+
+export async function commitRuleAutoPostPreparation(
+  preparationId: string,
+  dependencies?: RuleAutoPostWritebackDeps,
+): Promise<DurableMutationResult> {
+  const base = dependencies === undefined
+    ? await defaultDurableDeps()
+    : dependencies as DurableWritebackDeps;
+  const preparation = await loadRuleAutoPostBinding(base.db, preparationId);
+  assertRuleAutoPostScalarBinding(preparation);
+  const d: DurableWritebackDeps = {
+    ...base,
+    authorize: async (actorId, companyId) => {
+      if (actorId !== null || companyId !== preparation.companyId) return false;
+      const current = await loadRuleAutoPostBinding(base.db, preparationId);
+      return current.companyId === preparation.companyId
+        && current.transactionId === preparation.transactionId
+        && current.ruleId === preparation.ruleId
+        && current.ruleRevision === preparation.ruleRevision
+        && current.requestId === preparation.requestId
+        && ['PREPARED', 'RETRYABLE', 'COMMITTING'].includes(current.state);
+    },
+  };
+  return commitStagedCategorizationInternal({
+    transactionId: preparation.transactionId,
+    companyId: preparation.companyId,
+    expectedRevision: preparation.preparedRevision,
+    requestId: preparation.requestId,
+    actor: RULE_AUTO_POST_ACTOR,
+    expectedStageHash: preparation.stagedGraphHash,
+    expectedQboBinding: {
+      qboType: preparation.qboType,
+      qboId: preparation.qboId,
+      qboSyncToken: preparation.qboSyncToken,
+    },
+  }, d, undefined, preparation);
+}
+
 export async function commitGuardedLiveCategorization(
   input: Omit<CommitStagedCategorizationInput, 'actor'>,
   context: LiveMutationContext,
@@ -3830,6 +4185,36 @@ export async function commitGuardedLiveCategorization(
   );
 }
 
+/** Records the explicit staged approval, without claiming research or tax jurisdiction. */
+function manualApprovalContext(
+  txn: DurableTransaction,
+  actorId: string,
+): NormalizedCategorizationDecisionContext {
+  const raw = txn.rawData !== null && typeof txn.rawData === 'object' && !Array.isArray(txn.rawData)
+    ? txn.rawData as Record<string, unknown> : {};
+  const currencyRef = raw.CurrencyRef;
+  const currency = currencyRef !== null && typeof currencyRef === 'object' && !Array.isArray(currencyRef)
+    ? (currencyRef as Record<string, unknown>).value : undefined;
+  const payee = txn.payee?.normalize('NFC').trim() ?? '';
+  return normalizeCategorizationDecisionContext({
+    vendorIdentityHint: payee !== '' && Array.from(payee).length <= 500 && !/[\u0000-\u001f\u007f]/u.test(payee)
+      ? { displayName: payee, qboVendorId: null } : null,
+    rationale: 'User approved the exact staged categorization in Recat.',
+    requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+    reviewer: { userId: actorId, configVersion: 'browser-staged-approval-v1', decision: 'approved' },
+    originIntent: 'apply_once',
+    jurisdiction: 'unknown',
+    // XXX is the no-currency sentinel; a missing provider field never implies CAD.
+    currency: typeof currency === 'string' && /^[A-Za-z]{3}$/u.test(currency) ? currency : 'XXX',
+    context: {
+      transactionDirection: txn.qboType === 'Purchase' ? 'out' : 'in',
+      qboType: txn.qboType as 'Purchase' | 'Deposit',
+      sourceAccountName: null,
+      businessPurpose: null,
+    },
+  });
+}
+
 async function commitStagedCategorizationInternal(
   input: CommitStagedCategorizationInput,
   deps?: DurableWritebackDeps,
@@ -3837,8 +4222,32 @@ async function commitStagedCategorizationInternal(
     readonly context: LiveMutationContext;
     readonly proof: LiveMutationProof;
   },
+  ruleAutoPost?: RuleAutoPostPreparationBinding,
 ): Promise<DurableMutationResult> {
+  if (input.captureManualApproval === true && (
+    input.actor.id === null
+    || (input.authorization !== undefined && input.authorization.kind !== 'user')
+    || input.decisionContext !== undefined
+    || autopilot !== undefined
+    || ruleAutoPost !== undefined
+  )) {
+    lifecycleError('INVALID_DECISION_CONTEXT', 'Manual approval requires an explicit authenticated browser action.');
+  }
   const base = deps ?? (await defaultDurableDeps());
+  let decisionContext: NormalizedCategorizationDecisionContext | null = null;
+  if (input.decisionContext !== undefined) {
+    try {
+      decisionContext = normalizeCategorizationDecisionContext(input.decisionContext);
+    } catch {
+      lifecycleError('INVALID_DECISION_CONTEXT', 'The classification decision context is invalid.');
+    }
+    if (decisionContext.reviewer.userId !== input.actor.id) {
+      lifecycleError(
+        'INVALID_DECISION_CONTEXT',
+        'The classification reviewer does not match the committing actor.',
+      );
+    }
+  }
   let d = base;
   const authorityInput: AutopilotWritebackAuthorityInput | undefined = autopilot === undefined
     ? undefined
@@ -3890,13 +4299,49 @@ async function commitStagedCategorizationInternal(
   if (preliminary.companyId !== input.companyId) {
     lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
   }
+  if (
+    decisionContext !== null
+    && decisionContext.context.qboType !== preliminary.qboType
+  ) {
+    lifecycleError(
+      'INVALID_DECISION_CONTEXT',
+      'The classification context does not match the transaction type.',
+    );
+  }
   return d.lease(leaseKey(preliminary), invocationOwner, async () => {
     const intent: RequestIntent = {
       transactionId: input.transactionId,
       operation: 'recategorize',
       expectedRevision: input.expectedRevision,
+      // Existing requests retain their persisted context, including legacy absence.
+      decisionContextHash: input.captureManualApproval === true
+        ? undefined
+        : decisionContext === null
+        ? null
+        : categorizationDecisionContextHash(decisionContext),
     };
     let existing = await findRequestOrConflict(d, input.requestId, intent);
+    if (existing?.status === 'RETRYABLE' && ruleAutoPost !== undefined) {
+      existing = await d.db.$transaction(async (tx) => {
+        await lockCompanyMutationScope(tx, input.companyId);
+        await assertRuleAutoPostCommitAuthority(tx, ruleAutoPost);
+        const rearmed = await tx.qboMutationAttempt.updateMany({
+          where: { id: existing!.id, status: 'RETRYABLE' },
+          data: {
+            status: 'PREPARED',
+            errorCode: null,
+            errorMessage: null,
+          },
+        });
+        if (rearmed.count !== 1) {
+          lifecycleError(
+            'RULE_AUTO_POST_AUTHORITY_DENIED',
+            'Rule auto-post retry authority changed before send.',
+          );
+        }
+        return { ...existing!, status: 'PREPARED', errorCode: null, errorMessage: null };
+      });
+    }
     if (
       existing?.status === 'RETRYABLE'
       && autopilot !== undefined
@@ -4023,7 +4468,11 @@ async function commitStagedCategorizationInternal(
             );
           }
           await assertPreparedWriteSafetyAndPersistBlocked(
-            d, client, prepared, currentTxn, input.actor,
+            d,
+            client,
+            prepared,
+            currentTxn,
+            input.actor,
             { date: current.date, bankAccount: freshTxn.bankAccount },
           );
         },
@@ -4035,6 +4484,7 @@ async function commitStagedCategorizationInternal(
               input: authorityInput!,
             },
         input.expectedTaxDisposition,
+        ruleAutoPost,
       );
       if (!entered.won) {
         const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -4072,8 +4522,11 @@ async function commitStagedCategorizationInternal(
       input.expectedQboBinding,
       input.expectedTaxDisposition,
     );
+    if (input.captureManualApproval === true) {
+      decisionContext = manualApprovalContext(txn, input.actor.id!);
+    }
     if (txn.company.dryRun || d.envDryRun) {
-      return recordDryRun(input, txn, staged, d);
+      return recordDryRun(input, txn, staged, d, decisionContext, ruleAutoPost);
     }
 
     await d.renewLease(leaseKey(txn), invocationOwner);
@@ -4146,8 +4599,11 @@ async function commitStagedCategorizationInternal(
       preparedStage,
       {
         payee: freshTxn.payee,
-        source: autopilot === undefined ? 'user' : 'autopilot',
+        source: autopilot !== undefined
+          ? 'autopilot'
+          : ruleAutoPost !== undefined ? 'autopilot' : 'user',
       },
+      decisionContext,
     );
     if (!persisted.created) {
       const { txn: racedTxn } = await loadAuthorizedAttempt(
@@ -4173,40 +4629,44 @@ async function commitStagedCategorizationInternal(
       input.expectedStageHash,
       input.expectedQboBinding,
       async (currentTxn) => {
-        if (autopilot !== undefined) {
-          const [finalTxn, finalSnapshot] = await Promise.all([
-            client.fetchTxn(prepared.qboType, currentTxn.qboId),
-            client.fetchPreparedSnapshot(prepared.qboType, currentTxn.qboId),
-          ]);
-          if (
-            !finalTxn
-            || !finalSnapshot
-            || finalTxn.syncToken !== persisted.attempt.expectedSyncToken
-            || finalSnapshot.syncToken !== persisted.attempt.expectedSyncToken
-            || currentTxn.qboSyncToken !== persisted.attempt.expectedSyncToken
-            || !snapshotEquals(finalSnapshot, before)
-          ) {
-            lifecycleError(
-              'QBO_STATE_DRIFT',
-              `${prepared.qboType} changed immediately before the guarded live write.`,
+        if (autopilot !== undefined || ruleAutoPost !== undefined) {
+            const [finalTxn, finalSnapshot] = await Promise.all([
+              client.fetchTxn(prepared.qboType, currentTxn.qboId),
+              client.fetchPreparedSnapshot(prepared.qboType, currentTxn.qboId),
+            ]);
+            if (
+              !finalTxn
+              || !finalSnapshot
+              || finalTxn.syncToken !== persisted.attempt.expectedSyncToken
+              || finalSnapshot.syncToken !== persisted.attempt.expectedSyncToken
+              || currentTxn.qboSyncToken !== persisted.attempt.expectedSyncToken
+              || !snapshotEquals(finalSnapshot, before)
+            ) {
+              lifecycleError(
+                'QBO_STATE_DRIFT',
+                `${prepared.qboType} changed immediately before the guarded live write.`,
+              );
+            }
+            await d.renewLease(leaseKey(currentTxn), invocationOwner);
+            await loadAuthorizedStage(
+              currentTxn.id,
+              currentTxn.companyId,
+              persisted.attempt.expectedRevision,
+              input.actor.id,
+              d,
+              ['PENDING'],
+              authorization,
+              input.expectedStageHash,
+              input.expectedQboBinding,
+              input.expectedTaxDisposition,
             );
-          }
-          await d.renewLease(leaseKey(currentTxn), invocationOwner);
-          await loadAuthorizedStage(
-            currentTxn.id,
-            currentTxn.companyId,
-            persisted.attempt.expectedRevision,
-            input.actor.id,
-            d,
-            ['PENDING'],
-            authorization,
-            input.expectedStageHash,
-            input.expectedQboBinding,
-            input.expectedTaxDisposition,
-          );
         }
         await assertPreparedWriteSafetyAndPersistBlocked(
-          d, client, prepared, currentTxn, input.actor,
+          d,
+          client,
+          prepared,
+          currentTxn,
+          input.actor,
           { date: before.date, bankAccount: freshTxn.bankAccount },
         );
       },
@@ -4218,6 +4678,7 @@ async function commitStagedCategorizationInternal(
             input: authorityInput!,
           },
       input.expectedTaxDisposition,
+      ruleAutoPost,
     );
     if (!entered.won) {
       const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -4262,6 +4723,19 @@ export function hashPreparedWriteBody(body: QboPreparedWrite['body']): string {
 export function hashPreparedWriteBinding(prepared: QboPreparedWrite): string {
   const { requestId: _throwawayRequestId, ...binding } = prepared;
   return createHash('sha256').update(canonicalJson(binding)).digest('hex');
+}
+
+export function hashClassificationPreparedWrite(prepared: QboPreparedWrite): string {
+  return createHash('sha256').update(canonicalJson({
+    operation: prepared.operation,
+    qboType: prepared.qboType,
+    qboId: prepared.qboId,
+    requestId: prepared.requestId,
+    requestHash: prepared.requestHash,
+    body: prepared.body,
+    before: prepared.before,
+    expected: prepared.expected,
+  })).digest('hex');
 }
 
 function hashPurchaseSnapshot(snapshot: QboPreparedSnapshot): string {
@@ -4373,6 +4847,43 @@ export async function reconcileMutationAttempt(
  * to the canonical durable reconciler and atomically updates the owning live
  * run/job only after the exact persisted checkpoint remains bound.
  */
+export async function reconcileRuleAutoPostPreparation(
+  preparationId: string,
+  dependencies?: RuleAutoPostWritebackDeps,
+): Promise<DurableMutationResult> {
+  const base = dependencies === undefined
+    ? await defaultDurableDeps()
+    : dependencies as DurableWritebackDeps;
+  const preparation = await loadRuleAutoPostBinding(base.db, preparationId);
+  if (
+    preparation.requestId !== preparation.id
+    || preparation.preparedRevision !== preparation.sourceRevision + 1
+    || !['COMMITTING', 'UNCERTAIN', 'VERIFIED', 'REJECTED'].includes(preparation.state)
+  ) {
+    lifecycleError('RULE_AUTO_POST_AUTHORITY_DENIED', 'Rule auto-post preparation is unavailable.');
+  }
+  const d: DurableWritebackDeps = {
+    ...base,
+    authorize: async (actorId, companyId) => {
+      if (actorId !== null || companyId !== preparation.companyId) return false;
+      const current = await loadRuleAutoPostBinding(base.db, preparationId);
+      return current.requestId === preparation.requestId
+        && current.transactionId === preparation.transactionId
+        && ['COMMITTING', 'UNCERTAIN', 'VERIFIED', 'REJECTED'].includes(current.state);
+    },
+  };
+  return reconcileMutationAttemptInternal({
+    requestId: preparation.requestId,
+    actor: RULE_AUTO_POST_ACTOR,
+    expectedStageHash: preparation.stagedGraphHash,
+    expectedQboBinding: {
+      qboType: preparation.qboType,
+      qboId: preparation.qboId,
+      qboSyncToken: preparation.qboSyncToken,
+    },
+  }, d);
+}
+
 export async function reconcileGuardedLiveCategorization(
   input: GuardedLiveReconciliationInput,
   options: {

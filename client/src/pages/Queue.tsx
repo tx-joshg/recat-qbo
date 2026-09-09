@@ -16,7 +16,8 @@ import {
   type CategorizationMutationOutcome,
   type CategorizationMutationResult,
   type SplitDto,
-  type StageCategorizationBody,
+  type ManualStageCategorizationBody,
+  type RuleSuggestionDto,
   type TaxCalculation,
   type TransactionDto,
   type TxnStatus,
@@ -26,7 +27,6 @@ import {
   ApiError,
   companies as companiesApi,
   createCategorizationRequestId,
-  rules as rulesApi,
   reports as reportsApi,
   transactions as txnApi,
 } from '../lib/api';
@@ -38,7 +38,7 @@ import TagPicker from '../components/TagPicker';
 import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
-import RulePrompt from '../components/RulePrompt';
+import { useRecurringRule } from './queue/useRecurringRule';
 import TaxCodePicker, {
   isUsableTaxCodeForDirection,
   usableTaxCodesForDirection,
@@ -61,6 +61,18 @@ const STATE_OF: Partial<Record<TxnStatus, UiState>> = {
   ERROR: 'error',
   REVERTED: 'reverted',
 };
+
+function suggestionCategory(transaction: TransactionDto): string | null {
+  const suggestion = transaction.suggestion;
+  return suggestion === null ? null : suggestion.source === 'rule' ? suggestion.action.category : suggestion.category;
+}
+
+type ManualDesiredStage = Omit<ManualStageCategorizationBody, 'expectedRevision'>;
+
+function draftFields(transaction: TransactionDto): string {
+  return JSON.stringify([transaction.categoryQboId, transaction.taxCalculation, transaction.taxCodeQboId,
+    transaction.tagIds, transaction.splits, transaction.sourceGrossCents ?? transaction.amount]);
+}
 
 /** Search words per state — prototype's statusWords map. */
 const STATUS_WORDS: Record<UiState, string> = {
@@ -137,15 +149,6 @@ function errText(e: unknown): string {
 }
 
 const stopMouse = (e: ReactMouseEvent) => e.stopPropagation();
-
-/** The post endpoint may flag rule-prompt eligibility on top of the dto. */
-type PostResponseDto = TransactionDto & { rulePromptEligible?: boolean };
-
-interface RulePromptState {
-  payee: string;
-  category: string;
-  categoryQboId: string | null;
-}
 
 interface TaxMutationState {
   kind: 'commit' | 'undo';
@@ -244,7 +247,7 @@ export default function Queue() {
   const [tagPicker, setTagPicker] = useState<string | null>(null);
   const tagPickerRootRef = useRef<HTMLSpanElement>(null);
   const [errOpenId, setErrOpenId] = useState<string | null>(null);
-  const [rulePrompt, setRulePrompt] = useState<RulePromptState | null>(null);
+  const { offer: offerRecurring, invalidate: invalidateRecurring, dismiss: dismissRecurring, content: recurringContent } = useRecurringRule(activeCompanyId, toast);
   const [splitEditId, setSplitEditId] = useState<string | null>(null);
   const [bulkCat, setBulkCat] = useState<string | null>(null);
   const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
@@ -254,6 +257,7 @@ export default function Queue() {
   const externalRefreshes = useRef<Record<string, object>>({});
   const notificationVersions = useRef<Record<string, number>>({});
   const [externalRefreshState, setExternalRefreshState] = useState<Record<string, 'loading' | 'failed'>>({});
+  const ruleStageProofsRef = useRef<Record<string, RuleSuggestionDto>>({});
   const stageCoordinatorsRef = useRef<Record<string, ReturnType<typeof createRowStageCoordinator>>>({});
   const [syncingCompanyId, setSyncingCompanyId] = useState<string | null>(
     () => activeCompanyId && companySyncLocks.has(activeCompanyId) ? activeCompanyId : null,
@@ -402,6 +406,7 @@ export default function Queue() {
     const generation = companyGeneration.current.value;
     const ids = [...new Set(transactionIds)];
     if (!ids.length) return;
+    invalidateRecurring(ids);
     const token = {};
     const revisions = new Map(rowsRef.current.map(row => [row.id, row.revision]));
     for (const id of ids) {
@@ -410,6 +415,7 @@ export default function Queue() {
       // Stop callbacks from the old draft before requesting authoritative state.
       stageCoordinatorsRef.current[id]?.dispose();
       delete stageCoordinatorsRef.current[id];
+      delete ruleStageProofsRef.current[id];
     }
     setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.map(id => [id, 'loading' as const])) }));
     const current = () => aliveRef.current && companyGeneration.current.value === generation;
@@ -461,7 +467,7 @@ export default function Queue() {
       if (!current()) return;
       setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.filter(id => externalRefreshes.current[id] === token).map(id => [id, 'failed' as const])) }));
     }
-  }, [fetchAllTxns]);
+  }, [fetchAllTxns, invalidateRecurring]);
 
   useEffect(() => subscribeQboMutations(event => {
     if (event.origin !== mutationOrigin.current) void refreshNotifiedTransactions(event.companyId, event.transactionIds);
@@ -569,7 +575,7 @@ export default function Queue() {
   const usesTaxLifecycleFor = useCallback(
     (t: TransactionDto): boolean =>
       taxDirectionFor(t) !== null && (
-        taxReadyFor(t) ||
+        taxReadyFor(t) || ruleStageProofsRef.current[t.id] !== undefined ||
         t.taxCalculation !== null ||
         taxState(t).mutation !== null
       ),
@@ -616,7 +622,7 @@ export default function Queue() {
         t.bankAccount,
         fmtDate(t.date),
         t.category ? fullCat(t.category) : '',
-        t.suggestion?.category || '',
+        suggestionCategory(t) || '',
         STATUS_WORDS[state],
         fmtMoney(t.amount),
         String(Math.abs(t.amount)),
@@ -634,7 +640,7 @@ export default function Queue() {
       if (sortKey === 'acct') return t.bankAccount.toLowerCase();
       if (sortKey === 'cat')
         return (
-          t.splits && t.splits.length ? 'split' : t.category || t.suggestion?.category || ''
+          t.splits && t.splits.length ? 'split' : t.category || suggestionCategory(t) || ''
         ).toLowerCase();
       return STATE_OF[t.status] ?? '';
     };
@@ -715,7 +721,7 @@ export default function Queue() {
   );
 
   const stageBodyFor = useCallback(
-    (t: TransactionDto, state: TaxRowState): DesiredStage | null => {
+    (t: TransactionDto, state: TaxRowState): ManualDesiredStage | null => {
       const taxCalculation: TaxCalculation =
         t.splits && t.splits.length > 0
           ? state.taxCalculation
@@ -740,7 +746,7 @@ export default function Queue() {
             tagIds: t.tagIds,
           }];
 
-      const lines: StageCategorizationBody['lines'] = [];
+      const lines: ManualStageCategorizationBody['lines'] = [];
       for (const line of sourceLines) {
         const grossCents = exactCents(line.amount);
         if (grossCents === null || !line.categoryQboId) return null;
@@ -766,7 +772,8 @@ export default function Queue() {
   );
 
   const readyStageFor = useCallback((t: TransactionDto, state: TaxRowState) => {
-    const desired = stageBodyFor(t, state);
+    const proof = ruleStageProofsRef.current[t.id];
+    const desired: DesiredStage | null = proof ? { ruleSuggestion: proof } : stageBodyFor(t, state);
     if (hasActiveMutation(t) || desired === null || state.stage.status !== 'ready' ||
       state.stage.staged === null || state.stage.staged !== state.stage.desired ||
       !sameDesired(state.stage.staged, desired)) return null;
@@ -776,38 +783,57 @@ export default function Queue() {
   const requestStage = useCallback(
     (t: TransactionDto, state: TaxRowState) => {
       if (role !== 'categorizer' && role !== 'admin') return;
-      if (t.status !== 'PENDING' || state.stage.status === 'conflict' || hasActiveMutation(t) || !taxReadyFor(t)) return;
-      const desired = stageBodyFor(t, state);
+      if (t.companyId !== activeCompanyIdRef.current || t.status !== 'PENDING' || state.stage.status === 'conflict' || hasActiveMutation(t)) return;
+      const proof = ruleStageProofsRef.current[t.id];
+      if (!proof && !taxReadyFor(t)) return;
+      const desired: DesiredStage | null = proof ? { ruleSuggestion: proof } : stageBodyFor(t, state);
       if (desired === null) return;
       let coordinator = stageCoordinatorsRef.current[t.id];
       if (!coordinator) {
         const companyId = activeCompanyIdRef.current;
         // A revision-only change or a lost response may rebase safely. A different
         // server draft must be shown for review before another local write.
-        let acknowledged = stageBodyFor(t, initialTaxState(t));
-        let lastSent: DesiredStage | null = null;
+        const baseline = rowsRef.current.find(row => row.id === t.id) ?? t;
+        let acknowledged = stageBodyFor(baseline, initialTaxState(baseline));
+        let lastSent: ManualDesiredStage | null = null;
+        const projection = (next: DesiredStage): ManualDesiredStage | null => {
+          if (!('ruleSuggestion' in next)) return next;
+          const action = next.ruleSuggestion.action;
+          const grossCents = t.sourceGrossCents ?? exactCents(t.amount);
+          if (grossCents === null) return null;
+          return { taxCalculation: action.taxCalculation, tagIds: [...action.tagIds], lines: [{
+            grossCents, categoryQboId: action.categoryQboId, taxCodeQboId: action.taxCodeQboId,
+            tagIds: [...action.tagIds],
+          }] };
+        };
         let concurrentEdit = false;
         coordinator = createRowStageCoordinator(t.revision, {
           stage: async (expectedRevision, nextDesired) => {
-            lastSent = nextDesired;
+            lastSent = projection(nextDesired);
             const result = await txnApi.stageCategorization(t.id, { ...nextDesired, expectedRevision });
-            acknowledged = nextDesired;
+            acknowledged = projection(nextDesired);
             return result;
           },
-          reload: async () => {
+          reload: async (rejectedDesired) => {
             if (!companyId) return null;
             const latestRows = await fetchAllTxns(companyId);
             if (!aliveRef.current || activeCompanyIdRef.current !== companyId || stageCoordinatorsRef.current[t.id] !== coordinator) return null;
             const latest = latestRows.find((row) => row.id === t.id) ?? null;
             const latestDesired = latest ? stageBodyFor(latest, initialTaxState(latest)) : null;
+            const currentProof = ruleStageProofsRef.current[t.id];
+            const rejectedCurrentProof = currentProof !== undefined && rejectedDesired !== undefined
+              && sameDesired({ ruleSuggestion: currentProof }, rejectedDesired);
+            if (rejectedCurrentProof) delete ruleStageProofsRef.current[t.id];
             concurrentEdit = latest !== null && latest.status === 'PENDING' && latest.activeCategorizationAttempt === null
-              && (latestDesired === null || !(
+              && !(latestDesired !== null && (
                 (acknowledged !== null && sameDesired(latestDesired, acknowledged))
                 || (lastSent !== null && sameDesired(latestDesired, lastSent))
-              ));
+              ) || (acknowledged === null && draftFields(latest) === draftFields(baseline)));
             if (latest === null) {
+              delete ruleStageProofsRef.current[t.id];
               setRows((prev) => prev.filter((row) => row.id !== t.id));
-            } else if (latest.status !== 'PENDING' || latest.activeCategorizationAttempt !== null || concurrentEdit) {
+            } else if (latest.status !== 'PENDING' || latest.activeCategorizationAttempt !== null || concurrentEdit || rejectedCurrentProof) {
+              delete ruleStageProofsRef.current[t.id];
               patchRow(t.id, latest);
               setTaxRows((prev) => ({ ...prev, [t.id]: {
                 ...initialTaxState(latest), stage: prev[t.id]?.stage ?? initialTaxState(latest).stage,
@@ -831,14 +857,20 @@ export default function Queue() {
             ...(view.status === 'ready' ? { mutation: null } : {}),
           } }));
           if (view.status === 'ready' && view.result !== null) {
-            patchRow(t.id, { revision: view.result.revision, taxCalculation: view.result.taxCalculation });
+            const proof = view.staged && 'ruleSuggestion' in view.staged ? view.staged.ruleSuggestion : null;
+            const line = proof ? view.result.lines[0] : undefined;
+            patchRow(t.id, { revision: view.result.revision, taxCalculation: view.result.taxCalculation,
+              ...(proof && line ? { category: proof.action.category, categoryQboId: line.categoryQboId,
+                taxCodeQboId: line.taxCodeQboId, taxCode: taxCodesFor(t).find(code => code.qboId === line.taxCodeQboId)?.name ?? null,
+                tagIds: [...view.result.tagIds] } : {}),
+            });
           }
         });
         stageCoordinatorsRef.current[t.id] = coordinator;
       }
       coordinator.update(desired);
     },
-    [role, hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
+    [role, hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow, taxCodesFor],
   );
 
   useEffect(() => {
@@ -854,18 +886,21 @@ export default function Queue() {
       if (present.has(id)) continue;
       coordinator.dispose();
       delete stageCoordinatorsRef.current[id];
+      delete ruleStageProofsRef.current[id];
     }
   }, [rows]);
 
   useEffect(() => () => {
     for (const coordinator of Object.values(stageCoordinatorsRef.current)) coordinator.dispose();
     stageCoordinatorsRef.current = {};
-  }, []);
+    ruleStageProofsRef.current = {};
+  }, [activeCompanyId]);
 
   /** Assign a category: server merges matching rule tags — use the returned dto. */
   const categorizeTo = useCallback(
     (t: TransactionDto, name: string, categoryQboId: string) => {
       if (hasActiveMutation(t)) return;
+      delete ruleStageProofsRef.current[t.id];
       const prev = { category: t.category, categoryQboId: t.categoryQboId };
       patchRow(t.id, { category: name, categoryQboId }); // optimistic
       if (taxReadyFor(t)) {
@@ -906,7 +941,7 @@ export default function Queue() {
   const rowCategoryOptions = useMemo(() => {
     const bySuggestion = new Map<string, typeof bulkCategoryOptions>();
     return (t: TransactionDto) => {
-      const suggested = t.suggestion?.category;
+      const suggested = suggestionCategory(t);
       if (!suggested) return bulkCategoryOptions;
       const cached = bySuggestion.get(suggested);
       if (cached) return cached;
@@ -917,13 +952,28 @@ export default function Queue() {
     };
   }, [bulkCategoryOptions]);
 
-  const pickRowCategory = useCallback(
-    (t: TransactionDto, qboId: string) => {
-      const account = catAccounts.find((candidate) => candidate.qboId === qboId);
-      if (account) categorizeTo(t, account.name, account.qboId);
-    },
-    [catAccounts, categorizeTo],
-  );
+  const pickRowCategory = useCallback((t: TransactionDto, qboId: string) => {
+    if (hasActiveMutation(t)) return;
+    const account = catAccounts.find(candidate => candidate.qboId === qboId);
+    if (!account) return;
+    const suggestion = t.suggestion;
+    if (suggestion?.source !== 'rule' || suggestion.action.categoryQboId !== qboId) {
+      categorizeTo(t, account.name, account.qboId);
+      return;
+    }
+    if (suggestion.action.direction !== t.qboType) {
+      toast('This rule suggestion changed. Reload before continuing.');
+      return;
+    }
+    ruleStageProofsRef.current[t.id] = suggestion;
+    const next = { ...t, category: suggestion.action.category, categoryQboId: suggestion.action.categoryQboId,
+      taxCalculation: suggestion.action.taxCalculation, taxCodeQboId: suggestion.action.taxCodeQboId,
+      taxCode: taxCodesFor(t).find(code => code.qboId === suggestion.action.taxCodeQboId)?.name ?? null,
+      tagIds: [...suggestion.action.tagIds], splits: null };
+    const nextState = { ...taxState(t), taxCalculation: suggestion.action.taxCalculation,
+      taxCodeQboId: suggestion.action.taxCodeQboId };
+    patchRow(t.id, next); updateTaxState(t, () => nextState); requestStage(next, nextState);
+  }, [hasActiveMutation, catAccounts, categorizeTo, taxCodesFor, taxState, patchRow, updateTaxState, requestStage, toast]);
 
   const pickBulkCategory = useCallback(
     (qboId: string) => {
@@ -944,6 +994,7 @@ export default function Queue() {
     if (!current()) return;
     stageCoordinatorsRef.current[t.id]?.dispose();
     delete stageCoordinatorsRef.current[t.id];
+    delete ruleStageProofsRef.current[t.id];
     updateTaxState(t, (state) => ({ ...state, mutation: {
       ...mutation, outcome: 'VERIFIED', busy: true, phase: 'resolving', resolution: 'resolving',
     } }));
@@ -986,6 +1037,10 @@ export default function Queue() {
       }
       notifyQboMutation(t.companyId, [t.id], mutationOrigin.current);
       if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
+      if (mutation.kind === 'undo') invalidateRecurring([t.id]);
+      if (result.ok && result.outcome === 'VERIFIED' && result.status === 'POSTED' && mutation.kind === 'commit') {
+        offerRecurring({ companyId: t.companyId, transactionId: t.id, payee: t.payee });
+      }
       if (result.ok && result.outcome === 'VERIFIED' && result.status === 'PENDING' && mutation.kind === 'undo') {
         void refreshAfterVerifiedUndo(t, mutation);
         return;
@@ -1013,7 +1068,7 @@ export default function Queue() {
         },
       }));
     },
-    [patchRow, updateTaxState, refreshAfterVerifiedUndo, notifyQboMutation, toast],
+    [patchRow, updateTaxState, refreshAfterVerifiedUndo, notifyQboMutation, toast, offerRecurring, invalidateRecurring],
   );
 
   const recordTaxMutationFailure = useCallback(
@@ -1036,6 +1091,7 @@ export default function Queue() {
         if (['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED', 'SUPERSEDED'].includes(error.code)) {
           stageCoordinatorsRef.current[t.id]?.dispose();
           delete stageCoordinatorsRef.current[t.id];
+          delete ruleStageProofsRef.current[t.id];
           setRows(previous => previous.filter(row => row.id !== t.id));
           setSel(previous => { const next = { ...previous }; delete next[t.id]; return next; });
           setTaxRows(previous => { const next = { ...previous }; delete next[t.id]; return next; });
@@ -1059,6 +1115,7 @@ export default function Queue() {
             const fresh = freshRows.find(row => row.id === t.id);
             stageCoordinatorsRef.current[t.id]?.dispose();
             delete stageCoordinatorsRef.current[t.id];
+            delete ruleStageProofsRef.current[t.id];
             if (fresh) {
               patchRow(t.id, fresh);
               setTaxRows(previous => ({ ...previous, [t.id]: initialTaxState(fresh) }));
@@ -1341,6 +1398,7 @@ export default function Queue() {
       if (!window.confirm(
         `Undo this categorization in QuickBooks?\nThis will restore the original ${t.qboType === 'Deposit' ? 'Deposit' : 'Purchase'} exactly.`,
       )) return;
+      invalidateRecurring([t.id]);
       const requestId = createCategorizationRequestId();
       const mutation: TaxMutationState = {
         kind: 'undo',
@@ -1363,7 +1421,7 @@ export default function Queue() {
           recordTaxMutationFailure(t, error, mutation);
         });
     },
-    [updateTaxState, recordTaxMutation, recordTaxMutationFailure],
+    [updateTaxState, recordTaxMutation, recordTaxMutationFailure, invalidateRecurring],
   );
 
   const requireTransactionRefresh = useCallback((ids: string[]) => {
@@ -1371,6 +1429,7 @@ export default function Queue() {
       externalRefreshes.current[id] = {};
       stageCoordinatorsRef.current[id]?.dispose();
       delete stageCoordinatorsRef.current[id];
+      delete ruleStageProofsRef.current[id];
     }
     setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.map(id => [id, 'failed' as const])) }));
   }, []);
@@ -1380,7 +1439,7 @@ export default function Queue() {
       const t0 = rows.find((t) => t.id === id);
       const hasSplit = !!(t0 && t0.splits && t0.splits.length);
       if (!t0 || hasActiveMutation(t0) || !(t0.category || hasSplit)) return;
-      if (taxReadyFor(t0)) {
+      if (taxReadyFor(t0) || ruleStageProofsRef.current[t0.id]) {
         commitTax(t0);
         return;
       }
@@ -1403,7 +1462,7 @@ export default function Queue() {
       txnApi
         .post(id)
         .then((res) => {
-          const dto = res as PostResponseDto;
+          const dto = res;
           if (dto.id !== id || dto.companyId !== t0.companyId) {
             if (current()) requireTransactionRefresh([id]);
             return;
@@ -1413,19 +1472,7 @@ export default function Queue() {
           if (dto.status === 'DRY_RUN') toast('Dry run — payload logged, nothing sent to QuickBooks.');
           updateRow(dto);
           setSel((s) => ({ ...s, [id]: false }));
-          if (
-            dto.rulePromptEligible &&
-            (dto.status === 'POSTED' || dto.status === 'DRY_RUN')
-          ) {
-            setRulePrompt(
-              (rp) =>
-                rp ?? {
-                  payee: dto.payee,
-                  category: dto.category ?? '',
-                  categoryQboId: dto.categoryQboId,
-                },
-            );
-          }
+
         })
         .catch((e) => {
           if (!current()) return;
@@ -1526,6 +1573,7 @@ export default function Queue() {
   const toggleTag = useCallback(
     (t: TransactionDto, tagId: string) => {
       if (hasActiveMutation(t)) return;
+      delete ruleStageProofsRef.current[t.id];
       const prev = t.tagIds;
       const next = t.tagIds.includes(tagId)
         ? t.tagIds.filter((i) => i !== tagId)
@@ -1551,6 +1599,7 @@ export default function Queue() {
   const saveSplit = useCallback(
     (t: TransactionDto, lines: SplitLineDraft[], taxCalculation?: TaxCalculation) => {
       if (hasActiveMutation(t)) return;
+      delete ruleStageProofsRef.current[t.id];
       const sign = t.amount < 0 ? -1 : 1;
       const splits: SplitDto[] = lines.map((l) => {
         const amount = Math.round((parseFloat(l.amt) || 0) * 100) / 100;
@@ -1734,20 +1783,6 @@ export default function Queue() {
     toast,
   ]);
 
-  const createRule = useCallback(() => {
-    if (!activeCompanyId || !rulePrompt) return;
-    const rp = rulePrompt;
-    setRulePrompt(null);
-    rulesApi
-      .create(activeCompanyId, {
-        matchText: rp.payee,
-        category: rp.category,
-        categoryQboId: rp.categoryQboId,
-      })
-      .then(() => toast('Rule created — matching payees will be pre-filled'))
-      .catch((e) => toast(errText(e)));
-  }, [activeCompanyId, rulePrompt, toast]);
-
   // Prototype cycleSort: first press asc, second desc, third back to original.
   const cycleSort = useCallback(
     (k: SortKey) => {
@@ -1774,7 +1809,7 @@ export default function Queue() {
       setSel({});
       setTagPicker(null);
       setErrOpenId(null);
-      setRulePrompt(null);
+      dismissRecurring();
       setSplitEditId(null);
       return;
     }
@@ -1871,7 +1906,7 @@ export default function Queue() {
   const rowView = (t: TransactionDto): RowView => {
     const state = stateOf(t);
     const hasSplit = !!(t.splits && t.splits.length);
-    const sugName = t.suggestion?.category ?? null;
+    const sugName = suggestionCategory(t);
     const suggested = !t.category && !hasSplit && !!sugName;
     const mate = xferMateOf(t);
     // Same rule as the server's tagsRequired guard (writeback.ts): split txns
@@ -1948,8 +1983,8 @@ export default function Queue() {
           triggerTone={v.suggested ? 'suggested' : undefined}
           triggerBadge={v.suggested ? v.isRule ? 'rule' : 'suggested' : undefined}
           triggerBadgeTooltip={
-            v.isRule && (v.t.suggestion?.matchedRules ?? 0) > 1
-              ? `Matched ${v.t.suggestion?.matchedRules} rules — “${v.t.suggestion?.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`
+            v.isRule && v.t.suggestion?.source === 'rule'
+              ? `Rule revision ${v.t.suggestion.ruleRevision}`
               : undefined
           }
         />
@@ -1991,7 +2026,7 @@ export default function Queue() {
       ));
 
   const taxControls = (t: TransactionDto) => {
-    if (!taxReadyFor(t) || t.status !== 'PENDING' || (!t.category && !(t.splits && t.splits.length))) {
+    if ((!taxReadyFor(t) && !ruleStageProofsRef.current[t.id]) || t.status !== 'PENDING' || (!t.category && !(t.splits && t.splits.length))) {
       return null;
     }
     const state = taxState(t);
@@ -2013,6 +2048,7 @@ export default function Queue() {
             disabled={locked}
             onChange={(taxCodeQboId) => {
               if (locked) return;
+              delete ruleStageProofsRef.current[t.id];
               patchRow(t.id, {
                 taxCodeQboId,
                 taxCode:
@@ -2043,6 +2079,7 @@ export default function Queue() {
               options={[{ value: 'TaxInclusive', label: 'Tax inclusive' }, { value: 'TaxExcluded', label: 'Tax exclusive' }]}
               onValueChange={(next) => {
                 if (locked || (next !== 'TaxInclusive' && next !== 'TaxExcluded')) return;
+                delete ruleStageProofsRef.current[t.id];
                 const nextState: TaxRowState = { ...state, taxCalculation: next };
                 updateTaxState(t, () => nextState);
                 requestStage(t, nextState);
@@ -2076,6 +2113,7 @@ export default function Queue() {
             if (state.stage.status === 'conflict') {
               stageCoordinatorsRef.current[t.id]?.dispose();
               delete stageCoordinatorsRef.current[t.id];
+              delete ruleStageProofsRef.current[t.id];
               updateTaxState(t, () => next);
             }
             requestStage(t, next);
@@ -2237,6 +2275,7 @@ export default function Queue() {
           if (state.stage.status === 'conflict' || !stageCoordinatorsRef.current[v.t.id]) {
             stageCoordinatorsRef.current[v.t.id]?.dispose();
             delete stageCoordinatorsRef.current[v.t.id];
+            delete ruleStageProofsRef.current[v.t.id];
             const next = { ...state, mutation: null, stage: initialTaxState(v.t).stage };
             updateTaxState(v.t, () => next);
             requestStage(v.t, next);
@@ -3046,14 +3085,7 @@ export default function Queue() {
         />
       )}
 
-      {rulePrompt && (
-        <RulePrompt
-          payee={rulePrompt.payee}
-          category={rulePrompt.category}
-          onCreate={createRule}
-          onDismiss={() => setRulePrompt(null)}
-        />
-      )}
+      {recurringContent}
 
       {/* split editor */}
       {splitTxn && (

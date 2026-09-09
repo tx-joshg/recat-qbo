@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   CategorizationMutationResult,
+  RuleMutationResult,
   StagedCategorization,
   TaxReadinessDto,
   TransactionDto,
@@ -25,7 +26,9 @@ const mocks = vi.hoisted(() => ({
   bulkPost: vi.fn(),
   transfer: vi.fn(),
   sync: vi.fn(),
-  rulesCreate: vi.fn(),
+  currentCase: vi.fn(),
+  prepareFromCase: vi.fn(),
+  commitRuleOperation: vi.fn(),
   navigate: vi.fn(),
   toast: vi.fn(),
   setPendingCount: vi.fn(),
@@ -118,7 +121,9 @@ vi.mock('../lib/api', () => {
     createCategorizationRequestId: mocks.requestId,
     companies: { sync: mocks.sync },
     reports: { bankAccounts: mocks.bankAccounts },
-    rules: { create: mocks.rulesCreate },
+    classificationMemory: { currentCase: mocks.currentCase },
+    rules: { lifecycle: vi.fn().mockResolvedValue({ runtimeMode: 'canonical', items: [], nextCursor: null }) },
+    ruleOperations: { prepareFromCase: mocks.prepareFromCase, commit: mocks.commitRuleOperation },
     transactions: {
       list: mocks.list,
       refreshProviderStatus: mocks.refreshProviderStatus,
@@ -318,6 +323,7 @@ beforeEach(() => {
       removeEventListener: vi.fn(),
     })),
   });
+  mocks.currentCase.mockResolvedValue(null);
   mocks.taxReadiness = READY;
   mocks.activeCompanyId = 'COMPANY_GENERIC';
   mocks.tags = [];
@@ -2516,3 +2522,89 @@ function mockMobileMedia() {
       })),
     });
 }
+  it('keeps apply-once distinct and prepares recurring intent only after the explicit action', async () => {
+    const currentCase = {
+      id: 'case-current', companyId: 'COMPANY_GENERIC', transactionId: 'TRANSACTION_GENERIC',
+      vendorIdentityId: null, qboMutationAttemptId: 'attempt-current',
+      action: { categoryQboId: 'EXPENSE_ACCOUNT', taxCalculation: 'TaxInclusive', taxCodeQboId: 'TAX_CODE_STANDARD', tagIds: [] },
+      actionFingerprint: 'fingerprint', originIntent: 'apply_once', rationale: 'Verified receipt.',
+      requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+      reviewer: { userId: 'user-1', configVersion: 'v1', decision: 'approved' },
+      jurisdiction: 'CA-BC', currency: 'CAD',
+      context: { transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: 'Generic bank', businessPurpose: null },
+      provenance: { source: 'qbo_verified', sourceId: 'attempt-current', actorId: 'user-1', recordedAt: '2026-08-30T00:00:00.000Z' },
+      verifiedAt: '2026-08-30T00:00:00.000Z', invalidatedAt: null, invalidationReason: null,
+    };
+    mocks.currentCase.mockResolvedValue(currentCase);
+    mocks.prepareFromCase.mockResolvedValue({
+      ok: true, operationId: 'operation-1', companyId: 'COMPANY_GENERIC', mutation: 'create',
+      originIntent: 'make_recurring', status: 'PREPARED', ruleId: 'rule-1', revision: null,
+      rule: null, candidate: null, error: null,
+      preview: {
+        operationId: 'operation-1', companyId: 'COMPANY_GENERIC', ruleId: 'rule-1', candidateId: null,
+        mutation: 'create', originIntent: 'make_recurring', currentRevision: 0, proposedRevision: 1,
+        condition: { matchField: 'payee', matchText: 'Generic supplier' },
+        action: currentCase.action, categoryName: 'Generic expense', taxCodeName: 'Standard purchase tax',
+        direction: 'Purchase', autoPost: false, affectedPendingCount: 2, affectedProcessedCount: 1,
+        sampleTransactions: [], conflicts: [], warnings: [],
+        expiresAt: '2026-08-31T01:00:00.000Z', preparationDigest: 'digest',
+      },
+    });
+    let resolveCommit!: (value: RuleMutationResult) => void;
+    mocks.commitRuleOperation.mockReturnValue(new Promise<RuleMutationResult>((resolve) => { resolveCommit = resolve; }));
+    const committed = {
+      ok: true, operationId: 'operation-1', companyId: 'COMPANY_GENERIC', mutation: 'create',
+      originIntent: 'make_recurring', status: 'COMMITTED', ruleId: 'rule-1', revision: 1,
+      rule: null, candidate: null, preview: null, error: null,
+    } as const;
+    const user = userEvent.setup();
+    await renderQueue();
+
+    await user.click(await waitForPostEnabled());
+
+    expect(await screen.findByRole('button', { name: 'Apply once' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Make recurring suggestion' })).toBeInTheDocument();
+    expect(mocks.prepareFromCase).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Make recurring suggestion' }));
+    await waitFor(() => expect(mocks.prepareFromCase).toHaveBeenCalledWith(
+      'COMPANY_GENERIC',
+      'case-current',
+      {
+        matchText: 'Generic supplier',
+        idempotencyKey: '00000000-0000-4000-8000-000000000202',
+      },
+    ));
+    expect(await screen.findByText(/auto-post remains off/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 pending.*1 processed/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Confirm recurring suggestion' }));
+    await waitFor(() => expect(mocks.commitRuleOperation).toHaveBeenCalledWith(
+      'COMPANY_GENERIC',
+      'operation-1',
+      '00000000-0000-4000-8000-000000000202',
+    ));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    await user.click(screen.getByTestId('confirm-dialog-backdrop'));
+    expect(screen.getByRole('dialog', { name: 'Make recurring suggestion?' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Make recurring suggestion' })).not.toBeInTheDocument();
+
+    await act(async () => resolveCommit(committed));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+it.each([
+  { ok: false, status: 'POSTED' as const, outcome: 'VERIFIED' as const },
+  { status: 'DRY_RUN' as const, outcome: 'DRY_RUN' as const },
+  { ok: false, status: 'ERROR' as const, outcome: 'UNCERTAIN' as const },
+  { ok: false, status: 'PENDING' as const, outcome: 'RETRYABLE' as const },
+  { ok: false, status: 'PENDING' as const, outcome: 'REJECTED' as const },
+])('does not offer recurring intent without durable verified success: %j', async result => {
+  mocks.commit.mockResolvedValue(mutation(result));
+  await renderQueue();
+  await userEvent.click(await waitForPostEnabled());
+  await waitFor(() => expect(mocks.commit).toHaveBeenCalledTimes(1));
+  expect(mocks.currentCase).not.toHaveBeenCalled();
+  expect(mocks.prepareFromCase).not.toHaveBeenCalled();
+});

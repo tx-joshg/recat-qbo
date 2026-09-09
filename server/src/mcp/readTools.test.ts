@@ -62,6 +62,7 @@ function reads(): CompanyReadOperations {
     getTransaction: vi.fn().mockResolvedValue(sampleTransaction),
     listCategories: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     listTaxCodes: vi.fn().mockResolvedValue({
+      direction: 'Purchase',
       status: 'ready',
       reason: null,
       usingSalesTax: true,
@@ -70,7 +71,50 @@ function reads(): CompanyReadOperations {
       nextCursor: null,
     }),
     listTags: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
-    listRules: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listRules: vi.fn().mockResolvedValue({ runtimeMode: 'canonical', items: [], nextCursor: null }),
+    getRule: vi.fn().mockResolvedValue({
+      state: 'enabled',
+      reviewRequiredAt: null,
+      reviewReason: null,
+      repairReason: null,
+      revision: {
+        id: 'revision-a', ruleId: 'rule-a', companyId: 'company-a', revision: 2,
+        state: 'enabled', condition: { matchField: 'payee', matchText: 'Coffee' },
+        direction: 'Purchase',
+        action: { version: 2, direction: 'Purchase', category: 'Meals', categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+        taxCodeName: null, autoPost: false,
+        originIntent: 'make_recurring', sourceCaseId: 'case-a', sourceCandidateId: null,
+        changedBy: null, createdAt: '2026-01-01T00:00:00.000Z', repairReason: null,
+        affectedJournalEntryCount: 0,
+        valid: true, invalidReasons: [],
+      },
+    }),
+    testRule: vi.fn().mockResolvedValue({
+      samples: [], nextCursor: null, pendingCount: 0, processedCount: 0,
+      conflicts: [], conflictsTruncated: false,
+    }),
+    listRuleCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    getRuleCandidate: vi.fn().mockResolvedValue({
+      id: 'candidate-a', companyId: 'company-a', state: 'conflict', matchField: 'payee',
+      matchText: 'Coffee', categoryName: 'Meals', taxCodeName: null,
+      action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      invalidReasons: [],
+      executable: false, advisory: true, evidenceCount: 3, conflictingEvidenceCount: 1,
+      schemaVersion: 'rule-candidate-v1', configVersion: 'config-a', activatedRuleId: null,
+      updatedAt: '2026-01-01T00:00:00.000Z', evidence: [],
+    }),
+    getClassificationCase: vi.fn().mockResolvedValue({
+      id: 'case-a', companyId: 'company-a', transactionId: 'transaction-a', vendorIdentityId: null,
+      qboMutationAttemptId: 'attempt-a',
+      action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      actionFingerprint: 'a'.repeat(64), originIntent: 'apply_once', rationale: 'Verified classification.',
+      requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+      reviewer: { userId: null, configVersion: 'config-a', decision: 'approved' },
+      jurisdiction: 'unknown', currency: 'CAD',
+      context: { transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: null, businessPurpose: null },
+      provenance: { source: 'qbo_verified', sourceId: 'attempt-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+      verifiedAt: '2026-01-01T00:00:00.000Z', invalidatedAt: null, invalidationReason: null,
+    }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
   };
 }
@@ -147,7 +191,8 @@ describe('Recat MCP read tools', () => {
       { legacy: 'stateless' },
     );
     const response = await legacy(handler, 'tools/call', {
-      name, arguments: name !== 'list_companies' ? { companyId: 'company-a' } : {},
+      name, arguments: name === 'list_tax_codes' ? { companyId: 'company-a', direction: 'Purchase' }
+        : name !== 'list_companies' ? { companyId: 'company-a' } : {},
     });
     expect(response.result.isError).not.toBe(true);
     if (name === 'list_transactions') {
@@ -399,7 +444,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers thirteen core reads and twenty-four conservatively annotated action tools', async () => {
+  it('registers canonical reads and conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -421,6 +466,8 @@ describe('Recat MCP read tools', () => {
       'prepare_tax_refund',
       'cancel_tax_refund',
       'acknowledge_tax_refund_recorded',
+      'prepare_rule_change',
+      'commit_rule_change',
       'create_attachment_upload',
       'attach_transaction_files',
       'list_transaction_attachments',
@@ -434,7 +481,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(37);
+    expect(tools).toHaveLength(READ_TOOL_NAMES.length + 26);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: !['sync_company', 'refresh_transaction_mirror', 'get_write_safety', 'refresh_provider_actionability'].includes(tool.name),
@@ -541,6 +588,8 @@ describe('Recat MCP read tools', () => {
         name: 'acknowledge_tax_refund_recorded',
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
+      { name: 'prepare_rule_change', annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
+      { name: 'commit_rule_change', annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
       {
         name: 'create_attachment_upload',
         annotations: {
@@ -710,6 +759,18 @@ describe('Recat MCP read tools', () => {
     });
   });
 
+  it.each(['legacy', 'bridge', 'paused', 'canonical'])('returns the actual %s rule runtime state over MCP', async (runtimeMode) => {
+    const operations = reads();
+    vi.mocked(operations.listRules).mockResolvedValueOnce({ runtimeMode, items: [], nextCursor: null } as never);
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations, log: vi.fn() }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', { name: 'list_rules', arguments: { companyId: 'company-a' } });
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.runtimeMode).toBe(runtimeMode);
+  });
+
   it('routes every company read tool, forwards pagination, and safely reports authorization failures', async () => {
     const operations = reads();
     const handler = createMcpHandler(
@@ -721,7 +782,7 @@ describe('Recat MCP read tools', () => {
       ['list_transactions', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
       ['get_transaction', { companyId: 'company-a', transactionId: 'transaction-a' }],
       ['list_categories', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
-      ['list_tax_codes', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
+      ['list_tax_codes', { companyId: 'company-a', direction: 'Purchase', limit: 1, cursor: 'cursor-a' }],
       ['list_tags', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
       ['list_rules', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
       ['list_transfer_candidates', { companyId: 'company-a', limit: 1, cursor: 'cursor-a' }],
@@ -767,30 +828,22 @@ describe('Recat MCP read tools', () => {
   it('returns non-empty rule review state and activation provenance', async () => {
     const operations = reads();
     vi.mocked(operations.listRules).mockResolvedValueOnce({
+      runtimeMode: 'canonical',
       items: [{
-        id: 'rule-a',
-        companyId: 'company-a',
-        priority: 0,
-        matchField: 'payee',
-        matchText: 'Coffee',
-        category: 'Meals',
-        categoryQboId: 'account-a',
-        taxCalculation: null,
-        taxCode: null,
-        taxCodeQboId: null,
-        tagIds: [],
-        autoPost: false,
-        createdAt: '2026-01-01T00:00:00.000Z',
+        state: 'disabled',
         reviewRequiredAt: '2026-01-02T00:00:00.000Z',
         reviewReason: 'Verified outcomes now conflict with this learned rule.',
-        origin: {
-          candidateId: 'candidate-a',
-          evidenceCount: 3,
-          schemaVersion: 'schema-v1',
-          configVersion: 'config-v2',
+        repairReason: null,
+        revision: {
+          id: 'revision-a', ruleId: 'rule-a', companyId: 'company-a', revision: 2,
+          state: 'disabled', condition: { matchField: 'payee', matchText: 'Coffee' },
+          direction: 'Purchase',
+          action: { version: 2, direction: 'Purchase', category: 'Meals', categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+          taxCodeName: null, autoPost: false,
+          originIntent: 'auto_candidate', sourceCaseId: null, sourceCandidateId: 'candidate-a',
+          changedBy: null, createdAt: '2026-01-01T00:00:00.000Z', repairReason: null,
+          affectedJournalEntryCount: 0, valid: true, invalidReasons: [],
         },
-        valid: true,
-        invalidReasons: [],
       }],
       nextCursor: null,
     });
@@ -809,12 +862,10 @@ describe('Recat MCP read tools', () => {
       expect.objectContaining({
         reviewRequiredAt: '2026-01-02T00:00:00.000Z',
         reviewReason: 'Verified outcomes now conflict with this learned rule.',
-        origin: {
-          candidateId: 'candidate-a',
-          evidenceCount: 3,
-          schemaVersion: 'schema-v1',
-          configVersion: 'config-v2',
-        },
+        revision: expect.objectContaining({
+          sourceCandidateId: 'candidate-a',
+          originIntent: 'auto_candidate',
+        }),
       }),
     ]);
   });
@@ -890,5 +941,84 @@ describe('Recat MCP read tools', () => {
       code: SpanStatusCode.ERROR,
     });
     expect(span.end).toHaveBeenCalledTimes(1);
+  });
+  it('returns legacy invalid rule history and gathering candidates without unsafe coercion', async () => {
+    const operations = reads();
+    vi.mocked(operations.getRule).mockResolvedValueOnce({
+      state: 'disabled', reviewRequiredAt: null, reviewReason: null,
+      repairReason: 'Legacy rule requires repair.',
+      revision: {
+        id: 'revision-legacy', ruleId: 'rule-legacy', companyId: 'company-a', revision: 1,
+        state: 'enabled', condition: { matchField: 'payee', matchText: 'Legacy' },
+        direction: null, action: null, taxCodeName: null,
+        autoPost: false, originIntent: null, sourceCaseId: null, sourceCandidateId: null,
+        changedBy: null, createdAt: '2025-01-01T00:00:00.000Z',
+        repairReason: 'Legacy rule requires repair.', affectedJournalEntryCount: 0,
+        valid: false,
+        invalidReasons: ['Category account is missing or inactive.', 'Tax treatment is missing or invalid.'],
+      },
+    });
+    vi.mocked(operations.getRuleCandidate).mockResolvedValueOnce({
+      id: 'candidate-gathering', companyId: 'company-a', state: 'gathering', matchField: 'payee',
+      matchText: 'Coffee', categoryName: null, taxCodeName: null, action: null,
+      invalidReasons: [],
+      executable: false, advisory: true, evidenceCount: 1, conflictingEvidenceCount: 0,
+      schemaVersion: 'v1', configVersion: 'v1', activatedRuleId: null,
+      updatedAt: '2026-01-01T00:00:00.000Z', evidence: [],
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const rule = await legacy(handler, 'tools/call', {
+      name: 'get_rule', arguments: { companyId: 'company-a', ruleId: 'rule-legacy' },
+    });
+    const candidate = await legacy(handler, 'tools/call', {
+      name: 'get_rule_candidate', arguments: { companyId: 'company-a', candidateId: 'candidate-gathering' },
+    });
+    expect(rule.result.isError).not.toBe(true);
+    expect(rule.result).toMatchObject({ structuredContent: { revision: { action: null, valid: false } } });
+    expect(candidate.result.isError).not.toBe(true);
+    expect(candidate.result).toMatchObject({ structuredContent: { state: 'gathering' } });
+  });
+
+  it('accepts complete rule suggestions and rejects legacy rule hints at the MCP boundary', async () => {
+    const operations = reads();
+    vi.mocked(operations.getTransaction)
+      .mockResolvedValueOnce({
+        ...sampleTransaction,
+        suggestion: {
+          source: 'rule', version: 2, ruleId: 'rule-a', ruleRevision: 3,
+          action: {
+            version: 2, direction: 'Purchase', category: 'Meals', categoryQboId: 'account-a',
+            taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [],
+          },
+          autoPost: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        ...sampleTransaction,
+        suggestion: { source: 'rule', category: 'Meals', categoryQboId: 'account-a' },
+      } as never);
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const accepted = await legacy(handler, 'tools/call', {
+      name: 'get_transaction',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+    const rejected = await legacy(handler, 'tools/call', {
+      name: 'get_transaction',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+
+    expect(accepted.result.isError).not.toBe(true);
+    expect(accepted.result.structuredContent.transaction.suggestion).toMatchObject({
+      source: 'rule', version: 2, ruleId: 'rule-a', ruleRevision: 3,
+    });
+    expect(rejected.result.isError).toBe(true);
   });
 });

@@ -20,6 +20,7 @@ import {
   type ShadowWorkerDb,
   type ShadowWorkerDeps,
 } from './worker.js';
+import { appendRuleRevision } from '../ruleRevisionHistory.js';
 import { acquireAgentJobSuiteLock } from '../../test/postgresSuiteLock.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -95,6 +96,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         holdingAccountIds: ['holding'],
         dryRun: true,
         taxSupportStatus: 'needs_setup',
+        ruleRuntimeMode: 'canonical',
       },
     });
     await firstClient.agentCompanyConfig.create({
@@ -138,19 +140,22 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         active: true,
       }],
     });
-    await firstClient.rule.create({
+    const rule = await firstClient.rule.create({
       data: {
         id: RULE_ID,
         companyId: company.id,
         priority: 1,
         matchField: 'payee',
         matchText: 'Generic',
+        direction: 'Purchase', canonicalVersion: 2, revision: 1,
         category: 'Generic expense',
         categoryQboId: 'expense-a',
         taxCalculation: 'NotApplicable',
         taxCodeQboId: null,
       },
+      include: { ruleTags: true },
     });
+    await appendRuleRevision(firstClient, rule, null);
     const verifiedHistory = await firstClient.transaction.create({
       data: {
         companyId: company.id,

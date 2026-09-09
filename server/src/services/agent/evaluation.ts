@@ -37,6 +37,7 @@ export interface VerifiedCategorizationOutcome {
     configVersion: string;
     source: 'user' | 'autopilot' | 'mcp';
   } | null;
+  decisionContext?: import('../categorizationEvidence.js').NormalizedCategorizationDecisionContext;
 }
 
 export interface EvaluationRunRow {

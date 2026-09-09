@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   sessionFindUnique: vi.fn(),
   splitLineDtos: vi.fn(),
   stageCategorization: vi.fn(),
+  stageRuleSuggestion: vi.fn(),
   suggestForMany: vi.fn(),
   transactionFindMany: vi.fn(),
   transactionFindUnique: vi.fn(),
@@ -80,6 +81,10 @@ vi.mock('../lib/prisma.js', () => ({
     },
     user: { findMany: mocks.userFindMany },
   },
+}));
+
+vi.mock('../services/ruleSuggestionApplication.js', () => ({
+  stageRuleSuggestion: mocks.stageRuleSuggestion,
 }));
 
 vi.mock('../services/categorization.js', () => ({
@@ -222,6 +227,7 @@ beforeEach(() => {
   mocks.mutationAttemptFindFirst.mockResolvedValue(null);
   mocks.mutationAttemptFindUnique.mockResolvedValue({ transactionId: TRANSACTION_ID });
   mocks.stageCategorization.mockResolvedValue(stagedResult);
+  mocks.stageRuleSuggestion.mockResolvedValue(stagedResult);
   mocks.commitStagedCategorization.mockResolvedValue(verifiedResult);
   mocks.reconcileMutationAttempt.mockResolvedValue(verifiedResult);
   mocks.isLiveReconciliationOwnedRequest.mockResolvedValue(false);
@@ -1095,6 +1101,7 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual(verifiedResult);
     expect(mocks.commitStagedCategorization).toHaveBeenCalledWith({
+      captureManualApproval: true,
       transactionId: TRANSACTION_ID,
       companyId: COMPANY_ID,
       expectedRevision: 1,
@@ -1480,5 +1487,98 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     expect(mocks.transactionUpdate).toHaveBeenCalled();
+  });  it('routes a complete rule snapshot through verified rule staging, never manual staging', async () => {
+    const ruleSuggestion = {
+      source: 'rule' as const,
+      version: 2 as const,
+      ruleId: '00000000-0000-4000-8000-000000000090',
+      ruleRevision: 6,
+      action: {
+        version: 2 as const,
+        direction: 'Purchase' as const,
+        category: 'Meals',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCalculation: 'TaxExcluded' as const,
+        taxCodeQboId: 'TAX_CODE_STANDARD',
+        tagIds: [TAG_ID],
+      },
+      autoPost: false,
+    };
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 0, ruleSuggestion });
+
+    expect(response.status).toBe(200);
+    expect(mocks.stageRuleSuggestion).toHaveBeenCalledWith({
+      transactionId: TRANSACTION_ID,
+      companyId: COMPANY_ID,
+      expectedRevision: 0,
+      suggestion: ruleSuggestion,
+    });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
   });
+
+  it('maps stale rule proof to a bounded conflict that instructs the Queue to reload', async () => {
+    mocks.stageRuleSuggestion.mockRejectedValue({
+      code: 'STALE_RULE_SUGGESTION',
+      message: 'private current rule detail',
+    });
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send({
+        expectedRevision: 0,
+        ruleSuggestion: {
+          source: 'rule', version: 2,
+          ruleId: '00000000-0000-4000-8000-000000000090', ruleRevision: 6,
+          action: {
+            version: 2, direction: 'Purchase', category: 'Meals',
+            categoryQboId: 'EXPENSE_ACCOUNT', taxCalculation: 'NotApplicable',
+            taxCodeQboId: null, tagIds: [],
+          },
+          autoPost: false,
+        },
+      });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This rule suggestion changed. Reload before continuing.',
+      code: 'STALE_RULE_SUGGESTION',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('private');
+  });
+
+  it('keeps legacy manual categorization independent of implicit rule actions', async () => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({ category: 'Software', categoryQboId: 'EXPENSE_ACCOUNT', tagIds: [TAG_ID] });
+
+    expect(response.status).toBe(200);
+    expect(mocks.txnTagCreate).toHaveBeenCalledWith({ data: { txnId: TRANSACTION_ID, tagId: TAG_ID } });
+    expect(mocks.ruleFindMany).not.toHaveBeenCalled();
+    expect(mocks.ruleTagFindMany).not.toHaveBeenCalled();
+    expect(mocks.txnTagUpsert).not.toHaveBeenCalled();
+  });
+
+  it('uses the canonical direction-aware suggestion when deciding whether to offer a rule', async () => {
+    mocks.transactionFindUnique.mockResolvedValue({ ...transactionRow, category: 'Software' });
+    mocks.postTransaction.mockResolvedValue({ id: TRANSACTION_ID, ok: true, status: 'POSTED' });
+    mocks.suggestForMany.mockResolvedValue([{ source: 'rule', category: 'Software' }]);
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/post`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(202);
+    expect(response.body.rulePromptEligible).toBe(false);
+    expect(mocks.suggestForMany).toHaveBeenCalledWith(COMPANY_ID, [{
+      payee: transactionRow.payee, memo: null, amount: -10.5, qboType: 'Purchase',
+    }]);
+    expect(mocks.ruleFindMany).not.toHaveBeenCalled();
+  });
+
+
 });

@@ -31,6 +31,27 @@ function desired(categoryQboId: string): Extract<DesiredStage, { lines: unknown 
   };
 }
 
+function ruleDesired(ruleRevision: number): DesiredStage {
+  return {
+    ruleSuggestion: {
+      source: 'rule',
+      version: 2,
+      ruleId: '00000000-0000-4000-8000-000000000010',
+      ruleRevision,
+      action: {
+        version: 2,
+        direction: 'Purchase',
+        category: 'Meals',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'PURCHASE_TAX',
+        tagIds: ['00000000-0000-4000-8000-000000000001'],
+      },
+      autoPost: false,
+    },
+  };
+}
+
 function result(revision: number, categoryQboId = 'EXPENSE_ACCOUNT'): StagedCategorization {
   return {
     transactionId: 'transaction-1',
@@ -101,6 +122,25 @@ function lastView(publish: ReturnType<typeof vi.fn>): RowStageView {
 }
 
 describe('createRowStageCoordinator', () => {
+  it('preserves and serializes complete rule proof snapshots', async () => {
+    const first = deferred<StagedCategorization>();
+    const stage = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(result(3));
+    const publish = vi.fn();
+    const coordinator = createRowStageCoordinator(1, transport({ stage }), publish);
+    const firstProof = ruleDesired(4);
+
+    coordinator.update(firstProof);
+    (firstProof as Extract<DesiredStage, { ruleSuggestion: unknown }>).ruleSuggestion.action.tagIds.push(
+      '00000000-0000-4000-8000-000000000099',
+    );
+    coordinator.update(ruleDesired(5));
+
+    expect(stage).toHaveBeenNthCalledWith(1, 1, ruleDesired(4));
+    first.resolve(result(2));
+    await vi.waitFor(() => expect(stage).toHaveBeenNthCalledWith(2, 2, ruleDesired(5)));
+  });
 
   it('stages only A and latest C when B and C arrive during A', async () => {
     const first = deferred<StagedCategorization>();
@@ -266,8 +306,90 @@ describe('createRowStageCoordinator', () => {
     await vi.waitFor(() => expect(lastView(publish).status).toBe('ready'));
   });
 
+  it('rebases a manual edit queued behind an in-flight stale rule without replaying its proof', async () => {
+    const ruleStage = deferred<StagedCategorization>();
+    const reload = deferred<TransactionDto | null>();
+    const manualStage = deferred<StagedCategorization>();
+    const stage = vi.fn()
+      .mockReturnValueOnce(ruleStage.promise)
+      .mockReturnValueOnce(manualStage.promise);
+    const publish = vi.fn();
+    const coordinator = createRowStageCoordinator(
+      1,
+      transport({ stage, reload: vi.fn().mockReturnValue(reload.promise) }),
+      publish,
+    );
 
+    coordinator.update(ruleDesired(4));
+    coordinator.update(desired('MANUAL'));
+    ruleStage.reject(httpError(
+      'STALE_RULE_SUGGESTION',
+      'This rule suggestion changed. Reload before continuing.',
+      409,
+    ));
+    reload.resolve(transaction(7));
 
+    await vi.waitFor(() => expect(stage).toHaveBeenCalledTimes(2));
+    expect(stage).toHaveBeenNthCalledWith(1, 1, ruleDesired(4));
+    expect(stage).toHaveBeenNthCalledWith(2, 7, desired('MANUAL'));
+    manualStage.resolve(result(8, 'MANUAL'));
+    await vi.waitFor(() => expect(lastView(publish)).toMatchObject({
+      status: 'ready',
+      desired: desired('MANUAL'),
+      staged: desired('MANUAL'),
+    }));
+  });
+
+  it('retains the rejected rule proof through a failed recovery read', async () => {
+    const stage = vi.fn()
+      .mockRejectedValueOnce(httpError('STALE_RULE_SUGGESTION', 'Rule changed', 409))
+      .mockResolvedValue(result(8));
+    const reload = vi.fn()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue(transaction(7));
+    const publish = vi.fn();
+    const coordinator = createRowStageCoordinator(1, transport({ stage, reload }), publish);
+
+    coordinator.update(ruleDesired(4));
+    await vi.waitFor(() => expect(lastView(publish).status).toBe('error'));
+    coordinator.retry();
+
+    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(2));
+    expect(reload).toHaveBeenLastCalledWith(ruleDesired(4));
+    expect(stage).toHaveBeenCalledTimes(1);
+    expect(lastView(publish)).toMatchObject({ status: 'error', desired: null, error: 'Rule changed' });
+  });
+
+  it('rebases a manual edit queued during a stale-rule reload without replaying its proof', async () => {
+    const reload = deferred<TransactionDto | null>();
+    const stage = vi.fn()
+      .mockRejectedValueOnce(httpError(
+        'STALE_RULE_SUGGESTION',
+        'This rule suggestion changed. Reload before continuing.',
+        409,
+      ))
+      .mockResolvedValueOnce(result(8, 'MANUAL'));
+    const publish = vi.fn();
+    const coordinator = createRowStageCoordinator(
+      1,
+      transport({ stage, reload: vi.fn().mockReturnValue(reload.promise) }),
+      publish,
+    );
+
+    coordinator.update(ruleDesired(4));
+    await vi.waitFor(() => expect(lastView(publish).status).toBe('calculating'));
+    coordinator.update(desired('MANUAL'));
+    reload.resolve(transaction(7));
+
+    await vi.waitFor(() => expect(lastView(publish)).toMatchObject({
+      status: 'ready',
+      desired: desired('MANUAL'),
+      staged: desired('MANUAL'),
+    }));
+    expect(stage).toHaveBeenCalledTimes(2);
+    expect(stage).toHaveBeenNthCalledWith(1, 1, ruleDesired(4));
+    expect(stage).toHaveBeenNthCalledWith(2, 7, desired('MANUAL'));
+  });
 
   it('reloads and rebases once when a stage response is lost', async () => {
     const stage = vi.fn()

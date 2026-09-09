@@ -26,14 +26,14 @@ function writeJson(path, value) {
 function runNpm(fixtureRoot, callsPath, args) {
   writeFileSync(callsPath, '');
 
+  const childEnv = { ...process.env, VITEST_CALLS_PATH: callsPath };
+  // The fixture starts its own native runner; do not inherit this test process identity.
+  delete childEnv.NODE_TEST_CONTEXT;
   const result = spawnSync('npm', args, {
     shell: process.platform === 'win32',
     cwd: fixtureRoot,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      VITEST_CALLS_PATH: callsPath,
-    },
+    env: childEnv,
   });
 
   assert.equal(
@@ -49,7 +49,7 @@ function runNpm(fixtureRoot, callsPath, args) {
     .map((line) => JSON.parse(line));
 }
 
-test('server scripts keep full coverage and forward focused filters to one suite', () => {
+test('workspace scripts keep native and shared coverage and forward focused filters to one suite', () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), 'recat-package-scripts-'));
 
   try {
@@ -107,6 +107,27 @@ appendFileSync(
     }
 
     const callsPath = join(fixtureRoot, 'vitest-calls.jsonl');
+
+    mkdirSync(join(fixtureRoot, 'scripts'));
+    for (const name of ['package-scripts.test.mjs', 'rule-management-import.test.mjs']) {
+      writeFileSync(join(fixtureRoot, 'scripts', name),
+        `import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.VITEST_CALLS_PATH, JSON.stringify({ cwd: 'native', args: [${JSON.stringify(name)}] }) + '\\n');
+`);
+    }
+    const complete = runNpm(fixtureRoot, callsPath, ['test']);
+    assert.deepEqual(complete.filter(call => call.cwd === 'native').map(call => call.args[0]).sort(),
+      ['package-scripts.test.mjs', 'rule-management-import.test.mjs']);
+    assert.deepEqual(complete.filter(call => call.cwd !== 'native'), [
+      { cwd: 'shared', args: ['run'] },
+      { cwd: 'server', args: ['run'] },
+      { cwd: 'server', args: ['run', '--config', 'vitest.pg.config.ts'] },
+      { cwd: 'client', args: ['run'] },
+    ]);
+    assert.deepEqual(runNpm(fixtureRoot, callsPath,
+      ['run', 'test', '-w', 'shared', '--', 'src/ruleManagement.test.ts']),
+      [{ cwd: 'shared', args: ['run', 'src/ruleManagement.test.ts'] }]);
+
 
     assert.deepEqual(runNpm(fixtureRoot, callsPath, ['run', 'test', '-w', 'server']), [
       { cwd: 'server', args: ['run'] },

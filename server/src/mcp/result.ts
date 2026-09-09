@@ -1,3 +1,5 @@
+import { McpRuleChangeError } from '../services/mcp/rules.js';
+import { RuleCandidateError } from '../services/ruleCandidates.js';
 import type { CallToolResult, JSONObject } from '@modelcontextprotocol/server';
 import {
   QboRateLimitError,
@@ -29,6 +31,7 @@ export type SafeToolErrorCode =
   | 'TAX_REFUND_ALREADY_RECORDED'
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
+  | 'RULE_CHANGES_READ_ONLY'
   | 'OPERATION_RECONCILIATION_REQUIRED'
   | 'RESPONSE_TOO_LARGE'
   | 'COMPANY_UNAVAILABLE'
@@ -45,6 +48,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   TAX_REFUND_ALREADY_RECORDED: 'This refund is already marked as recorded. Review the existing operation; only an administrator can correct that attestation.',
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
+  RULE_CHANGES_READ_ONLY: 'Rule changes are currently read-only for this company. Ask an administrator to complete the rule migration or resume rule editing.',
   OPERATION_RECONCILIATION_REQUIRED: 'This operation requires reconciliation before it can continue.',
   RESPONSE_TOO_LARGE: 'The response exceeds the size limit. For list tools, request fewer items with limit. For single records, use the web app. For mutations, inspect the operation status before retrying.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
@@ -132,6 +136,13 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
     return error.code === 'SOURCE_NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
   }
 
+  if (error instanceof McpRuleChangeError) {
+    if (error.code === 'RULE_CHANGES_READ_ONLY') return 'RULE_CHANGES_READ_ONLY';
+    return error.code === 'NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
+  if (error instanceof RuleCandidateError) {
+    return error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
   if (error instanceof ReceiptError) {
     if (error.code === 'RECEIPT_FORBIDDEN') return 'FORBIDDEN';
     if (error.code === 'RECEIPT_NOT_FOUND') return 'NOT_FOUND';
