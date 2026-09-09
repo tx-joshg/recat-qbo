@@ -79,6 +79,25 @@ input, select, button { font-family:inherit; }
 /* select control (filters, report pickers) */
 .rr .select { border:1px solid var(--bd); border-radius:7px; padding:8px 10px; font-size:14px; background:var(--card); color:var(--ink); outline:none; cursor:pointer; font-family:inherit; }
 
+/* shared select / combobox controls */
+.rr .control-label { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+.rr .control-trigger { box-sizing:border-box; min-width:0; max-width:100%; align-self:end; flex-shrink:0; display:flex; align-items:center; justify-content:space-between; gap:8px; border:1px solid var(--bd); border-radius:7px; padding:8px 10px; font-size:14px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; text-align:left; }
+.rr .control-trigger > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rr .control-trigger > span:last-child { flex:none; }
+.rr .control-trigger:focus-visible { outline:3px solid var(--acc); outline-offset:2px; }
+.rr .control-popover { box-sizing:border-box; display:flex; flex-direction:column; width:min(var(--control-anchor-width), calc(100vw - 16px)); background:var(--card); border:1px solid var(--bd); border-radius:9px; box-shadow:var(--sh); z-index:70; overflow:hidden; color:var(--ink); }
+.rr .control-search { display:block; width:100%; box-sizing:border-box; border:0; border-bottom:1px solid var(--bd2); padding:11px 14px; font:inherit; font-size:14px; background:var(--card); color:var(--ink); outline:none; }
+.rr .control-search:focus-visible { outline:3px solid var(--acc); outline-offset:-3px; }
+.rr .control-options { min-height:0; max-height:246px; overflow:auto; overscroll-behavior:contain; }
+.rr .control-search,.rr .control-footer { flex-shrink:0; }
+.rr .control-option { overflow-wrap:anywhere; }
+.rr .control-option { display:block; width:100%; box-sizing:border-box; padding:9px 14px; color:var(--ink); font-size:14px; text-align:left; cursor:pointer; }
+.rr .control-option.is-active, .rr .control-option.is-selected { background:var(--hl); }
+.rr .control-option.is-disabled { color:var(--fnt); cursor:not-allowed !important; }
+.rr .control-option-group, .rr .control-empty { color:var(--fnt); }
+.rr .control-empty { display:block; padding:12px 14px; font-size:13.5px; }
+.rr .control-footer { border-top:1px solid var(--bd2); }
+
 /* status pills — Posted ✓ / Dry run ✓ / Error ⓘ and audit action chips */
 .rr .pill-ok { font-size:12.5px; font-weight:600; color:var(--okT); background:var(--okB); border:1px solid var(--okD); padding:4px 10px; border-radius:99px; }
 .rr .pill-am { font-size:12.5px; font-weight:600; color:var(--amT); background:var(--amB); border:1px solid var(--amD); padding:4px 10px; border-radius:99px; }
@@ -181,7 +200,12 @@ input, select, button { font-family:inherit; }
     input[type="checkbox"],
     input[type="radio"],
     [role="button"],
-    .interactive-surface
+    .interactive-surface,
+    .control-trigger,
+    .control-popover,
+    .control-search,
+    .control-options,
+    .control-option
   ),
   .rr :is(
     button,
@@ -189,7 +213,12 @@ input, select, button { font-family:inherit; }
     input[type="checkbox"],
     input[type="radio"],
     [role="button"],
-    .interactive-surface
+    .interactive-surface,
+    .control-trigger,
+    .control-popover,
+    .control-search,
+    .control-options,
+    .control-option
   ) * {
     transition:none !important;
   }
