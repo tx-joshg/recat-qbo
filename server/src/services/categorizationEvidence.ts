@@ -1,3 +1,4 @@
+import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type {
   VerifiedCategorizationOutcome,
   VerifiedCategorizationProposal,
@@ -75,7 +76,7 @@ function isVerifiedCategorizationProposal(
       && isEvidenceQboReference(line.categoryQboId)
       && (
         value.taxCalculation === 'NotApplicable'
-          ? line.taxCodeQboId === null
+          ? (line.taxCodeQboId === null || line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE)
           : isEvidenceQboReference(line.taxCodeQboId)
       )
       && (

@@ -23,6 +23,19 @@ enum TxnStatus {
   REVERTED
 }
 
+/// The current QuickBooks provider disposition is deliberately separate from
+/// Recat's local mutation lifecycle.  A row may remain PENDING locally while
+/// QuickBooks has already cleared/reconciled it, and that distinction must be
+/// queryable without overloading TxnStatus.
+enum ProviderActionability {
+  UNKNOWN
+  WRITABLE
+  BLOCKED_CLEARED
+  BLOCKED_RECONCILED
+  BLOCKED_PERIOD_CLOSED
+  UNAVAILABLE
+}
+
 enum SyncMode {
   polling
   webhook
@@ -199,6 +212,7 @@ model Company {
   taxSupportStatus        String        @default("needs_setup")
   taxSupportReason        String?
   transactions      Transaction[]
+  transactionActionability TransactionActionability[]
   tags              Tag[]
   rules             Rule[]
   savedReports      SavedReport[]
@@ -226,6 +240,22 @@ model Company {
   receiptIntakeOperations ReceiptIntakeOperation[]
   receiptCompanyConfig ReceiptCompanyConfig?
   receiptEvents ReceiptEvent[]
+  qboTokenRevocations QboTokenRevocation[]
+}
+
+/// Quarantined disconnect snapshots, never active connection credentials.
+model QboTokenRevocation {
+  id                    String   @id @default(uuid())
+  companyId             String
+  company               Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  realmId               String
+  encryptedRefreshToken String
+  createdAt             DateTime @default(now())
+  leaseOwner            String?
+  leaseExpiresAt        DateTime?
+
+  @@index([companyId])
+  @@index([leaseExpiresAt, createdAt])
 }
 
 model Transaction {
@@ -257,6 +287,7 @@ model Transaction {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   txnTags        TxnTag[]
+  providerActionability TransactionActionability?
   qboMutationAttempts QboMutationAttempt[]
   autopilotRuleCandidateEvidence AutopilotRuleCandidateEvidence[]
   autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
@@ -267,6 +298,37 @@ model Transaction {
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
+}
+
+/// Latest bounded, read-only QuickBooks write-safety observation for a
+/// transaction.  This is an index, not an authorization record: every actual
+/// write still performs a fresh provider read through assertQboWriteAllowed.
+/// The scalar transaction binding is retained so an observation can never be
+/// mistaken for another QBO entity after a sync or local revision change.
+model TransactionActionability {
+  id                 String               @id @default(uuid())
+  companyId          String
+  company            Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId      String               @unique
+  transaction        Transaction          @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  disposition        ProviderActionability @default(UNKNOWN)
+  checkedAt          DateTime?
+  revision           Int
+  qboSyncToken       String               @db.VarChar(128)
+  qboType            String               @db.VarChar(32)
+  qboId              String               @db.VarChar(128)
+  txnDate            DateTime             @db.Date
+  bankAccountQboId   String?              @db.VarChar(128)
+  bookCloseDate      DateTime?            @db.Date
+  cleared            Boolean?
+  reconciled         Boolean?
+  unavailableCode    String?              @db.VarChar(64)
+  unavailableReason  String?              @db.VarChar(500)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  @@index([companyId, disposition, checkedAt])
+  @@index([companyId, transactionId, revision, qboSyncToken])
 }
 
 model AttachmentBlob {
@@ -922,6 +984,8 @@ model AgentCompanyConfig {
   dailyLiveWriteLimit         Int       @default(25)
   limits                      Json
   configVersion               String
+  /// Explicit operator scheduling intent; separate from model/evidence identity.
+  schedulingGeneration        Int       @default(0)
   liveRequested               Boolean   @default(false)
   liveAcceptedPolicyVersion   String?
   liveAcceptedConfigVersion   String?
@@ -946,23 +1010,24 @@ model LiveWritePermit {
 }
 
 model AgentJob {
-  id             String     @id @default(uuid())
-  companyId      String
-  company        Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  transactionId  String
-  revision       Int
-  configVersion  String
-  status         String
-  dueAt          DateTime
-  lockOwner      String?
-  leaseExpiresAt DateTime?
-  attemptCount   Int        @default(0)
-  lastErrorCode  String?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  runs           AgentRun[]
+  id                   String     @id @default(uuid())
+  companyId            String
+  company              Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId        String
+  revision             Int
+  configVersion        String
+  schedulingGeneration Int        @default(0)
+  status               String
+  dueAt                DateTime
+  lockOwner            String?
+  leaseExpiresAt       DateTime?
+  attemptCount         Int        @default(0)
+  lastErrorCode        String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  runs                 AgentRun[]
 
-  @@unique([companyId, transactionId, revision, configVersion])
+  @@unique([companyId, transactionId, revision, configVersion, schedulingGeneration], map: "AgentJob_scheduling_intent_key")
   @@index([status, dueAt])
 }
 

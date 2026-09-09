@@ -1,6 +1,5 @@
 // Fixed dark bulk-action bar shown while rows are selected — port of
-// Recat.dc.html lines 386–407. The bulk CategoryPicker is passed in as a node
-// so the Queue page keeps ownership of picker state.
+// Recat.dc.html lines 386–407. The shared category control owns its popup.
 
 import { useEffect, useState } from 'react';
 import type { MouseEvent, ReactNode } from 'react';
@@ -9,23 +8,18 @@ const stop = (e: MouseEvent) => e.stopPropagation();
 
 export default function BulkBar({
   count,
-  label,
   btnOpacity,
-  onOpenPicker,
   onPost,
   onClear,
-  picker,
+  categoryControl,
 }: {
   count: number;
-  /** 'Assign one category…' or the chosen full category path. */
-  label: string;
   /** 1 when at least one selected row is ready, otherwise .45 (prototype). */
   btnOpacity: number;
-  onOpenPicker: (e: MouseEvent) => void;
   onPost: () => void;
   onClear: () => void;
-  /** The open bulk CategoryPicker (positioned above), or null. */
-  picker: ReactNode;
+  /** Shared category selection control. */
+  categoryControl: ReactNode;
 }) {
   // ≤640px the row layout can't fit (230px picker + post button + esc), so the
   // bar stacks into a column. Same matchMedia pattern as Nav/Queue/Dashboard.
@@ -102,25 +96,7 @@ export default function BulkBar({
         </>
       )}
       <span style={{ position: 'relative', ...(isMobile ? { display: 'block' } : {}) }}>
-        <button
-          onClick={onOpenPicker}
-          style={{
-            border: '1px solid rgba(128,128,128,.45)',
-            background: 'none',
-            borderRadius: 7,
-            padding: '8px 12px',
-            fontSize: 14,
-            color: 'var(--darkInk)',
-            minWidth: 230,
-            textAlign: 'left',
-            cursor: 'pointer',
-            font: 'inherit',
-            ...(isMobile ? { width: '100%', minWidth: 0, boxSizing: 'border-box' } : {}),
-          }}
-        >
-          {label}
-        </button>
-        {picker}
+        {categoryControl}
       </span>
       <button
         onClick={onPost}

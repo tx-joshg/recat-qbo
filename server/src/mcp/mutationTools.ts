@@ -1,7 +1,10 @@
+import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod-v4';
 import {
+  getPreparedMcpCategorization,
   prepareMcpCategorization,
+  type GetPreparedMcpCategorizationInput,
   type PrepareMcpCategorizationInput,
 } from '../services/mcp/categorization.js';
 import {
@@ -43,6 +46,7 @@ import {
 
 const CORE_MUTATION_TOOL_NAMES = [
   'prepare_categorization',
+  'get_prepared_categorization',
   'commit_categorization',
   'get_operation',
   'retry_operation',
@@ -64,6 +68,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: PrepareMcpCategorizationInput,
   ): ReturnType<typeof prepareMcpCategorization>;
+  getPreparedCategorization(
+    principal: McpPrincipal,
+    input: GetPreparedMcpCategorizationInput,
+  ): ReturnType<typeof getPreparedMcpCategorization>;
   commitCategorization(
     principal: McpPrincipal,
     input: CommitMcpCategorizationInput,
@@ -98,6 +106,7 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   ...mcpAttachmentOperations,
   ...mcpReceiptOperations,
   prepareCategorization: prepareMcpCategorization,
+  getPreparedCategorization: getPreparedMcpCategorization,
   commitCategorization: commitMcpCategorization,
   getOperation: getMcpOperation,
   retryOperation: retryMcpOperation,
@@ -157,15 +166,71 @@ const proposalLine = z.strictObject({
   tagIds: uniqueTagIds,
 });
 const proposal = z.strictObject({
+  taxDisposition: z.enum(['set', 'preserve_current']).optional(),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(proposalLine).min(1).max(MAX_LINES),
   tagIds: uniqueTagIds,
 }).superRefine((value, context) => {
+  if (value.taxDisposition === 'preserve_current') {
+    if (value.lines.length !== 1) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current requires exactly one line.',
+        path: ['lines'],
+      });
+    }
+    if (value.tagIds.length !== 0) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current cannot change transaction tags.',
+        path: ['tagIds'],
+      });
+    }
+    for (const [index, line] of value.lines.entries()) {
+      if (line.taxCodeQboId == null) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current requires an explicit source tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (line.memo !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line memos.',
+          path: ['lines', index, 'memo'],
+        });
+      }
+      if (line.tagIds.length !== 0) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line tags.',
+          path: ['lines', index, 'tagIds'],
+        });
+      }
+    }
+    return;
+  }
+
+  const explicitNon = value.taxCalculation === 'NotApplicable'
+    && value.lines.some((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE);
   for (const [index, line] of value.lines.entries()) {
-    if (
-      value.taxCalculation === 'NotApplicable'
-      && line.taxCodeQboId != null
-    ) {
+    if (value.taxCalculation === 'NotApplicable' && line.taxCodeQboId != null) {
+      if (line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'NotApplicable lines can select only the literal NON tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (explicitNon && line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Explicit NON requires the literal NON tax code on every line.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+    } else if (explicitNon) {
       context.addIssue({
         code: 'custom',
         message: 'NotApplicable lines cannot select a tax code.',
@@ -191,6 +256,11 @@ const prepareCategorizationInput = z.strictObject({
   expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
   idempotencyKey,
   proposal,
+});
+const getPreparedCategorizationInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  idempotencyKey,
 });
 const operationWithOptionalIdempotencyInput = z.strictObject({
   operationId: uuid,
@@ -218,6 +288,8 @@ const previewLine = z.strictObject({
   subtotalCents: safeInteger,
   taxCents: safeInteger,
   totalCents: safeInteger,
+  categoryQboId: qboReference,
+  taxCodeQboId: qboReference.nullable(),
 });
 const preparedCategorizationOutput = z.strictObject({
   operationId: uuid,
@@ -227,6 +299,7 @@ const preparedCategorizationOutput = z.strictObject({
   preview: z.strictObject({
     transactionId: uuid,
     revision: z.number().int().min(1).max(MAX_REVISION),
+    taxDisposition: z.enum(['set', 'preserve_current']),
     taxCalculation: z.enum([
       'TaxInclusive',
       'TaxExcluded',
@@ -252,6 +325,7 @@ const operationResult = z.strictObject({
     'UNCHANGED',
     'DRY_RUN',
     'RETRYABLE',
+    'REJECTED',
   ]),
   status: z.enum([
     'PENDING',
@@ -281,6 +355,7 @@ const operationOutput = z.strictObject({
     'prepared',
     'committed',
     'retryable',
+    'rejected',
     'reconciliation_required',
     'expired',
     'cancelled',
@@ -291,6 +366,7 @@ const operationOutput = z.strictObject({
     'write_committing',
     'write_uncertain',
     'write_retryable',
+    'write_rejected',
     'write_unchanged',
     'verified',
     'dry_run',
@@ -422,7 +498,7 @@ const preparedUndoOutput = z.strictObject({
   expiresAt: z.iso.datetime(),
   preview: z.strictObject({
     action: z.literal('restore_purchase_categorization'),
-    resultingStatus: z.literal('REVERTED'),
+    resultingStatus: z.literal('PENDING'),
     direction: z.enum(['purchase', 'refund']),
     totalCents: safeInteger,
     totalTaxCents: safeInteger.nullable(),
@@ -485,6 +561,18 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.prepareCategorization(
         principal,
         input as PrepareMcpCategorizationInput,
+      ),
+  },
+  {
+    name: 'get_prepared_categorization',
+    description: 'Recover an exact owned prepared categorization after a transport response was lost.',
+    inputSchema: getPreparedCategorizationInput,
+    outputSchema: preparedCategorizationOutput,
+    annotations: getOperationAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.getPreparedCategorization(
+        principal,
+        input as GetPreparedMcpCategorizationInput,
       ),
   },
   {

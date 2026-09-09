@@ -188,16 +188,18 @@ export function mapDepositSnapshot(raw: RawDeposit): QboDepositSnapshot {
     'deposit account reference',
   );
   const lines = raw.Line.map(snapshotLine);
+  const totalCents = exactCents(raw.TotalAmt);
   const derivedTotalTaxCents =
     raw.GlobalTaxCalculation === undefined
       ? null
-      : lines.some((line) => line.taxCodeQboId !== null)
-        ? null
-        : 0;
+      : safeCentSum([
+          totalCents,
+          -safeCentSum(lines.map((line) => line.amountCents)),
+        ]);
   return {
     qboId: raw.Id,
     syncToken: raw.SyncToken,
-    totalCents: exactCents(raw.TotalAmt),
+    totalCents,
     depositToAccountQboId,
     date: raw.TxnDate,
     globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
@@ -278,6 +280,7 @@ const RESTORABLE_LINE_FIELDS = new Set([
   'Description',
   'DetailType',
   'DepositLineDetail',
+  'CustomExtensions',
 ]);
 
 const RESTORABLE_DETAIL_FIELDS = new Set([
@@ -306,6 +309,8 @@ function assertRestorableHoldingLine(line: RawDepositLine): void {
   const unsupportedLineField = Object.keys(line).find(
     (field) => !RESTORABLE_LINE_FIELDS.has(field),
   );
+  const unsupportedCustomExtensions = line.CustomExtensions !== undefined &&
+    (!Array.isArray(line.CustomExtensions) || line.CustomExtensions.length !== 0);
   const detail = line.DepositLineDetail;
   const unsupportedDetailField = detail === undefined
     ? undefined
@@ -315,6 +320,7 @@ function assertRestorableHoldingLine(line: RawDepositLine): void {
     : DETAIL_REFERENCE_FIELDS.find((field) => hasUnsupportedReferenceField(detail[field]));
   if (
     unsupportedLineField === undefined &&
+    !unsupportedCustomExtensions &&
     unsupportedDetailField === undefined &&
     unsupportedReferenceField === undefined
   ) return;
@@ -342,8 +348,10 @@ function stagedLineToRaw(
   taxCalculation: StagedCategorization['taxCalculation'],
   preserved: PreservedLineFields,
   replacedLine?: RawDepositLine,
+  preserveReplacedLineId = true,
 ): RawDepositLine {
   const accountQboId = requiredIdentity(line.categoryQboId, 'category account reference');
+  const description = line.memo ?? replacedLine?.Description;
   if (line.idx < 0 || !Number.isSafeInteger(line.idx)) {
     preparationError('QBO_DEPOSIT_UNSUPPORTED', 'Transaction split indexes must be non-negative integers.');
   }
@@ -364,14 +372,14 @@ function stagedLineToRaw(
     preparationError('QBO_DEPOSIT_UNSUPPORTED', 'NotApplicable transaction lines cannot carry a tax code.');
   }
   return {
-    ...(replacedLine?.Id === undefined
+    ...(replacedLine?.Id === undefined || !preserveReplacedLineId
       ? {}
       : { Id: requiredIdentity(replacedLine.Id, 'holding line id') }),
     // QBO Deposit lines are net amounts even when GlobalTaxCalculation says
     // TaxInclusive; QBO computes and adds the selected sales tax separately.
     Amount: moneyFromCents(line.subtotalCents),
     DetailType: 'DepositLineDetail',
-    ...(line.memo === null ? {} : { Description: line.memo }),
+    ...(description === undefined ? {} : { Description: description }),
     DepositLineDetail: detail,
   };
 }
@@ -488,7 +496,10 @@ export function prepareDepositRecategorization(args: {
   if (holdingLineIndexes.length === 0) {
     preparationError('QBO_STATE_DRIFT', 'Transaction no longer has an eligible holding-account line.');
   }
-  if (args.staged.lines.length !== holdingRawLines.length) {
+  if (
+    args.staged.lines.length !== holdingRawLines.length
+    && holdingRawLines.length !== 1
+  ) {
     preparationError(
       'QBO_DEPOSIT_UNSUPPORTED',
       'Prepared transaction must update every holding-account line in place.',
@@ -533,7 +544,8 @@ export function prepareDepositRecategorization(args: {
       line,
       args.staged.taxCalculation,
       preserved,
-      holdingRawLines[index],
+      holdingRawLines[holdingRawLines.length === 1 ? 0 : index],
+      holdingRawLines.length !== 1 || index === 0,
     ));
   const newSnapshotLines = newRawLines.map(snapshotLine);
   const totalTaxCents = safeCentSum([keptTaxCents, args.staged.totals.taxCents]);

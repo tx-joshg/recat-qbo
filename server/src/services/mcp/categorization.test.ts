@@ -12,6 +12,7 @@ import {
 } from './operations.js';
 import {
   prepareMcpCategorization,
+  getPreparedMcpCategorization,
   type McpCategorizationDeps,
   type PrepareMcpCategorizationInput,
 } from './categorization.js';
@@ -243,6 +244,37 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe('prepareMcpCategorization', () => {
+  it('recovers the exact owned prepared operation without restaging', async () => {
+    const context = harness();
+    const prepared = await prepareMcpCategorization(
+      principal,
+      prepareInput(),
+      context.deps,
+    );
+    const recoveryStore: McpOperationStore = {
+      mcpOperation: {
+        findFirst: async ({ where }) => {
+          const row = [...context.rows.values()].find((candidate) => matches(candidate, where));
+          return row === undefined ? null : structuredClone(row);
+        },
+        createMany: async () => ({ count: 0 }),
+      },
+    };
+
+    await expect(getPreparedMcpCategorization(
+      principal,
+      {
+        companyId: COMPANY_ID,
+        transactionId: TRANSACTION_ID,
+        idempotencyKey: 'prepare-1',
+      },
+      { ...context.deps, operationStore: recoveryStore },
+    )).resolves.toEqual(prepared);
+
+    expect(context.revision).toBe(1);
+    expect(context.validationCalls).toBe(1);
+  });
+
   it('atomically stages and stores a bounded immutable receipt without any QBO call', async () => {
     const context = harness();
     const getQboClient = vi.fn(() => {
@@ -263,6 +295,7 @@ describe('prepareMcpCategorization', () => {
       preview: {
         transactionId: TRANSACTION_ID,
         revision: 1,
+        taxDisposition: 'set',
         taxCalculation: 'NotApplicable',
         totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
         lines: [{
@@ -270,13 +303,15 @@ describe('prepareMcpCategorization', () => {
           subtotalCents: -1050,
           taxCents: 0,
           totalCents: -1050,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: null,
         }],
         transactionTagCount: 0,
         lineTagCount: 0,
       },
       warnings: [],
     });
-    expect(JSON.stringify(result)).not.toMatch(/Café supplies|EXPENSE_ACCOUNT|QBO_PURCHASE_1/);
+    expect(JSON.stringify(result)).not.toMatch(/Café supplies|QBO_PURCHASE_1/);
     expect(context.revision).toBe(1);
     expect(context.rows.size).toBe(1);
     expect([...context.rows.values()][0]).toMatchObject({

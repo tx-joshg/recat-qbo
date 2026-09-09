@@ -31,6 +31,7 @@ const preparedCategorization = {
   preview: {
     transactionId,
     revision: 3,
+    taxDisposition: 'set' as const,
     taxCalculation: 'TaxInclusive' as const,
     totals: {
       subtotalCents: -1_000,
@@ -42,6 +43,8 @@ const preparedCategorization = {
       subtotalCents: -1_000,
       taxCents: -50,
       totalCents: -1_050,
+      categoryQboId: 'expense-account',
+      taxCodeQboId: 'tax-code',
     }],
     transactionTagCount: 1,
     lineTagCount: 1,
@@ -74,7 +77,7 @@ const preparedUndo = {
   expiresAt: '2026-07-29T20:15:00.000Z',
   preview: {
     action: 'restore_purchase_categorization' as const,
-    resultingStatus: 'REVERTED' as const,
+    resultingStatus: 'PENDING' as const,
     direction: 'purchase' as const,
     totalCents: -1_050,
     totalTaxCents: -50,
@@ -120,6 +123,7 @@ function mutations(
 ): McpMutationOperations {
   return {
     prepareCategorization: vi.fn().mockResolvedValue(preparedCategorization),
+    getPreparedCategorization: vi.fn().mockResolvedValue(preparedCategorization),
     commitCategorization: vi.fn().mockResolvedValue(operation),
     getOperation: vi.fn().mockResolvedValue(operation),
     retryOperation: vi.fn().mockResolvedValue(operation),
@@ -172,6 +176,28 @@ function handler(
 }
 
 describe('Recat MCP mutation tools', () => {
+  it('routes exact prepared-categorization recovery to its owner-scoped operation', async () => {
+    const operations = mutations();
+    const server = handler(operations);
+    const input = {
+      companyId,
+      transactionId,
+      idempotencyKey: 'prepare-one',
+    };
+
+    const response = await legacy(server, 'tools/call', {
+      name: 'get_prepared_categorization',
+      arguments: input,
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.getPreparedCategorization).toHaveBeenCalledWith(principal, input);
+  });
+
+  it('exposes read-only prepared-categorization recovery', () => {
+    expect(MUTATION_TOOL_NAMES).toContain('get_prepared_categorization');
+  });
+
   it('publishes recursively strict bounded input and output schemas', async () => {
     const body = await legacy(handler(mutations()), 'tools/list', {});
     const tools = body.result.tools as Array<Record<string, any>>;
@@ -224,12 +250,12 @@ describe('Recat MCP mutation tools', () => {
       prepare.outputSchema.properties.preview.properties.lines.maxItems,
     ).toBe(20);
 
-    const operationSchema = mutationTools[1]!.outputSchema;
+    const operationSchema = mutationTools.find((tool) => tool.name === 'commit_categorization')!.outputSchema;
     expect(operationSchema.properties.actions.additionalProperties).toBe(false);
     expect(operationSchema.properties.result.anyOf).toHaveLength(2);
     expect(operationSchema.properties.error.anyOf).toHaveLength(2);
 
-    const undoSchema = mutationTools[4]!.outputSchema;
+    const undoSchema = mutationTools.find((tool) => tool.name === 'prepare_undo')!.outputSchema;
     expect(undoSchema.properties.preview.additionalProperties).toBe(false);
     expect(
       undoSchema.properties.preview.properties.restorationDigest.pattern,
@@ -328,6 +354,235 @@ describe('Recat MCP mutation tools', () => {
     expect(operations.commitUndo).toHaveBeenCalledWith(principal, calls[5][1]);
     expect(operations.prepareTransfer).toHaveBeenCalledWith(principal, calls[6][1]);
     expect(operations.commitTransfer).toHaveBeenCalledWith(principal, calls[7][1]);
+  });
+
+  it('accepts one exact preserve-current proposal and returns its reviewable references', async () => {
+    const proposal = {
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: -4_320,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const operations = mutations({
+      prepareCategorization: vi.fn().mockResolvedValue({
+        ...preparedCategorization,
+        preview: {
+          ...preparedCategorization.preview,
+          taxDisposition: 'preserve_current',
+          taxCalculation: 'NotApplicable',
+          totals: {
+            subtotalCents: -4_320,
+            taxCents: 0,
+            totalCents: -4_320,
+          },
+          lines: [{
+            idx: 0,
+            subtotalCents: -4_320,
+            taxCents: 0,
+            totalCents: -4_320,
+            categoryQboId: '42',
+            taxCodeQboId: 'NON',
+          }],
+          transactionTagCount: 0,
+          lineTagCount: 0,
+        },
+      }),
+    });
+
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 0,
+        idempotencyKey: 'preserve-non',
+        proposal,
+      },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.preview).toMatchObject({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+      }],
+    });
+    expect(operations.prepareCategorization).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({ proposal }),
+    );
+  });
+
+  it('accepts tax-inclusive preserve-current without requiring the source code inventory', async () => {
+    const proposal = {
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -4_320,
+        categoryQboId: '99',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const operations = mutations({
+      prepareCategorization: vi.fn().mockResolvedValue({
+        ...preparedCategorization,
+        preview: {
+          ...preparedCategorization.preview,
+          taxDisposition: 'preserve_current',
+          taxCalculation: 'TaxInclusive',
+          totals: { subtotalCents: -4_320, taxCents: 0, totalCents: -4_320 },
+          lines: [{
+            idx: 0,
+            subtotalCents: -4_320,
+            taxCents: 0,
+            totalCents: -4_320,
+            categoryQboId: '99',
+            taxCodeQboId: '7',
+          }],
+          transactionTagCount: 0,
+          lineTagCount: 0,
+        },
+      }),
+    });
+
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 0,
+        idempotencyKey: 'preserve-tax-inclusive',
+        proposal,
+      },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareCategorization).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({ proposal }),
+    );
+  });
+
+  it('rejects preserve-current proposals that could change anything besides one category', async () => {
+    const valid = {
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: -4_320,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const invalidProposals = [
+      { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: undefined }] },
+      { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: null }] },
+      { ...valid, lines: [...valid.lines, { ...valid.lines[0] }] },
+      { ...valid, lines: [{ ...valid.lines[0], memo: 'do not change' }] },
+      { ...valid, tagIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'] },
+      {
+        ...valid,
+        lines: [{
+          ...valid.lines[0],
+          tagIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],
+        }],
+      },
+      { ...valid, privateExtra: true },
+    ];
+    const operations = mutations();
+    const server = handler(operations);
+
+    for (const [index, proposal] of invalidProposals.entries()) {
+      const response = await legacy(server, 'tools/call', {
+        name: 'prepare_categorization',
+        arguments: {
+          companyId,
+          transactionId,
+          expectedRevision: 0,
+          idempotencyKey: `invalid-preserve-${index}`,
+          proposal,
+        },
+      });
+      expect(response.result.isError, `case ${index}`).toBe(true);
+    }
+    expect(operations.prepareCategorization).not.toHaveBeenCalled();
+  });
+
+  it('accepts an explicit literal NON for a set NotApplicable split', async () => {
+    const operations = mutations();
+    const proposal = {
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [
+        {
+          grossCents: -400,
+          categoryQboId: 'expense-a',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+        {
+          grossCents: -600,
+          categoryQboId: 'expense-b',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 2,
+        idempotencyKey: 'explicit-non-split',
+        proposal,
+      },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareCategorization).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({ proposal }),
+    );
+  });
+
+  it('rejects a non-NON tax reference for a set NotApplicable split', async () => {
+    const operations = mutations();
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 2,
+        idempotencyKey: 'not-non-split',
+        proposal: {
+          taxDisposition: 'set',
+          taxCalculation: 'NotApplicable',
+          lines: [{
+            grossCents: -1_000,
+            categoryQboId: 'expense',
+            taxCodeQboId: 'OTHER',
+            tagIds: [],
+          }],
+          tagIds: [],
+        },
+      },
+    });
+
+    expect(response.result.isError).toBe(true);
+    expect(operations.prepareCategorization).not.toHaveBeenCalled();
   });
 
   it('rejects extra keys and contradictory tax inputs before service dispatch', async () => {

@@ -153,10 +153,14 @@ export async function getInstanceSettings(
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).
   const smtpFromEnv = env.SMTP_HOST !== '';
+  const suggestionProvider =
+    env.SUGGESTION_PROVIDER !== undefined && env.SUGGESTION_PROVIDER !== ''
+      ? normalizeSuggestionProvider(env.SUGGESTION_PROVIDER)
+      : normalizeSuggestionProvider(stored.suggestionProvider);
   const suggestionModel =
     env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
       ? env.SUGGESTION_MODEL
-      : (stored.suggestionModel || 'gpt-4o-mini');
+      : (stored.suggestionModel || (suggestionProvider === 'openrouter' ? 'openai/gpt-4o-mini' : 'gpt-4o-mini'));
   return {
     // env vars take precedence over DB values
     // APP_URL unset → the stored value wins, falling back to env's own default.
@@ -169,10 +173,7 @@ export async function getInstanceSettings(
     webhookVerifierToken:
       env.QBO_WEBHOOK_VERIFIER_TOKEN !== '' ? env.QBO_WEBHOOK_VERIFIER_TOKEN : (stored.webhookVerifierToken ?? ''),
     suggestionSource: normalizeSuggestionSource(stored.suggestionSource),
-    suggestionProvider:
-      env.SUGGESTION_PROVIDER !== undefined && env.SUGGESTION_PROVIDER !== ''
-        ? normalizeSuggestionProvider(env.SUGGESTION_PROVIDER)
-        : normalizeSuggestionProvider(stored.suggestionProvider),
+    suggestionProvider,
     suggestionModel,
     agentDecisionModel: stored.agentDecisionModel || suggestionModel,
     agentVerifierModel: stored.agentVerifierModel || suggestionModel,

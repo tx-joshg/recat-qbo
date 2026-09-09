@@ -7,10 +7,9 @@
 // auto-post rules, and record a SyncLog row. QBO is always the source of truth.
 
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
-import type { SuggestionDto } from '@recat/shared';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import type { QboTxn } from '../lib/qbo/types.js';
+import type { QboAccountInfo, QboTxn } from '../lib/qbo/types.js';
 import {
   EntityLeaseError,
   fenceEntityLeaseOwnerships,
@@ -19,14 +18,27 @@ import {
   type EntityLeaseFenceDb,
   type EntityLeaseKey,
 } from './entityLease.js';
-import { refreshSuggestions } from './suggestions.js';
 import { postTransaction } from './writeback.js';
+import type { SuggestionDto } from '@recat/shared';
+import { refreshSuggestions } from './suggestions.js';
+import {
+  ensureUnknownProviderActionability,
+  type ProviderActionabilityDb,
+} from './providerActionability.js';
+import { runCompanyMutationTransaction } from './companyMutationScope.js';
 
 export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
 
 export interface SyncResult {
   ok: boolean;
   message: string;
+  mirror?: {
+    created: number;
+    refreshed: number;
+    stale: number;
+    busy: number;
+    contended: number;
+  };
 }
 
 function jsonStringArray(v: unknown): string[] {
@@ -111,6 +123,98 @@ async function withSyncEntityLease<T>(
     if (isEntityBusy(error)) return null;
     throw error;
   }
+}
+
+export type MirroredTransactionRefreshOutcome =
+  | 'refreshed'
+  | 'stale'
+  | 'busy'
+  | 'contended'
+  | 'not_found'
+  | 'missing_in_qbo'
+  | 'not_in_holding';
+
+export interface MirroredTransactionRefreshResult {
+  transactionId: string;
+  outcome: MirroredTransactionRefreshOutcome;
+}
+
+/**
+ * Refresh one already-mirrored holding transaction from QBO.
+ *
+ * This is intentionally narrower than syncCompany: it does not enumerate the
+ * chart, tax references, or every holding transaction. It is the safe refresh
+ * path immediately before a governed categorization prepare when a stored QBO
+ * source snapshot needs to be current.
+ */
+export async function refreshMirroredTransaction(
+  companyId: string,
+  transactionId: string,
+  mutationDependencies: SyncMutationDeps = defaultSyncMutationDeps,
+): Promise<MirroredTransactionRefreshResult> {
+  const [company, current] = await Promise.all([
+    prisma.company.findUnique({ where: { id: companyId } }),
+    prisma.transaction.findUnique({ where: { id: transactionId } }),
+  ]);
+  if (company === null || current === null || current.companyId !== companyId) {
+    return { transactionId, outcome: 'not_found' };
+  }
+
+  const { qboFactory } = await import('../lib/qbo/factory.js');
+  const client = await qboFactory.forCompany(companyId);
+  const fresh = await client.fetchTxn(current.qboType as QboTxn['qboType'], current.qboId);
+  if (fresh === null) return { transactionId, outcome: 'missing_in_qbo' };
+
+  const holdingIds = jsonStringArray(company.holdingAccountIds);
+  if (!fresh.lines.some((line) => holdingIds.includes(line.accountQboId))) {
+    return { transactionId, outcome: 'not_in_holding' };
+  }
+  if (isStaleProviderToken(fresh.syncToken, current.qboSyncToken)) {
+    return { transactionId, outcome: 'stale' };
+  }
+
+  const key = entityKey(companyId, current);
+  const mutation = await withSyncEntityLease(
+    key,
+    mutationDependencies,
+    async (owner) => prisma.$transaction(async (tx) => {
+      await mutationDependencies.fence(key, owner, tx);
+      const updated = await tx.transaction.updateMany({
+        where: {
+          id: current.id,
+          companyId,
+          revision: current.revision,
+          qboSyncToken: current.qboSyncToken,
+          qboMutationAttempts: { none: { status: { in: [...ACTIVE_MUTATION_STATUSES] } } },
+        },
+        data: {
+          qboSyncToken: fresh.syncToken,
+          date: new Date(fresh.date),
+          payee: fresh.payee,
+          memo: fresh.memo ?? null,
+          amount: fresh.amount,
+          bankAccount: fresh.bankAccount,
+          rawData: fresh.raw as Prisma.InputJsonValue,
+        },
+      });
+      if (updated.count === 1) {
+        await ensureUnknownProviderActionability(
+          {
+            id: current.id,
+            companyId,
+            revision: current.revision,
+            qboSyncToken: fresh.syncToken,
+            qboType: fresh.qboType,
+            qboId: fresh.qboId,
+            date: new Date(fresh.date),
+          },
+          tx as unknown as ProviderActionabilityDb,
+        );
+      }
+      return updated.count === 1 ? 'refreshed' as const : 'contended' as const;
+    }),
+  );
+  return { transactionId, outcome: mutation ?? 'busy' };
 }
 
 function syncTokenOrder(
@@ -200,6 +304,48 @@ const CDC_MAX_AGE_MS = 25 * 24 * 60 * 60 * 1000;
  */
 const inFlightSyncs = new Map<string, Promise<unknown>>();
 
+/**
+ * Replaces the company account cache as one authoritative snapshot inside
+ * the company mutation fence, including accounts absent from the response.
+ */
+export async function replaceAccountReferenceCache(
+  companyId: string,
+  accounts: readonly QboAccountInfo[],
+  db: PrismaClient = prisma,
+): Promise<void> {
+  await runCompanyMutationTransaction(db, companyId, async (tx) => {
+    for (const account of accounts) {
+      const fullName = account.fullName.split(':').join(' · ');
+      await tx.qboAccount.upsert({
+        where: { companyId_qboId: { companyId, qboId: account.qboId } },
+        create: {
+          companyId,
+          qboId: account.qboId,
+          name: account.name,
+          fullName,
+          classification: account.classification,
+          accountType: account.accountType,
+          active: account.active,
+        },
+        update: {
+          name: account.name,
+          fullName,
+          classification: account.classification,
+          accountType: account.accountType,
+          active: account.active,
+        },
+      });
+    }
+    const accountIds = accounts.map(({ qboId }) => qboId);
+    await tx.qboAccount.updateMany({
+      where: accountIds.length > 0
+        ? { companyId, qboId: { notIn: accountIds } }
+        : { companyId },
+      data: { active: false },
+    });
+  });
+}
+
 export function syncCompany(
   companyId: string,
   kind: SyncKind,
@@ -234,30 +380,7 @@ async function runSyncCompany(
 
     // ---- 1. chart of accounts (reference data for pickers + name resolution) ----
     const accounts = await client.listAccounts();
-    for (const a of accounts) {
-      // Store the display path with ' · ' separators ("Expenses · Meals"),
-      // converted from QBO's colon-style FullyQualifiedName.
-      const fullName = a.fullName.split(':').join(' · ');
-      await prisma.qboAccount.upsert({
-        where: { companyId_qboId: { companyId, qboId: a.qboId } },
-        create: {
-          companyId,
-          qboId: a.qboId,
-          name: a.name,
-          fullName,
-          classification: a.classification,
-          accountType: a.accountType,
-          active: a.active,
-        },
-        update: {
-          name: a.name,
-          fullName,
-          classification: a.classification,
-          accountType: a.accountType,
-          active: a.active,
-        },
-      });
-    }
+    await replaceAccountReferenceCache(companyId, accounts);
 
     // Tax references are auxiliary to transaction sync. Their own service
     // persists a safe not-ready diagnostic on failure; preserve the successful
@@ -319,6 +442,7 @@ async function runSyncCompany(
       ).map((t) => `${t.qboType}:${t.qboId}`),
     );
     let created = 0;
+    const mirrorStats = { created: 0, refreshed: 0, stale: 0, busy: 0, contended: 0 };
     for (const t of holdingTxns) {
       // Refresh the QBO mirror on every sync (fresh SyncToken + raw JSON);
       // local categorization state (status/category/splits/tags) is untouched.
@@ -352,7 +476,7 @@ async function runSyncCompany(
             },
           });
           if (current === null) {
-            await tx.transaction.upsert({
+            const mirrored = await tx.transaction.upsert({
               where: {
                 companyId_qboType_qboId: {
                   companyId,
@@ -368,13 +492,26 @@ async function runSyncCompany(
                 ...mirror,
               },
               update: mirror,
+              select: {
+                id: true,
+                companyId: true,
+                revision: true,
+                qboSyncToken: true,
+                qboType: true,
+                qboId: true,
+                date: true,
+              },
             });
-            return { created: true };
+            await ensureUnknownProviderActionability(
+              mirrored,
+              tx as unknown as ProviderActionabilityDb,
+            );
+            return { created: true, outcome: 'created' as const };
           }
           if (isStaleProviderToken(t.syncToken, current.qboSyncToken)) {
-            return { created: false };
+            return { created: false, outcome: 'stale' as const };
           }
-          await tx.transaction.updateMany({
+          const updated = await tx.transaction.updateMany({
             where: {
               id: current.id,
               revision: current.revision,
@@ -385,12 +522,34 @@ async function runSyncCompany(
             },
             data: mirror,
           });
-          return { created: false };
+          if (updated.count === 1) {
+            await ensureUnknownProviderActionability(
+              {
+                id: current.id,
+                companyId,
+                revision: current.revision,
+                qboSyncToken: t.syncToken,
+                qboType: t.qboType,
+                qboId: t.qboId,
+                date: new Date(t.date),
+              },
+              tx as unknown as ProviderActionabilityDb,
+            );
+          }
+          return { created: false, outcome: updated.count === 1 ? 'refreshed' as const : 'contended' as const };
         }),
       );
+      if (mutation === null) {
+        mirrorStats.busy += 1;
+        continue;
+      }
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
+      if (mutation.outcome === 'created') mirrorStats.created += 1;
+      if (mutation.outcome === 'refreshed') mirrorStats.refreshed += 1;
+      if (mutation.outcome === 'stale') mirrorStats.stale += 1;
+      if (mutation.outcome === 'contended') mirrorStats.contended += 1;
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -513,7 +672,7 @@ async function runSyncCompany(
       message += ` — ${plural(autoPostFailures.length, 'auto-post failure')} (${autoPostFailures[0]})`;
     }
     await prisma.syncLog.create({ data: { companyId, kind, ok: true, message } });
-    return { ok: true, message };
+    return { ok: true, message, mirror: mirrorStats };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await prisma.syncLog

@@ -52,6 +52,7 @@ import {
 export type McpOperationState =
   | 'prepared'
   | 'committed'
+  | 'rejected'
   | 'retryable'
   | 'reconciliation_required'
   | 'expired'
@@ -63,6 +64,7 @@ export type McpOperationPhase =
   | 'write_committing'
   | 'write_uncertain'
   | 'write_retryable'
+  | 'write_rejected'
   | 'write_unchanged'
   | 'verified'
   | 'dry_run'
@@ -254,6 +256,40 @@ async function getOwnedAttachmentOperation(
   ));
 }
 
+async function resolveRetryChild(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+  dependencies: McpOperationExecutionDeps,
+): Promise<McpOperationRecord> {
+  if (operation.retryOfId !== null) return operation;
+  const store = storeFrom(dependencies);
+  const candidate = await store.mcpOperation.findFirst({
+    where: { retryOfId: operation.id },
+  });
+  if (candidate === null) return operation;
+  const child = await loadOwnedOperation(candidate.id, principal, { store });
+  if (
+    child.retryOfId !== operation.id
+    || child.idempotencyKey !== null
+    || child.tokenId !== operation.tokenId
+    || child.tokenPrefix !== operation.tokenPrefix
+    || child.userId !== operation.userId
+    || child.companyId !== operation.companyId
+    || child.transactionId !== operation.transactionId
+    || child.toolName !== operation.toolName
+    || child.kind !== operation.kind
+    || child.payloadHash !== operation.payloadHash
+    || child.sourceRevision !== operation.sourceRevision
+    || child.preparedRevision !== operation.preparedRevision
+    || child.qboType !== operation.qboType
+    || child.qboId !== operation.qboId
+    || child.qboSyncToken !== operation.qboSyncToken
+  ) {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  return child;
+}
+
 export async function getMcpOperation(
   principal: McpPrincipal,
   input: GetMcpOperationInput,
@@ -285,7 +321,8 @@ export async function getMcpOperation(
       store: storeFrom(dependencies) as never,
     });
   }
-  const loaded = await loadExecution(principal, input.operationId, dependencies);
+  owned = await resolveRetryChild(principal, owned, dependencies);
+  const loaded = await loadExecution(principal, owned.id, dependencies);
   return project(loaded, nowFrom(dependencies));
 }
 
@@ -304,6 +341,7 @@ export async function commitMcpCategorization(
   if (current.state === 'expired') throw new McpOperationExecutionError('OPERATION_EXPIRED');
   if (current.state === 'cancelled') throw new McpOperationExecutionError('OPERATION_CANCELLED');
   if (current.state === 'retryable') throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
+  if (current.state === 'rejected') return current;
   if (current.state === 'committed') return current;
 
   const actor = await actorFor(loaded.operation, dependencies);
@@ -322,6 +360,7 @@ export async function commitMcpCategorization(
       actor,
       authorization,
       expectedStageHash: hashStagedCategorization(loaded.preview),
+      expectedTaxDisposition: loaded.preview.taxDisposition ?? 'set',
       expectedQboBinding: {
         qboType: loaded.operation.qboType,
         qboId: loaded.operation.qboId,
@@ -334,6 +373,7 @@ export async function commitMcpCategorization(
       companyId: loaded.operation.companyId,
       expectedRevision: loaded.operation.preparedRevision,
       expectedStageHash: hashStagedCategorization(loaded.preview),
+      expectedTaxDisposition: loaded.preview.taxDisposition ?? 'set',
       expectedQboBinding: {
         qboType: loaded.operation.qboType,
         qboId: loaded.operation.qboId,
@@ -371,6 +411,7 @@ export async function commitMcpUndo(
   if (current.state === 'retryable') {
     throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }
+  if (current.state === 'rejected') return current;
   if (current.state === 'committed') return current;
 
   const operation = loaded.operation;
@@ -473,30 +514,30 @@ export async function retryMcpOperation(
       store: storeFrom(dependencies) as never,
     });
   }
-  const loaded = await loadExecution(principal, input.operationId, dependencies);
+  owned = await resolveRetryChild(principal, owned, dependencies);
+  const loaded = await loadExecution(principal, owned.id, dependencies);
   const current = project(loaded, nowFrom(dependencies));
   const commit = loaded.operation.kind === 'undo'
     ? commitMcpUndo
     : commitMcpCategorization;
   if (current.state === 'committed') return current;
+  if (current.state === 'rejected') return current;
   if (current.state === 'prepared' || current.state === 'reconciliation_required') {
     const resumed = await commit(
       principal,
       { operationId: loaded.operation.id },
       dependencies,
     );
-    if (
-      loaded.operation.retryOfId !== null
-      || resumed.phase !== 'write_unchanged'
-    ) {
+    if (loaded.operation.retryOfId !== null) {
       if (
-        loaded.operation.retryOfId !== null
-        && resumed.state === 'retryable'
+        resumed.state === 'retryable'
+        && resumed.phase !== 'write_unchanged'
       ) {
         throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
       }
       return resumed;
     }
+    if (resumed.phase !== 'write_unchanged') return resumed;
   } else if (current.state !== 'retryable') {
     throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }
@@ -728,6 +769,19 @@ function project(
     case 'DRY_RUN': return base(operation, 'committed', 'dry_run', false, false, false, result);
     case 'RETRYABLE': return base(operation, 'retryable', 'write_retryable', false, operation.retryOfId === null, false, result);
     case 'UNCHANGED': return base(operation, 'retryable', 'write_unchanged', false, operation.retryOfId === null, false, result);
+    case 'REJECTED': return base(
+      operation,
+      'rejected',
+      'write_rejected',
+      false,
+      false,
+      false,
+      result,
+      {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction.',
+      },
+    );
     default:
       return base(operation, 'reconciliation_required', 'corrupt', false, false, true, null, {
         code: 'OPERATION_CORRUPT',
@@ -763,7 +817,7 @@ function base(
 }
 
 function attemptOutcome(status: string): DurableMutationOutcome {
-  if (status === 'VERIFIED' || status === 'DRY_RUN' || status === 'UNCHANGED' || status === 'RETRYABLE') {
+  if (status === 'VERIFIED' || status === 'DRY_RUN' || status === 'UNCHANGED' || status === 'RETRYABLE' || status === 'REJECTED') {
     return status;
   }
   return status === 'UNCERTAIN' ? 'UNCERTAIN' : 'IN_PROGRESS';
@@ -899,8 +953,9 @@ function validAttemptState(
       {
         const verification = attempt.verification as Record<string, unknown> | null;
         const newSyncToken = verification?.newSyncToken;
-        const verifiedStatus = operation.kind === 'undo' ? 'REVERTED' : 'POSTED';
-        return transaction.status === verifiedStatus
+        const verificationStatus = operation.kind === 'undo' ? 'REVERTED' : 'POSTED';
+        const transactionStatus = operation.kind === 'undo' ? 'PENDING' : 'POSTED';
+        return transaction.status === transactionStatus
         && typeof newSyncToken === 'string'
         && newSyncToken.length > 0
         && newSyncToken.length <= 128
@@ -908,7 +963,7 @@ function validAttemptState(
         && transaction.qboSyncToken === newSyncToken
         && exactVerification(verification, {
           outcome: 'VERIFIED',
-          status: verifiedStatus,
+          status: verificationStatus,
           newSyncToken,
         });
       }
@@ -929,6 +984,15 @@ function validAttemptState(
           status: preparedStatus,
         });
       }
+    case 'REJECTED':
+      return transaction.status === preparedStatus
+        && retainsPreparedSync
+        && attempt.responseSnapshot === null
+        && attempt.errorCode === 'QBO_WRITE_REJECTED'
+        && exactVerification(attempt.verification, {
+          outcome: 'REJECTED',
+          status: preparedStatus,
+        });
     default:
       return false;
   }

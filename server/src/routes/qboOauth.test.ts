@@ -314,6 +314,7 @@ describe('QuickBooks OAuth callback publication', () => {
       data: expect.objectContaining({
         legalName: 'Example Books LLC',
         disconnectedAt: null,
+        qboTokenRevocations: { deleteMany: {} },
       }),
     });
     expect(mocks.companyUpdate.mock.calls[0]?.[0].data).not.toHaveProperty('nickname');

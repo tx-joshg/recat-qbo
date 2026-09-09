@@ -6,6 +6,13 @@ export function fmtLongDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/** Full source timestamp in the viewer's timezone; invalid values have no label. */
+export function fmtFullDateTime(iso: string): string | null {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'long' });
+}
+
 /** Relative-or-clock timestamp: 'just now' / '4 min ago' / 'Today, 8:14 AM' / 'Yesterday, 6:40 PM' / 'Mar 3, 8:14 AM'. */
 export function fmtWhen(iso: string): string {
   const d = new Date(iso);

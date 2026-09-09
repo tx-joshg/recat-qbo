@@ -23,6 +23,7 @@ export type PurchaseVerification = VerificationResult;
 
 export function canonicalPurchaseLineHash(line: PurchaseLine): string {
   return JSON.stringify([
+    line.rawHash,
     line.id,
     line.amountCents,
     line.description,
@@ -77,6 +78,35 @@ function omittedInclusiveTotalTaxMatches(
   }
   return derivedTotalTaxCents === expectedTotalTaxCents;
 }
+
+/**
+ * QBO can round TxnTaxDetail.TotalTax one cent away from the sum proven by
+ * TaxInclusiveAmt lines (notably on foreign-currency purchases).  The target
+ * lines are still verified exactly below, so this exception cannot mask a
+ * changed category, tax code, line gross, or transaction gross.
+ */
+function providerInclusiveTaxRoundingResidualMatches(
+  expected: ExpectedPurchaseResult,
+  actual: QboPurchaseSnapshot,
+): boolean {
+  if (
+    expected.globalTaxCalculation !== 'TaxInclusive'
+    || actual.globalTaxCalculation !== 'TaxInclusive'
+    || expected.totalTaxCents === null
+    || actual.totalTaxCents === null
+    || Math.abs(expected.totalCents - actual.totalCents) > 1
+    || Math.abs(expected.totalTaxCents - actual.totalTaxCents) !== 1
+    || expected.targetLines.length !== 1
+    || expected.untouchedLineHashes.length !== 0
+    || expected.targetLines[0]?.taxInclusiveCents === null
+    || Math.abs(
+      expected.totalCents - (expected.targetLines[0]?.taxInclusiveCents ?? NaN),
+    ) > 1
+  ) {
+    return false;
+  }
+  return true;
+}
 export function canonicalDepositLineHash(line: DepositLine): string {
   return JSON.stringify([
     line.rawHash,
@@ -115,11 +145,26 @@ export function verifyPurchaseResult(
   actual: QboPurchaseSnapshot,
 ): PurchaseVerification {
   if (actual.qboId !== expected.qboId) return drift('Purchase ID changed.');
-  if (actual.totalCents !== expected.totalCents) return drift('Purchase total changed.');
+  const providerInclusiveRoundingResidual = providerInclusiveTaxRoundingResidualMatches(
+    expected,
+    actual,
+  );
+  if (actual.totalCents !== expected.totalCents && !providerInclusiveRoundingResidual) {
+    return drift('Purchase total changed.');
+  }
   if (actual.accountQboId !== expected.accountQboId) return drift('Purchase account changed.');
   if (actual.date !== expected.date) return drift('Purchase date changed.');
   if (actual.direction !== expected.direction) return drift('Purchase direction changed.');
   if (actual.globalTaxCalculation !== expected.globalTaxCalculation) return drift('Purchase global tax mode changed.');
+  if (
+    expected.taxDisposition === 'preserve_current'
+    && (
+      typeof expected.preservedHash !== 'string'
+      || expected.preservedHash !== actual.preservedHash
+    )
+  ) {
+    return drift('Purchase preserved fields changed.');
+  }
   if (
     !purchaseTotalTaxMatches(
       expected.globalTaxCalculation,
@@ -127,6 +172,7 @@ export function verifyPurchaseResult(
       actual.totalTaxCents,
     )
     && !omittedInclusiveTotalTaxMatches(expected.totalTaxCents, actual)
+    && !providerInclusiveRoundingResidual
   ) {
     return drift('Purchase total tax changed.');
   }
@@ -140,7 +186,11 @@ export function verifyPurchaseResult(
         actual.totalTaxCents,
         targetLine,
         line,
-      ) || targetLineHash(line) === targetLineHash(targetLine));
+        expected.taxDisposition,
+      ) || (
+        expected.taxDisposition !== 'preserve_current'
+        && targetLineHash(line) === targetLineHash(targetLine)
+      ));
     if (targetIndex === -1) return drift('Expected target Purchase line is missing or changed.');
     remainingLines.splice(targetIndex, 1);
   }

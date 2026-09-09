@@ -41,12 +41,31 @@ it('turns off control and descendant transitions for reduced motion', () => {
       (rule): rule is CSSStyleRule =>
         rule instanceof CSSStyleRule && rule.selectorText.includes('.interactive-surface'),
     );
+    const sharedControlTransitionRule = Array.from(reducedMotion!.cssRules).find(
+      (rule): rule is CSSStyleRule =>
+        rule instanceof CSSStyleRule && rule.selectorText.includes('.control-trigger') && rule.selectorText.includes(') *'),
+    );
 
     expect(transitionRule).toBeDefined();
     expect(transitionRule!.selectorText).toContain(') *');
     expect(transitionRule!.style.getPropertyValue('transition')).toBe('none');
     expect(transitionRule!.style.getPropertyPriority('transition')).toBe('important');
+    expect(sharedControlTransitionRule).toBeDefined();
+    expect(sharedControlTransitionRule!.style.getPropertyValue('transition')).toBe('none');
+    expect(sharedControlTransitionRule!.style.getPropertyPriority('transition')).toBe('important');
   } finally {
     style.remove();
+  }
+});
+
+it('uses a not-allowed cursor for disabled shared control options', () => {
+  const style = installGlobalStyles();
+  try {
+    document.body.innerHTML = '<main class="rr"><div id="disabled-option" class="control-option is-disabled">Unavailable</div></main>';
+
+    expect(getComputedStyle(document.getElementById('disabled-option')!).cursor).toBe('not-allowed');
+  } finally {
+    style.remove();
+    document.body.innerHTML = '';
   }
 });

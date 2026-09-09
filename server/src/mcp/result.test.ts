@@ -13,8 +13,38 @@ import { WritebackLifecycleError } from '../services/writeback.js';
 import { AttachmentError } from '../services/attachments/types.js';
 import { ReceiptError } from '../services/receipts/types.js';
 import { safeToolFailure, toolSuccess } from './result.js';
+import { McpSchemaBoundsError } from './schemaBounds.js';
 
 describe('MCP tool results', () => {
+  it.each([
+    new McpOperationExecutionError('OPERATION_CORRUPT'),
+    new McpTransferExecutionError('OPERATION_CORRUPT'),
+    new McpUndoError('OPERATION_CORRUPT'),
+  ])('requires reconciliation for a corrupt operation envelope: %s', (error) => {
+    const result = safeToolFailure(error, 'recovery-fixture');
+    expect(result.structuredContent).toMatchObject({ error: {
+      code: 'OPERATION_RECONCILIATION_REQUIRED',
+      message: 'This operation requires reconciliation before it can continue.',
+    } });
+  });
+
+  it('gives bounded-output failures a safe actionable response', () => {
+    const result = safeToolFailure(new McpSchemaBoundsError('OUTPUT_BYTES', 'PRIVATE_SIZE_SENTINEL'), 'request-size');
+    expect(result.structuredContent).toMatchObject({ error: {
+      code: 'RESPONSE_TOO_LARGE',
+      message: expect.stringContaining('limit'),
+    } });
+    expect(JSON.stringify(result)).toContain('operation status');
+    expect(JSON.stringify(result)).toContain('web app');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_SIZE_SENTINEL');
+  });
+
+  it('does not blame tool arguments for an unserializable server response', () => {
+    const result = safeToolFailure(new McpSchemaBoundsError('OUTPUT_SERIALIZATION', 'PRIVATE_SERIALIZATION_SENTINEL'), 'request-size');
+    expect(result.structuredContent).toMatchObject({ error: { code: 'COMPANY_UNAVAILABLE' } });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_SERIALIZATION_SENTINEL');
+  });
+
   it('maps attachment failures without exposing private detail', () => {
     const forbidden = safeToolFailure(
       new AttachmentError(
@@ -123,10 +153,10 @@ describe('MCP tool results', () => {
     [new McpOperationExecutionError('OPERATION_CANCELLED'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('RETRY_NOT_ALLOWED'), 'INVALID_INPUT'],
-    [new McpOperationExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpOperationExecutionError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [new McpTransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
     [new McpTransferExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
-    [new McpTransferExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpTransferExecutionError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [new TransferOperationError('FORBIDDEN'), 'FORBIDDEN'],
     [new TransferOperationError('TRANSACTION_NOT_FOUND'), 'NOT_FOUND'],
     [new TransferOperationError('COMPANY_DISCONNECTED'), 'QBO_DISCONNECTED'],
@@ -135,7 +165,7 @@ describe('MCP tool results', () => {
     [new TransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
     [new TransferExecutionError('OPERATION_EXPIRED'), 'INVALID_INPUT'],
     [new McpUndoError('UNDO_NOT_ALLOWED'), 'INVALID_INPUT'],
-    [new McpUndoError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpUndoError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [
       new CategorizationError(
         'TRANSACTION_NOT_FOUND',
@@ -143,6 +173,14 @@ describe('MCP tool results', () => {
       ),
       'NOT_FOUND',
     ],
+    ...[
+      'INVALID_TAX_CODE',
+      'PRESERVE_SOURCE_ID_INVALID',
+      'PRESERVE_SOURCE_SHAPE_INVALID',
+      'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
+      'PRESERVE_SOURCE_TAX_CALCULATION_INVALID',
+      'PRESERVE_SOURCE_TOTAL_INVALID',
+    ].map((code) => [new CategorizationError(code, 'PRIVATE_SOURCE_DETAILS'), 'INVALID_INPUT']),
     [
       new CategorizationError(
         'INVALID_ACCOUNT',

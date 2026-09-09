@@ -1,3 +1,4 @@
+import { Select } from '../SelectCombobox';
 import type {
   ReceiptDocumentStatus,
   ReceiptListParams,
@@ -42,26 +43,19 @@ export default function ReceiptFilters({
     ...patch,
   });
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div className="receipt-filters">
       <div
         role="group"
         aria-label="Receipt status"
-        style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}
+        className="receipt-filter-chips"
       >
         {RECEIPT_QUICK_FILTERS.map((filter) => (
           <button
             key={filter.label}
             type="button"
+            className="btn receipt-filter-chip"
             aria-pressed={quickLabel === filter.label}
             onClick={() => onQuickFilter(filter)}
-            style={{
-              border: '1px solid var(--bd2)',
-              borderRadius: 99,
-              padding: '6px 11px',
-              background: quickLabel === filter.label ? 'var(--acc)' : 'var(--card)',
-              color: quickLabel === filter.label ? '#fff' : 'var(--ink)',
-              cursor: 'pointer',
-            }}
           >
             {filter.label}
           </button>
@@ -74,45 +68,35 @@ export default function ReceiptFilters({
         disabled={duplicateMode}
         onChange={(event) => onSearch(event.target.value)}
         placeholder="Search vendor, filename, amount, or receipt ID"
-        style={{
-          width: 'min(100%, 480px)',
-          border: '1px solid var(--bd2)',
-          borderRadius: 8,
-          padding: '9px 11px',
-          background: 'var(--sur)',
-          color: 'var(--ink)',
-        }}
+        className="text-control receipt-search"
       />
-      {!duplicateMode && <details>
-        <summary>More filters</summary>
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))',
-          gap: 10,
-          marginTop: 10,
-        }}>
-          <label>
-            From
+      {!duplicateMode && (
+        <div className="receipt-filter-grid">
+          <label className="field">
+            <span className="field-label">From</span>
             <input
               aria-label="Receipt date from"
               type="date"
+              className="text-control"
               value={filters.dateFrom ?? ''}
               onChange={(event) => update({ dateFrom: event.target.value || undefined })}
             />
           </label>
-          <label>
-            To
+          <label className="field">
+            <span className="field-label">To</span>
             <input
               aria-label="Receipt date to"
               type="date"
+              className="text-control"
               value={filters.dateTo ?? ''}
               onChange={(event) => update({ dateTo: event.target.value || undefined })}
             />
           </label>
-          <label>
-            Document type
+          <label className="field">
+            <span className="field-label">Document type</span>
             <input
               aria-label="Document type filter"
+              className="text-control"
               value={filters.documentTypes?.[0] ?? ''}
               onChange={(event) => update({
                 documentTypes: event.target.value.trim()
@@ -121,51 +105,50 @@ export default function ReceiptFilters({
               })}
             />
           </label>
-          <label>
-            Source
-            <select
-              aria-label="Receipt source filter"
+          <label className="field">
+            <span className="field-label">Source</span>
+            <Select
+              label="Receipt source filter"
               value={filters.sourceKinds?.[0] ?? ''}
-              onChange={(event) => update({
-                sourceKinds: event.target.value
-                  ? [event.target.value as NonNullable<ReceiptListParams['sourceKinds']>[number]]
+              onValueChange={(value) => update({
+                sourceKinds: value
+                  ? [value as NonNullable<ReceiptListParams['sourceKinds']>[number]]
                   : undefined,
               })}
-            >
-              <option value="">All sources</option>
-              <option value="WEB_UPLOAD">Web upload</option>
-              <option value="API_UPLOAD">API upload</option>
-              <option value="MCP_UPLOAD">MCP upload</option>
-            </select>
+              options={[{ value: '', label: 'All sources' },
+                { value: 'WEB_UPLOAD', label: 'Web upload' },
+                { value: 'API_UPLOAD', label: 'API upload' },
+                { value: 'MCP_UPLOAD', label: 'MCP upload' }]}
+            />
           </label>
-          <label>
-            Match state
-            <select
-              aria-label="Receipt match filter"
+          <label className="field">
+            <span className="field-label">Match state</span>
+            <Select
+              label="Receipt match filter"
               value={filters.matched === undefined
                 ? ''
                 : filters.matched ? 'matched' : 'unmatched'}
-              onChange={(event) => update({
-                matched: event.target.value === ''
+              onValueChange={(value) => update({
+                matched: value === ''
                   ? undefined
-                  : event.target.value === 'matched',
+                  : value === 'matched',
               })}
-            >
-              <option value="">All</option>
-              <option value="matched">Matched</option>
-              <option value="unmatched">Unmatched</option>
-            </select>
+              options={[{ value: '', label: 'All' },
+                { value: 'matched', label: 'Matched' },
+                { value: 'unmatched', label: 'Unmatched' }]}
+            />
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <label className="field field-checkbox">
             <input
               type="checkbox"
+              className="checkbox-control"
               checked={filters.missingInfo ?? false}
               onChange={(event) => update({ missingInfo: event.target.checked })}
             />
-            Missing information
+            <span className="field-label">Missing information</span>
           </label>
         </div>
-      </details>}
+      )}
     </div>
   );
 }
