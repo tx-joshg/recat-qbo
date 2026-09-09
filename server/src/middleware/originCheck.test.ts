@@ -21,7 +21,7 @@ vi.mock('../env.js', () => ({
 
 vi.mock('../lib/prisma.js', () => ({ prisma: {} }));
 
-import { originCheck } from './auth.js';
+import { originCheck, requireBrowserMutationOrigin } from './auth.js';
 
 function run(method: string, origin?: string): Promise<unknown> {
   return new Promise((resolve) => {
@@ -31,12 +31,23 @@ function run(method: string, origin?: string): Promise<unknown> {
   });
 }
 
+function runStrict(origin?: string): Promise<unknown> {
+  return new Promise((resolve) => {
+    const req = { method: 'POST', headers: origin === undefined ? {} : { origin } } as Request;
+    requireBrowserMutationOrigin(req, {} as Response, (err?: unknown) => resolve(err));
+  });
+}
+
 beforeEach(() => {
   mocks.origins = new Set(['http://umbrel.local:3009']);
   mocks.throws = false;
 });
 
 describe('originCheck', () => {
+  it('requires an allowed Origin on cookie-authenticated policy mutations', async () => {
+    await expect(runStrict()).resolves.toMatchObject({ status: 403, code: 'BAD_ORIGIN' });
+    await expect(runStrict('http://umbrel.local:3009')).resolves.toBeUndefined();
+  });
   it('passes a mutating request from an allowed origin', async () => {
     await expect(run('POST', 'http://umbrel.local:3009')).resolves.toBeUndefined();
   });

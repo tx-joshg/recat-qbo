@@ -35,6 +35,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTaxCodeInfo,
   type QboTaxProfile,
+  type QboTaxRefundCapability,
   type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
@@ -48,6 +49,7 @@ import {
 
 import { MOCK_REALM_IDS, type StagedCategorization } from '@recat/shared';
 import {
+  mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
@@ -84,6 +86,7 @@ interface MockAccount {
   /** normalized bucket (Income | COGS | Expenses | Bank | CreditCard) */
   classification: string;
   accountType: string;
+  accountSubType?: string;
   /** colon path, per QBO FullyQualifiedName convention */
   fullName: string;
 }
@@ -161,7 +164,13 @@ export interface MockRealm {
   nextId: number;
 }
 
-function acct(qboId: string, name: string, classification: string, accountType: string): MockAccount {
+function acct(
+  qboId: string,
+  name: string,
+  classification: string,
+  accountType: string,
+  accountSubType?: string,
+): MockAccount {
   // Bank/credit-card/holding accounts are top-level in QBO, so their
   // FullyQualifiedName is just the name; category accounts get a group path.
   const grouped = classification === 'Income' || classification === 'COGS' || classification === 'Expenses';
@@ -171,6 +180,7 @@ function acct(qboId: string, name: string, classification: string, accountType: 
     name,
     classification,
     accountType,
+    accountSubType,
     fullName: grouped && !holding ? `${classification}:${name}` : name,
   };
 }
@@ -231,6 +241,7 @@ function buildHarborRealm(): MockRealm {
     acct('25', 'Software subscriptions', 'Expenses', 'Expense'),
     acct('26', 'Utilities', 'Expenses', 'Expense'),
     acct('27', 'Vehicle fuel', 'Expenses', 'Expense'),
+    acct('28', 'GST/HST Suspense', 'Liability', 'Other Current Liabilities', 'GlobalTaxSuspense'),
   ];
   const HOLDING = '4'; // Ask My Accountant
   const seeds: TxnSeed[] = [
@@ -290,6 +301,7 @@ function buildBluebirdRealm(): MockRealm {
     acct('16', 'Rent', 'Expenses', 'Expense'),
     acct('17', 'Software subscriptions', 'Expenses', 'Expense'),
     acct('18', 'Utilities', 'Expenses', 'Expense'),
+    acct('19', 'GST/HST Suspense', 'Liability', 'Other Current Liabilities', 'GlobalTaxSuspense'),
   ];
   const HOLDING = '3'; // Ask My Accountant
   const seeds: TxnSeed[] = [
@@ -1063,32 +1075,10 @@ function rawPurchaseSnapshot(
       ? null
       : (raw.Line ?? []).reduce((sum, line) => sum + lineTaxCents(line), 0);
   return {
-    qboId: raw.Id,
+    ...mapPurchaseTaxSnapshot(raw),
     syncToken,
-    totalCents: sign * Math.round((raw.TotalAmt ?? 0) * 100),
-    accountQboId: raw.AccountRef?.value ?? null,
-    date: raw.TxnDate ?? '',
-    direction: sign === 1 ? 'refund' : 'purchase',
-    globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
     totalTaxCents:
       unsignedTotalTaxCents === null ? null : sign * unsignedTotalTaxCents,
-    lines: (raw.Line ?? []).map((line, index) => ({
-      id: line.Id ?? String(index + 1),
-      amountCents: sign * Math.round((line.Amount ?? 0) * 100),
-      description: line.Description ?? null,
-      accountQboId: line.AccountBasedExpenseLineDetail?.AccountRef?.value ?? null,
-      customerQboId: line.AccountBasedExpenseLineDetail?.CustomerRef?.value ?? null,
-      classQboId: line.AccountBasedExpenseLineDetail?.ClassRef?.value ?? null,
-      taxCodeQboId: line.AccountBasedExpenseLineDetail?.TaxCodeRef?.value ?? null,
-      taxAmountCents:
-        line.AccountBasedExpenseLineDetail?.TaxAmount === undefined
-          ? null
-          : sign * Math.round(line.AccountBasedExpenseLineDetail.TaxAmount * 100),
-      taxInclusiveCents:
-        line.AccountBasedExpenseLineDetail?.TaxInclusiveAmt === undefined
-          ? null
-          : sign * Math.round(line.AccountBasedExpenseLineDetail.TaxInclusiveAmt * 100),
-    })),
   };
 }
 
@@ -1332,6 +1322,7 @@ export class MockQboClient implements QboClient {
       fullName: a.fullName,
       classification: a.classification,
       accountType: a.accountType,
+      accountSubType: a.accountSubType ?? null,
       active: true,
     }));
   }
@@ -1339,6 +1330,15 @@ export class MockQboClient implements QboClient {
   async getTaxProfile(): Promise<QboTaxProfile> {
     await ensureMockRealmsHydrated();
     return { ...this.realm.taxProfile };
+  }
+
+  async probeTaxRefundCapability(): Promise<QboTaxRefundCapability> {
+    return {
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: '75',
+    };
   }
 
   async fetchWriteSafety(

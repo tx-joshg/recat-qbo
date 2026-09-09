@@ -36,13 +36,20 @@ function sourceWithManyItems(): AgentSnapshotSource {
     tags: [{ id: TAG_ID, name: 'Project' }],
     rules: categories.map((category, index) => ({
       id: uuid(index + 1),
+      ruleRevision: 1,
       priority: index + 1,
       matchField: 'payee' as const,
       matchText: `Merchant ${String(index + 1).padStart(2, '0')}`,
-      categoryQboId: category.qboId,
-      taxCalculation: 'NotApplicable' as const,
-      taxCodeQboId: null,
-      tagIds: [TAG_ID],
+      action: {
+        version: 2 as const,
+        direction: 'Purchase' as const,
+        category: category.name,
+        categoryQboId: category.qboId,
+        taxCalculation: 'NotApplicable' as const,
+        taxCodeQboId: null,
+        tagIds: [TAG_ID],
+      },
+      autoPost: false,
     })),
     similarVerifiedTransactions: categories.map((_category, index) => ({
       transactionId: uuid(index + 31),
@@ -81,8 +88,11 @@ function sourceWithTaxCodes(): AgentSnapshotSource {
     },
     rules: source.rules.slice(0, 2).map((rule) => ({
       ...rule,
-      taxCalculation: 'TaxExcluded',
-      taxCodeQboId: 'tax-01',
+      action: {
+        ...rule.action,
+        taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'tax-01',
+      },
     })),
     similarVerifiedTransactions: source.similarVerifiedTransactions.slice(0, 2).map((transaction) => ({
       ...transaction,

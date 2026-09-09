@@ -5,6 +5,7 @@
 // marked with a TODO — server routes will be built to match this file.
 
 import type {
+  ProviderActionabilityRefreshResult,
   AgentCompanySettingsDto,
   AgentRunStatus,
   AttachmentDto,
@@ -51,7 +52,15 @@ import type {
   ReceiptStatsRange,
   Role,
   ReconcileCategorizationBody,
-  RuleDto,
+  RuleDetailDto,
+  RuleRevisionPageDto,
+  RuleAffectedTransactionFilter,
+  RuleAffectedTransactionPageDto,
+  RuleLifecycleFilter,
+  RuleLifecyclePageDto,
+  RuleMutationKind,
+  RuleMutationResult,
+  ClassificationCase,
   RuleCandidateDto,
   RuleTestResult,
   SavedReportConfig,
@@ -81,18 +90,21 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
   readonly mutationResult: CategorizationMutationResult | undefined;
+  readonly requestId: string | undefined;
 
   constructor(
     status: number,
     message: string,
     code?: string,
     mutationResult?: CategorizationMutationResult,
+    requestId?: string,
   ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.mutationResult = mutationResult;
+    this.requestId = requestId;
   }
 }
 
@@ -112,6 +124,7 @@ const MUTATION_OUTCOMES: readonly CategorizationMutationResult['outcome'][] = [
   'UNCHANGED',
   'DRY_RUN',
   'RETRYABLE',
+  'REJECTED',
 ];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_MUTATION_ERROR_CODE_LENGTH = 120;
@@ -167,12 +180,16 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     let message = res.statusText || `Request failed (${res.status})`;
     let code: string | undefined;
     let mutationResult: CategorizationMutationResult | undefined;
+    let requestId: string | undefined;
     try {
       const data = await res.json() as unknown;
       if (typeof data === 'object' && data !== null) {
         const errorBody = data as Partial<ApiErrorBody>;
         if (typeof errorBody.error === 'string') message = errorBody.error;
         if (typeof errorBody.code === 'string') code = errorBody.code;
+        if (typeof errorBody.requestId === 'string' && UUID_PATTERN.test(errorBody.requestId)) {
+          requestId = errorBody.requestId;
+        }
       }
       mutationResult = boundedMutationResult(data);
       if (mutationResult?.error) {
@@ -182,7 +199,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     } catch {
       // non-JSON error body — keep the status text
     }
-    throw new ApiError(res.status, message, code, mutationResult);
+    throw new ApiError(res.status, message, code, mutationResult, requestId);
   }
   const text = await res.text();
   return (text ? JSON.parse(text) : undefined) as T;
@@ -483,12 +500,18 @@ export const auth = {
   session: () => api.get<SessionDto>('/api/session'),
 };
 
+export interface CompanySyncResult {
+  ok: boolean;
+  message: string;
+  lastSyncedAt: string | null;
+}
+
 export const companies = {
   list: () => api.get<CompanyDto[]>('/api/companies'),
   patch: (id: string, body: CompanyPatchBody) => api.patch<CompanyDto>(`/api/companies/${id}`, body),
   attachmentStoragePolicy: (id: string) =>
     api.get<AttachmentStoragePolicyDto>(`/api/companies/${id}/attachment-storage-policy`),
-  sync: (id: string) => api.post<void>(`/api/companies/${id}/sync`),
+  sync: (id: string) => api.post<CompanySyncResult>(`/api/companies/${id}/sync`),
   /** Consent URL for connecting a (new) company — mode=demo → the built-in
    * fake consent page; mode=real → Intuit OAuth (env picks sandbox/production). */
   connectUrl: (params: ConnectUrlParams) =>
@@ -508,6 +531,12 @@ export const companies = {
 };
 
 export const transactions = {
+  /** Read QuickBooks status for one mirrored transaction; resume only with the returned cursor. */
+  refreshProviderStatus: (companyId: string, cursor?: string) =>
+    api.post<ProviderActionabilityRefreshResult>(
+      `/api/companies/${companyId}/transactions/actionability/refresh${qs({ limit: 1, cursor })}`,
+      {},
+    ),
   list: (companyId: string, params: TransactionListParams = {}) =>
     api.get<TransactionListResponse>(`/api/companies/${companyId}/transactions${qs({ ...params })}`),
   /** Stage category/splits/tags — no QBO write. */
@@ -863,31 +892,71 @@ export const tags = {
     api.del<void>(`/api/companies/${companyId}/tags/${tagId}`),
 };
 
-export interface RuleBody {
-  matchText: string;
-  category: string;
-  categoryQboId?: string | null;
-  tagIds?: string[];
-  autoPost?: boolean;
-  /** Match order — lowest number wins when several rules match. */
-  priority?: number;
+export const classificationMemory = {
+  currentCase: (companyId: string, transactionId: string) =>
+    api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`),
+};
+
+export interface PrepareRuleOperationBody {
+  mutation: Exclude<RuleMutationKind, 'create'>;
+  ruleId?: string;
+  candidateId?: string;
+  expectedRevision: number;
+  idempotencyKey: string;
+  retryOfId?: string;
+  proposal?: {
+    matchText?: string;
+    direction?: 'Purchase' | 'Deposit';
+    categoryQboId?: string;
+    taxCalculation?: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+    taxCodeQboId?: string | null;
+    tagIds?: string[];
+    autoPost?: boolean;
+    reviewReason?: string;
+  };
 }
 
+export const ruleOperations = {
+  prepare: (companyId: string, body: PrepareRuleOperationBody) =>
+    api.post<RuleMutationResult>(`/api/companies/${companyId}/rule-operations/prepare`, body),
+  commit: (companyId: string, operationId: string, idempotencyKey: string) =>
+    api.post<RuleMutationResult>(
+      `/api/companies/${companyId}/rule-operations/${operationId}/commit`,
+      { idempotencyKey },
+    ),
+  prepareFromCase: (
+    companyId: string,
+    caseId: string,
+    body: { matchText: string; idempotencyKey: string; retryOfId?: string },
+  ) => api.post<RuleMutationResult>(
+    `/api/companies/${companyId}/rule-operations/from-case/${caseId}/prepare`,
+    body,
+  ),
+};
+
 export const rules = {
-  /** Returns rules in match order (priority asc) — render as-is, no re-sort. */
-  list: (companyId: string) => api.get<RuleDto[]>(`/api/companies/${companyId}/rules`),
-  create: (companyId: string, body: RuleBody) =>
-    api.post<RuleDto>(`/api/companies/${companyId}/rules`, body),
-  patch: (companyId: string, ruleId: string, body: Partial<RuleBody>) =>
-    api.patch<RuleDto>(`/api/companies/${companyId}/rules/${ruleId}`, body),
-  del: (companyId: string, ruleId: string) =>
-    api.del<void>(`/api/companies/${companyId}/rules/${ruleId}`),
-  /** Persist a full match order: ids[0] = topmost (wins first). Returns the reordered list. */
-  reorder: (companyId: string, ids: string[]) =>
-    api.put<RuleDto[]>(`/api/companies/${companyId}/rules/order`, { ids }),
-  /** Dry-run a draft rule (placed at top priority) against recent transactions. */
-  test: (companyId: string, matchText: string) =>
-    api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),
+  lifecycle: (
+    companyId: string,
+    state: RuleLifecycleFilter = 'all',
+    cursor?: string,
+    limit = 100,
+  ) => api.get<RuleLifecyclePageDto>(
+    `/api/companies/${companyId}/rules/lifecycle${qs({ state, cursor, limit })}`,
+  ),
+  detail: (companyId: string, ruleId: string) =>
+    api.get<RuleDetailDto>(`/api/companies/${companyId}/rules/${ruleId}`),
+  revisions: (companyId: string, ruleId: string, cursor?: string, limit = 20) =>
+    api.get<RuleRevisionPageDto>(
+      `/api/companies/${companyId}/rules/${ruleId}/revisions${qs({ cursor, limit })}`,
+    ),
+  affectedTransactions: (companyId: string, ruleId: string, params: {
+    status?: RuleAffectedTransactionFilter; limit?: number; cursor?: string;
+  }) => api.get<RuleAffectedTransactionPageDto>(
+    `/api/companies/${companyId}/rules/${ruleId}/affected-transactions${qs(params)}`,
+  ),
+  /** Test a draft vendor condition for one transaction direction without writing. */
+  test: (companyId: string, matchText: string, direction: 'Purchase' | 'Deposit') =>
+    api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText, direction }),
 };
 
 export const ruleCandidates = {
@@ -898,14 +967,6 @@ export const ruleCandidates = {
   get: (companyId: string, candidateId: string) =>
     api.get<RuleCandidateDto>(
       `/api/companies/${companyId}/rule-candidates/${candidateId}`,
-    ),
-  dismiss: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/dismiss`,
-    ),
-  activate: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/activate`,
     ),
 };
 
@@ -918,6 +979,8 @@ export const savedReports = {
 };
 
 export const reports = {
+  bankAccounts: (companyId: string) =>
+    api.get<string[]>(`/api/companies/${companyId}/reports/bank-accounts`),
   pl: (companyId: string, params: PlReportParams) =>
     api.get<StatementDto>(`/api/companies/${companyId}/reports/pl${qs({ ...params })}`),
   bs: (companyId: string, params: BsReportParams) =>

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { StagedCategorization } from '@recat/shared';
+import { verifyPreparedResult } from '../../services/tax/verify.js';
 import {
   mapDepositSnapshot,
   QboDepositPreparationError,
@@ -105,6 +106,249 @@ function prepare(
 }
 
 describe('prepareDepositRecategorization', () => {
+  it('prepares the synthetic single-line non-taxable GST refund Deposit shape', () => {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_SYNTHETIC_1',
+      SyncToken: '0',
+      TxnDate: '2024-05-10',
+      DepositToAccountRef: { value: 'BANK_CAD', name: 'Example Bank (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 1200.45,
+      HomeTotalAmt: 1200.45,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Synthetic government refund REF-EXAMPLE-A',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Synthetic government refund REF-EXAMPLE-A',
+        Amount: 1200.45,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: 'Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+    const before = mapDepositSnapshot(raw);
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '00000000-0000-4000-8000-000000000001',
+        revision: 1,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 120_045, taxCents: 0, totalCents: 120_045 },
+        lines: [{
+          idx: 0,
+          subtotalCents: 120_045,
+          taxCents: 0,
+          totalCents: 120_045,
+          categoryQboId: 'REFUND_ACCOUNT',
+          taxCodeQboId: '5',
+          memo: raw.Line![0]!.Description!,
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+      before,
+      requestId: '00000000-0000-4000-8000-000000000002',
+    });
+
+    expect(prepared).toMatchObject({
+      qboType: 'Deposit',
+      qboId: 'DEPOSIT_SYNTHETIC_1',
+      body: {
+        SyncToken: '0',
+        GlobalTaxCalculation: 'TaxInclusive',
+        Line: [{
+          Id: '1',
+          Amount: 1200.45,
+          Description: raw.Line![0]!.Description,
+          DepositLineDetail: {
+            AccountRef: { value: 'REFUND_ACCOUNT' },
+            TaxCodeRef: { value: '5' },
+            TaxApplicableOn: 'Sales',
+          },
+        }],
+      },
+      expected: {
+        totalCents: 120_045,
+        totalTaxCents: 0,
+        targetLines: [{
+          amountCents: 120_045,
+          accountQboId: 'REFUND_ACCOUNT',
+          taxCodeQboId: '5',
+          taxApplicableOn: 'Sales',
+        }],
+      },
+    });
+  });
+
+  it('splits one holding Deposit line into reviewed zero-rate lines', () => {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_SYNTHETIC_2',
+      SyncToken: '0',
+      TxnDate: '2024-05-09',
+      DepositToAccountRef: { value: 'BANK_CAD', name: 'Example Bank (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 1502.30,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Synthetic government refund REF-EXAMPLE-B',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Synthetic government refund REF-EXAMPLE-B',
+        Amount: 1502.30,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: 'Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '00000000-0000-4000-8000-000000000003',
+        revision: 2,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 150_230, taxCents: 0, totalCents: 150_230 },
+        lines: [
+          { idx: 0, subtotalCents: 150_000, taxCents: 0, totalCents: 150_000, categoryQboId: 'REFUND_ACCOUNT', taxCodeQboId: '5', memo: null, tagIds: [] },
+          { idx: 1, subtotalCents: 230, taxCents: 0, totalCents: 230, categoryQboId: 'INTEREST_ACCOUNT', taxCodeQboId: '5', memo: null, tagIds: [] },
+        ],
+        tagIds: [],
+      },
+      before: mapDepositSnapshot(raw),
+      requestId: '00000000-0000-4000-8000-000000000004',
+    });
+
+    expect(prepared.body.Line).toMatchObject([
+      { Id: '1', Amount: 1500.00, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: 'REFUND_ACCOUNT' }, TaxCodeRef: { value: '5' } } },
+      { Amount: 2.30, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: 'INTEREST_ACCOUNT' }, TaxCodeRef: { value: '5' } } },
+    ]);
+    expect(prepared.body.Line![1]).not.toHaveProperty('Id');
+    expect(prepared.expected.targetLines).toHaveLength(2);
+  });
+
+  it('preserves a replaced Deposit line description when the proposal memo is null', () => {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_SYNTHETIC_3',
+      SyncToken: '0',
+      TxnDate: '2024-05-09',
+      DepositToAccountRef: { value: 'BANK_CAD', name: 'Example Bank (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 240.68,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Synthetic rebate INV-EXAMPLE-C',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Synthetic rebate INV-EXAMPLE-C',
+        Amount: 240.68,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: 'Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '00000000-0000-4000-8000-000000000005',
+        revision: 1,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 24_068, taxCents: 0, totalCents: 24_068 },
+        lines: [{
+          idx: 0,
+          subtotalCents: 24_068,
+          taxCents: 0,
+          totalCents: 24_068,
+          categoryQboId: 'REBATE_ACCOUNT',
+          taxCodeQboId: '5',
+          memo: null,
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+      before: mapDepositSnapshot(raw),
+      requestId: '00000000-0000-4000-8000-000000000006',
+    });
+
+    expect(prepared.body.Line![0]!.Description).toBe(raw.Line![0]!.Description);
+    expect(prepared.expected.targetLines[0]!.description).toBe(raw.Line![0]!.Description);
+  });
+
+  it('derives zero Deposit tax when QBO omits TotalTax for an explicit zero-rate code', () => {
+    const snapshot = mapDepositSnapshot({
+      Id: 'DEPOSIT_SYNTHETIC_3',
+      SyncToken: '1',
+      TxnDate: '2024-05-09',
+      DepositToAccountRef: { value: 'BANK_CAD', name: 'Example Bank (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 240.68,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Synthetic rebate INV-EXAMPLE-C',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Amount: 240.68,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: 'REBATE_ACCOUNT', name: 'Other Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    });
+
+    expect(snapshot.totalTaxCents).toBe(0);
+  });
+
+  it.each(['TaxInclusive', 'TaxExcluded'] as const)(
+    'derives omitted aggregate tax from net Deposit lines in %s mode',
+    (taxCalculation) => {
+      const raw = completeDeposit({
+        GlobalTaxCalculation: taxCalculation,
+        TotalAmt: 164,
+        TxnTaxDetail: {},
+      });
+      raw.Line![0]!.DepositLineDetail!.TaxCodeRef = { value: SALES_TAX_CODE };
+
+      expect(mapDepositSnapshot(raw).totalTaxCents).toBe(700);
+    },
+  );
+
+  it('keeps explicit aggregate tax authoritative and absent tax mode unknown', () => {
+    const raw = completeDeposit({ TotalAmt: 164, TxnTaxDetail: { TotalTax: 5 } });
+    expect(mapDepositSnapshot(raw).totalTaxCents).toBe(500);
+
+    raw.TxnTaxDetail = {};
+    delete raw.GlobalTaxCalculation;
+    expect(mapDepositSnapshot(raw).totalTaxCents).toBeNull();
+  });
+
   it('fingerprints preserved entity metadata and exact raw line fields', () => {
     const raw = completeDeposit();
     const baseline = mapDepositSnapshot(raw);
@@ -330,7 +574,7 @@ describe('prepareDepositRecategorization', () => {
     );
   });
 
-  it('rejects staged lines that would append beyond the existing holding lines', () => {
+  it('rejects expanding multiple holding lines beyond the existing in-place shape', () => {
     const splitStage: StagedCategorization = {
       ...staged(),
       lines: [
@@ -348,15 +592,34 @@ describe('prepareDepositRecategorization', () => {
           totalCents: 4_280,
           categoryQboId: 'income-second',
         },
+        {
+          ...staged().lines[0]!,
+          idx: 2,
+          subtotalCents: 0,
+          taxCents: 0,
+          totalCents: 0,
+          categoryQboId: 'income-third',
+        },
       ],
     };
 
-    expect(() => prepare(completeDeposit(), splitStage)).toThrowError(
+    const base = completeDeposit();
+    const raw = completeDeposit({
+      Line: [
+        { ...base.Line![0]!, Id: 'holding-line-a', Amount: 64.2 },
+        { ...base.Line![0]!, Id: 'holding-line-b', Amount: 42.8 },
+        base.Line![1]!,
+      ],
+    });
+
+    expect(() => prepare(raw, splitStage)).toThrowError(
       expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
   });
 
   it.each([
+    ['non-empty CustomExtensions', { CustomExtensions: [{ DefinitionId: 'generic-extension' }] }],
+    ['non-array CustomExtensions', { CustomExtensions: 'generic-extension' }],
     ['LinkedTxn', { LinkedTxn: [{ TxnId: 'payment-generic', TxnType: 'Payment' }] }],
     ['unknown top-level field', { GenericLineField: 'semantic data' }],
     ['CheckNum', { DepositLineDetail: { CheckNum: 'CHECK-GENERIC' } }],
@@ -563,6 +826,81 @@ describe('prepareDepositRecategorization', () => {
 });
 
 describe('prepareDepositRestore', () => {
+  it.each([
+    { taxCents: 0, subtotalCents: 10_700, firstTaxCents: 0, secondNetCents: 4_700, secondTaxCents: 0 },
+    { taxCents: 700, subtotalCents: 10_000, firstTaxCents: 420, secondNetCents: 4_000, secondTaxCents: 280 },
+  ])('verifies and restores a split with assigned sibling identity and $taxCents omitted tax cents', ({
+    taxCents, subtotalCents, firstTaxCents, secondNetCents, secondTaxCents,
+  }) => {
+    const raw = completeDeposit({
+      TotalAmt: 107,
+      TxnTaxDetail: {},
+      Line: [{
+        Id: 'holding-line',
+        Amount: 107,
+        Description: 'Synthetic source description',
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: { AccountRef: { value: HOLDING_ACCOUNT } },
+      }],
+    });
+    const taxCodeQboId = taxCents === 0 ? 'sales-zero' : SALES_TAX_CODE;
+    const original = prepare(raw, {
+      ...staged(),
+      totals: { subtotalCents, taxCents, totalCents: 10_700 },
+      lines: [{
+        idx: 0,
+        subtotalCents: 6_000,
+        taxCents: firstTaxCents,
+        totalCents: 6_000 + firstTaxCents,
+        categoryQboId: 'income-first',
+        taxCodeQboId,
+        memo: null,
+      }, {
+        idx: 1,
+        subtotalCents: secondNetCents,
+        taxCents: secondTaxCents,
+        totalCents: secondNetCents + secondTaxCents,
+        categoryQboId: 'income-second',
+        taxCodeQboId,
+        memo: null,
+      }],
+    });
+    expect(original.expected.targetLines.map((line) => line.id)).toEqual(['holding-line', null]);
+
+    // Simulate QBO readback: its new sibling gets an identity, both lines get
+    // ordinal metadata, and the aggregate tax field is absent.
+    const current: RawDeposit = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: {},
+      Line: [
+        { ...original.body.Line![0]!, LineNum: 1 },
+        { ...original.body.Line![1]!, Id: 'qbo-assigned-sibling', LineNum: 2 },
+      ],
+    };
+    const postedSnapshot = mapDepositSnapshot(current);
+    expect(postedSnapshot.totalTaxCents).toBe(taxCents);
+    expect(verifyPreparedResult(original, postedSnapshot)).toEqual({ ok: true });
+
+    const restore = prepareDepositRestore({
+      current,
+      prepared: original,
+      requestId: 'request-restore-split',
+    });
+    expect(restore.body.SyncToken).toBe('8');
+    expect(restore.body.Line).toEqual(raw.Line);
+    expect(restore.expected.targetLines).toHaveLength(1);
+    expect(restore.body).not.toHaveProperty('TxnTaxDetail');
+
+    const restoredSnapshot = mapDepositSnapshot({
+      ...restore.body,
+      SyncToken: '9',
+      TxnTaxDetail: {},
+    });
+    expect(restoredSnapshot.totalTaxCents).toBe(0);
+    expect(verifyPreparedResult(restore, restoredSnapshot)).toEqual({ ok: true });
+  });
+
   it('accepts QBO LineNum enrichment through preparation and verified restore', () => {
     const raw = completeDeposit();
     raw.Line![0]!.LineNum = 7;

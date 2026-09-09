@@ -109,25 +109,23 @@ describe('rule candidate routes', () => {
     expect(mocks.dismiss).not.toHaveBeenCalled();
   });
 
-  it('strictly validates candidate ids before mutation', async () => {
-    const response = await request(app())
-      .post('/api/companies/company-1/rule-candidates/not-an-id/activate')
-      .set(sessionHeaders);
-
-    expect(response.status).toBe(400);
-    expect(mocks.activate).not.toHaveBeenCalled();
-  });
-
-  it('passes a bounded reviewer identity to explicit activation', async () => {
+  it('rejects legacy candidate activation with the governed-operation migration code', async () => {
     const response = await request(app())
       .post(`/api/companies/company-1/rule-candidates/${CANDIDATE_ID}/activate`)
       .set(sessionHeaders);
 
-    expect(response.status).toBe(200);
-    expect(mocks.activate).toHaveBeenCalledWith(
-      'company-1',
-      CANDIDATE_ID,
-      { id: 'reviewer-1', label: 'Reviewer' },
-    );
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('RULE_OPERATION_REQUIRED');
+    expect(mocks.activate).not.toHaveBeenCalled();
+  });
+
+  it('rejects legacy candidate dismissal with the governed-operation migration code', async () => {
+    const response = await request(app())
+      .post(`/api/companies/company-1/rule-candidates/${CANDIDATE_ID}/dismiss`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('RULE_OPERATION_REQUIRED');
+    expect(mocks.dismiss).not.toHaveBeenCalled();
   });
 });

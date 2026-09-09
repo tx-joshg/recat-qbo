@@ -2,7 +2,7 @@
 // Instance-wide SMTP config for magic links and the daily digest. Env vars
 // (SMTP_HOST etc.) take precedence over anything saved here.
 
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import type { InstanceSettingsDto } from '@recat/shared';
 import { instanceSettings } from '../../lib/api';
 import type { SmtpProvider } from '../../lib/smtpProviders';
@@ -56,6 +56,14 @@ export default function EmailCard({
   const [pass, setPass] = useState('');
   const [from, setFrom] = useState(settings.smtpHost !== '' ? settings.smtpFrom : '');
   const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [connectionState, setConnectionState] = useState<
+    'untested' | 'connected' | 'failed' | 'not-configured'
+  >(settings.smtpHost.trim() !== '' || envManaged ? 'untested' : 'not-configured');
+  const fieldId = useId();
+  const markUntested = (nextHost = host) => {
+    setConnectionState(nextHost.trim() !== '' || envManaged ? 'untested' : 'not-configured');
+  };
 
   // Fill host/port (and username only when the provider fixes it); never touch
   // the password or from address.
@@ -63,6 +71,7 @@ export default function EmailCard({
     setHost(p.host);
     setPort(String(p.port));
     if (p.username !== null) setUser(p.username);
+    markUntested(p.host);
   };
 
   const patchBody = (): Parameters<typeof instanceSettings.patch>[0] => {
@@ -79,6 +88,7 @@ export default function EmailCard({
   };
 
   const save = () => {
+    if (busy) return;
     const body = patchBody();
     // Nothing changed — silent no-op; only a real, successful PATCH toasts.
     if (Object.keys(body).length === 0) return;
@@ -92,6 +102,7 @@ export default function EmailCard({
         setUser(updated.smtpUser);
         setPass('');
         setFrom(updated.smtpHost !== '' ? updated.smtpFrom : '');
+        setConnectionState(updated.smtpHost.trim() !== '' || updated.smtpFromEnv ? 'untested' : 'not-configured');
         toast('Email settings saved');
       })
       .catch((err) => toast(errMsg(err)))
@@ -102,6 +113,7 @@ export default function EmailCard({
   const sendTest = () => {
     if (busy) return;
     setBusy(true);
+    setTesting(true);
     const body = patchBody();
     const saved =
       envManaged || Object.keys(body).length === 0
@@ -113,15 +125,22 @@ export default function EmailCard({
           });
     saved
       .then(() => instanceSettings.testEmail())
-      .then((res) =>
+      .then((res) => {
+        setConnectionState(res.delivered ? 'connected' : 'not-configured');
         toast(
           res.delivered
             ? `Test email sent to ${res.to} — check the inbox`
             : 'SMTP not configured — the email was printed to the server log',
-        ),
-      )
-      .catch((err) => toast(errMsg(err)))
-      .finally(() => setBusy(false));
+        );
+      })
+      .catch((err) => {
+        setConnectionState('failed');
+        toast(errMsg(err));
+      })
+      .finally(() => {
+        setTesting(false);
+        setBusy(false);
+      });
   };
 
   return (
@@ -145,7 +164,7 @@ export default function EmailCard({
           take precedence, so values saved here would be ignored.
         </div>
       ) : (
-        <>
+        <fieldset disabled={busy} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
           <div style={{ marginTop: 16 }}>
             <SmtpPresets host={host} onPick={pickProvider} />
           </div>
@@ -158,65 +177,76 @@ export default function EmailCard({
             }}
           >
           <div>
-            <label style={fieldLabel}>SMTP host</label>
+            <label htmlFor={`${fieldId}-host`} style={fieldLabel}>SMTP host</label>
             <input
               className="input"
+              id={`${fieldId}-host`}
               value={host}
-              onChange={(e) => setHost(e.target.value)}
+              onChange={(e) => { setHost(e.target.value); markUntested(e.target.value); }}
               placeholder="smtp.example.com"
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Port</label>
+            <label htmlFor={`${fieldId}-port`} style={fieldLabel}>Port</label>
             <input
               className="input"
               type="number"
+              id={`${fieldId}-port`}
               value={port}
-              onChange={(e) => setPort(e.target.value)}
+              onChange={(e) => { setPort(e.target.value); markUntested(); }}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Username</label>
+            <label htmlFor={`${fieldId}-user`} style={fieldLabel}>Username</label>
             <input
               className="input"
+              id={`${fieldId}-user`}
               value={user}
-              onChange={(e) => setUser(e.target.value)}
+              onChange={(e) => { setUser(e.target.value); markUntested(); }}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>Password</label>
+            <label htmlFor={`${fieldId}-pass`} style={fieldLabel}>Password</label>
             <input
               className="input"
               type="password"
+              id={`${fieldId}-pass`}
               value={pass}
-              onChange={(e) => setPass(e.target.value)}
+              onChange={(e) => { setPass(e.target.value); markUntested(); }}
               placeholder={settings.smtpPassSet ? '••••••••' : ''}
               style={inputStyle}
             />
           </div>
           <div>
-            <label style={fieldLabel}>From address</label>
+            <label htmlFor={`${fieldId}-from`} style={fieldLabel}>From address</label>
             <input
               className="input"
+              id={`${fieldId}-from`}
               value={from}
-              onChange={(e) => setFrom(e.target.value)}
+              onChange={(e) => { setFrom(e.target.value); markUntested(); }}
               placeholder="Recat <noreply@yourdomain.com>"
               style={{ ...inputStyle, fontFamily: 'inherit' }}
             />
           </div>
           </div>
-        </>
+        </fieldset>
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
-        <HoverButton onClick={sendTest} style={ghostBtn} hoverStyle={{ background: 'var(--hl)' }}>
-          Send test email
+      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginTop: 16 }}>
+        <span role="status" aria-live="polite" style={{ marginRight: 'auto', fontSize: 13.5, color: 'var(--mut)' }}>
+          {testing ? 'Testing connection…'
+            : connectionState === 'connected' ? '✓ Connected'
+              : connectionState === 'failed' ? 'Connection failed'
+                : connectionState === 'not-configured' ? 'Not configured' : 'Not tested'}
+        </span>
+        <HoverButton onClick={sendTest} disabled={busy} style={{ ...ghostBtn, opacity: busy ? 0.65 : 1, cursor: busy ? 'wait' : 'pointer' }} hoverStyle={{ background: 'var(--hl)' }}>
+          {testing ? 'Sending…' : 'Send test email'}
         </HoverButton>
         {!envManaged && (
-          <HoverButton onClick={save} style={ghostBtn} hoverStyle={{ background: 'var(--hl)' }}>
+          <HoverButton onClick={save} disabled={busy} style={{ ...ghostBtn, opacity: busy ? 0.65 : 1, cursor: busy ? 'wait' : 'pointer' }} hoverStyle={{ background: 'var(--hl)' }}>
             Save changes
           </HoverButton>
         )}

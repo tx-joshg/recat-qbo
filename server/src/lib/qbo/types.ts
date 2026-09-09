@@ -5,7 +5,7 @@
 // the exact same sync/write-back paths as production. Which implementation a
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
-import type { QboDiagnosticCode, StagedCategorization } from '@recat/shared';
+import type { QboDiagnosticCode, StagedCategorization, TaxDisposition } from '@recat/shared';
 import type { AttachmentBlobReader } from '../../services/attachments/types.js';
 import type { QboWriteSafetyEvidence, QboWriteSafetyTarget } from './writeSafety.js';
 
@@ -24,6 +24,8 @@ export interface QboAccountInfo {
   /** normalized bucket: Income | COGS | Expenses | Asset | Liability | Equity | Bank | CreditCard | Other */
   classification: string;
   accountType: string;
+  /** QBO system subtype, such as GlobalTaxSuspense, when the API returns it. */
+  accountSubType?: string | null;
   active: boolean;
 }
 
@@ -74,6 +76,13 @@ export interface QboTaxProfile {
   partnerTaxEnabled: boolean | null;
 }
 
+export interface QboTaxRefundCapability {
+  mode: 'manual_required';
+  reason: 'UNSUPPORTED_PUBLIC_API';
+  api: 'intuit-accounting-v3';
+  minorVersion: '75';
+}
+
 export interface QboTaxRateInfo {
   qboId: string;
   name: string;
@@ -103,6 +112,8 @@ export interface QboPurchaseSnapshot {
   direction: 'purchase' | 'refund';
   globalTaxCalculation: string | null;
   totalTaxCents: number | null;
+  /** Canonical fingerprint of writable entity fields a category-only write cannot change. */
+  preservedHash?: string;
   lines: {
     id: string | null;
     amountCents: number;
@@ -113,6 +124,10 @@ export interface QboPurchaseSnapshot {
     taxCodeQboId: string | null;
     taxAmountCents: number | null;
     taxInclusiveCents: number | null;
+    /** Full canonical raw-line fingerprint. Always populated by live QBO mapping. */
+    rawHash?: string;
+    /** Raw-line fingerprint with only AccountRef.value replaced by a stable sentinel. */
+    categoryOnlyHash?: string;
   }[];
 }
 
@@ -230,12 +245,14 @@ export interface QboDepositSnapshot {
 
 export interface QboPurchaseExpectedState {
   qboId: string;
+  taxDisposition?: TaxDisposition;
   totalCents: number;
   accountQboId: string | null;
   date: string;
   direction: QboPurchaseSnapshot['direction'];
   globalTaxCalculation: string | null;
   totalTaxCents: number | null;
+  preservedHash?: string;
   targetLines: QboPurchaseSnapshot['lines'];
   untouchedLineHashes: string[];
 }
@@ -445,6 +462,43 @@ export class QboRequestTimeout extends Error {
   }
 }
 
+export class QboHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'QboHttpError';
+    this.status = status;
+  }
+}
+
+/** Shared bounds for provider cooldowns and client-facing retry hints. */
+export const QBO_RATE_LIMIT_MIN_RETRY_SECONDS = 1;
+export const QBO_RATE_LIMIT_MAX_RETRY_SECONDS = 60;
+export const QBO_RATE_LIMIT_FALLBACK_SECONDS = 5;
+
+/**
+ * QuickBooks rejected a request because the provider rate limit was reached.
+ * The delay is deliberately bounded before it reaches callers, so an
+ * untrusted Retry-After header cannot create an unbounded server-side wait or
+ * an unbounded client-facing value.
+ */
+export class QboRateLimitError extends Error {
+  code = 'QBO_RATE_LIMITED' as const;
+  readonly retryAfterSeconds: number;
+
+  constructor(
+    retryAfterSeconds = QBO_RATE_LIMIT_FALLBACK_SECONDS,
+    message = 'QuickBooks rate limit reached.',
+  ) {
+    super(message);
+    this.name = 'QboRateLimitError';
+    this.retryAfterSeconds = Number.isFinite(retryAfterSeconds)
+      ? Math.min(QBO_RATE_LIMIT_MAX_RETRY_SECONDS, Math.max(QBO_RATE_LIMIT_MIN_RETRY_SECONDS, Math.ceil(retryAfterSeconds)))
+      : QBO_RATE_LIMIT_FALLBACK_SECONDS;
+  }
+}
+
 export class QboAttachmentNotFoundError extends Error {
   code = 'QBO_ATTACHMENT_NOT_FOUND' as const;
 
@@ -470,6 +524,7 @@ export interface QboClient {
   getCompanyInfo(): Promise<QboCompanyInfo>;
   listAccounts(): Promise<QboAccountInfo[]>;
   getTaxProfile(): Promise<QboTaxProfile>;
+  probeTaxRefundCapability(): Promise<QboTaxRefundCapability>;
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
   uploadAttachments(

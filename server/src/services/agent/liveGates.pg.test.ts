@@ -2,6 +2,7 @@ import { PrismaClient, type Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { runSerializableTransaction } from '../../lib/serializableTransaction.js';
+import { claimShadowJobs, discoverShadowJobs, type AgentJobDb } from './jobs.js';
 import {
   enableLiveMode,
   runLiveAuthorityTransaction,
@@ -211,6 +212,138 @@ describePostgres('live gate PostgreSQL authority races', () => {
       },
     };
   }
+
+  function settingsDeps(root: PrismaClient): AgentSettingsDeps {
+    return {
+      db: root as unknown as AgentSettingsDb,
+      getInstanceSettings: async () => ({
+        suggestionProvider: 'custom', agentDecisionModel: 'decision-model',
+        agentVerifierModel: 'verifier-model', aiEndpoint: 'https://models.example/v1',
+        aiApiKey: 'synthetic-provider-key', openrouterApiKey: '',
+      }),
+      withSerializableTransaction: (callback) => runSerializableTransaction(
+        root, (transaction) => callback(transaction as unknown as AgentSettingsDb),
+      ),
+    };
+  }
+
+  async function discoverIntent(fixture: Fixture, root = firstClient) {
+    return discoverShadowJobs(fixture.companyId, { db: root as unknown as AgentJobDb });
+  }
+
+  async function enableIntent(fixture: Fixture, root = firstClient) {
+    return enableLiveMode(
+      fixture.companyId, 'Live gate PostgreSQL fixture',
+      { userId: 'synthetic-admin', isAdmin: true }, gateDeps(root),
+    );
+  }
+
+  it('creates fresh scheduling intent after shadow promotion without changing completed jobs', async () => {
+    const fixture = await seed();
+    try {
+      const [original] = await discoverIntent(fixture);
+      const completed = await firstClient.agentJob.update({
+        where: { id: original!.id }, data: { status: 'completed', attemptCount: 1 },
+      });
+      await expect(enableIntent(fixture)).resolves.toMatchObject({ state: { enabled: true } });
+      const promoted = await discoverIntent(fixture);
+      expect(promoted).toHaveLength(1);
+      expect(promoted[0]!.id).not.toBe(original!.id);
+      expect(promoted[0]).toMatchObject({ revision: original!.revision, configVersion: original!.configVersion, attemptCount: 0 });
+      await expect(firstClient.agentJob.findUniqueOrThrow({ where: { id: original!.id } })).resolves.toEqual(completed);
+      await enableIntent(fixture);
+      await expect(discoverIntent(fixture)).resolves.toEqual([]);
+    } finally { await cleanup(fixture); }
+  });
+
+  it('rediscovers cancelled unchanged rows after off then identical shadow settings', async () => {
+    const fixture = await seed();
+    try {
+      const configured = await updateShadowSettings(fixture.companyId, { mode: 'shadow' }, settingsDeps(firstClient));
+      const [original] = await discoverIntent(fixture);
+      await updateShadowSettings(fixture.companyId, { mode: 'off' }, settingsDeps(firstClient));
+      await claimShadowJobs('synthetic-worker', 1, { db: firstClient as unknown as AgentJobDb });
+      await expect(firstClient.agentJob.findUniqueOrThrow({ where: { id: original!.id } }))
+        .resolves.toMatchObject({ status: 'cancelled', lastErrorCode: 'AGENT_SUPERSEDED' });
+      const restored = await updateShadowSettings(fixture.companyId, { mode: 'shadow' }, settingsDeps(firstClient));
+      expect(restored.configVersion).toBe(configured.configVersion);
+      const rediscovered = await discoverIntent(fixture);
+      expect(rediscovered).toHaveLength(1);
+      expect(rediscovered[0]!.id).not.toBe(original!.id);
+      await updateShadowSettings(fixture.companyId, { mode: 'shadow' }, settingsDeps(firstClient));
+      await expect(discoverIntent(fixture)).resolves.toEqual([]);
+    } finally { await cleanup(fixture); }
+  });
+
+  it('creates one new intent after an explicit paused-live re-enable', async () => {
+    const fixture = await seed();
+    try {
+      await enableIntent(fixture);
+      const [original] = await discoverIntent(fixture);
+      await firstClient.agentJob.update({ where: { id: original!.id }, data: { status: 'completed' } });
+      await firstClient.agentCompanyConfig.update({
+        where: { companyId: fixture.companyId },
+        data: { livePausedAt: NOW, livePauseCode: 'MANUAL_PAUSE', livePauseMessage: 'Synthetic pause' },
+      });
+      await enableIntent(fixture);
+      const batches = await Promise.all([discoverIntent(fixture), discoverIntent(fixture, secondClient)]);
+      expect(batches.flat()).toHaveLength(1);
+      expect(batches.flat()[0]!.id).not.toBe(original!.id);
+    } finally { await cleanup(fixture); }
+  });
+
+  it.each(['terminal', 'admin-cancelled', 'category', 'tax', 'split', 'tag', 'attempted'] as const)(
+    'does not create bypass work for a %s revision on a new intent', async (kind) => {
+      const fixture = await seed();
+      try {
+        const [original] = await discoverIntent(fixture);
+        if (kind === 'terminal' || kind === 'admin-cancelled') {
+          await firstClient.agentJob.update({ where: { id: original!.id }, data: {
+            status: kind === 'terminal' ? 'terminal' : 'cancelled',
+            lastErrorCode: kind === 'terminal' ? 'AGENT_JOB_EXHAUSTED' : 'AGENT_CANCELLED_BY_ADMIN',
+          } });
+        } else if (kind === 'category' || kind === 'tax') {
+          await firstClient.transaction.update({ where: { id: fixture.transactionId }, data:
+            kind === 'category' ? { category: 'Synthetic expense' } : { taxCalculation: 'NotApplicable' },
+          });
+        } else if (kind === 'split') {
+          await firstClient.splitLine.create({ data: {
+            txnId: fixture.transactionId, idx: 0, amount: '-1.00', category: 'Synthetic expense',
+          } });
+        } else if (kind === 'tag') {
+          const tag = await firstClient.tag.create({ data: { companyId: fixture.companyId, name: 'Synthetic tag', color: '#123456' } });
+          await firstClient.txnTag.create({ data: { txnId: fixture.transactionId, tagId: tag.id } });
+        } else {
+          await firstClient.qboMutationAttempt.create({ data: {
+            transactionId: fixture.transactionId, requestId: original!.id, operation: 'recategorize',
+            status: 'FAILED', expectedRevision: 0, expectedSyncToken: '0',
+            requestHash: 'synthetic-hash', requestPayload: {}, beforeSnapshot: {},
+          } });
+        }
+        const preserved = await firstClient.agentJob.findUniqueOrThrow({ where: { id: original!.id } });
+        await updateShadowSettings(fixture.companyId, { mode: 'off' }, settingsDeps(firstClient));
+        await updateShadowSettings(fixture.companyId, { mode: 'shadow' }, settingsDeps(firstClient));
+        await expect(discoverIntent(fixture)).resolves.toEqual([]);
+        await expect(firstClient.agentJob.findUniqueOrThrow({ where: { id: original!.id } })).resolves.toEqual(preserved);
+      } finally { await cleanup(fixture); }
+    },
+  );
+
+  it('claims only the new intent and fences a still-running old job', async () => {
+    const fixture = await seed();
+    try {
+      const [original] = await discoverIntent(fixture);
+      const [oldClaim] = await claimShadowJobs('old-intent-worker', 1, { db: firstClient as unknown as AgentJobDb });
+      expect(oldClaim!.id).toBe(original!.id);
+      await enableIntent(fixture);
+      const [fresh] = await discoverIntent(fixture);
+      const [newClaim] = await claimShadowJobs('new-intent-worker', 1, { db: secondClient as unknown as AgentJobDb });
+      expect(newClaim!.id).toBe(fresh!.id);
+      expect(newClaim).toHaveProperty('schedulingGeneration', 1);
+      await expect(firstClient.agentJob.findUniqueOrThrow({ where: { id: original!.id } }))
+        .resolves.toMatchObject({ status: 'cancelled', lockOwner: null, lastErrorCode: 'AGENT_SUPERSEDED' });
+    } finally { await cleanup(fixture); }
+  });
 
   it('prevents a PREPARED mutation from landing between the final gate read and enable commit', async () => {
     const fixture = await seed();

@@ -3,14 +3,13 @@
 // Per run: refresh the chart of accounts, pull holding-account transactions
 // (full list for manual/initial/nightly, Change Data Capture deltas for
 // poll/webhook), upsert on (companyId, qboType, qboId), mark txns that were
-// fixed inside QuickBooks as SUPERSEDED, recompute suggestion snapshots, apply
+// fixed inside QuickBooks as SUPERSEDED, recompute suggestion snapshots, gate
 // auto-post rules, and record a SyncLog row. QBO is always the source of truth.
 
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
-import type { SuggestionDto } from '@recat/shared';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import type { QboTxn } from '../lib/qbo/types.js';
+import type { QboAccountInfo, QboTxn } from '../lib/qbo/types.js';
 import {
   EntityLeaseError,
   fenceEntityLeaseOwnerships,
@@ -20,13 +19,35 @@ import {
   type EntityLeaseKey,
 } from './entityLease.js';
 import { refreshSuggestions } from './suggestions.js';
-import { postTransaction } from './writeback.js';
+import {
+  ensureUnknownProviderActionability,
+  type ProviderActionabilityDb,
+} from './providerActionability.js';
+import { runCompanyMutationTransaction } from './companyMutationScope.js';
+import { disableRuleForSafetyInTransaction } from './ruleSafetyTransition.js';
+import { validateExistingRuleAction } from './rules.js';
+import { RuleSuggestionApplicationError } from './ruleSuggestionApplication.js';
+import { rememberBusyRulePreparation, type DeferredRuleCandidate } from './rulePreparationRetry.js';
+import { compareRuleWinner, ruleMatches } from './ruleMatching.js';
+import {
+  prepareRuleAutoPost,
+  recoverRuleAutoPosts,
+  resumeRuleAutoPost,
+  type RecoveryReport,
+} from './ruleAutoPost.js';
 
 export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
 
 export interface SyncResult {
   ok: boolean;
   message: string;
+  mirror?: {
+    created: number;
+    refreshed: number;
+    stale: number;
+    busy: number;
+    contended: number;
+  };
 }
 
 function jsonStringArray(v: unknown): string[] {
@@ -111,6 +132,98 @@ async function withSyncEntityLease<T>(
     if (isEntityBusy(error)) return null;
     throw error;
   }
+}
+
+export type MirroredTransactionRefreshOutcome =
+  | 'refreshed'
+  | 'stale'
+  | 'busy'
+  | 'contended'
+  | 'not_found'
+  | 'missing_in_qbo'
+  | 'not_in_holding';
+
+export interface MirroredTransactionRefreshResult {
+  transactionId: string;
+  outcome: MirroredTransactionRefreshOutcome;
+}
+
+/**
+ * Refresh one already-mirrored holding transaction from QBO.
+ *
+ * This is intentionally narrower than syncCompany: it does not enumerate the
+ * chart, tax references, or every holding transaction. It is the safe refresh
+ * path immediately before a governed categorization prepare when a stored QBO
+ * source snapshot needs to be current.
+ */
+export async function refreshMirroredTransaction(
+  companyId: string,
+  transactionId: string,
+  mutationDependencies: SyncMutationDeps = defaultSyncMutationDeps,
+): Promise<MirroredTransactionRefreshResult> {
+  const [company, current] = await Promise.all([
+    prisma.company.findUnique({ where: { id: companyId } }),
+    prisma.transaction.findUnique({ where: { id: transactionId } }),
+  ]);
+  if (company === null || current === null || current.companyId !== companyId) {
+    return { transactionId, outcome: 'not_found' };
+  }
+
+  const { qboFactory } = await import('../lib/qbo/factory.js');
+  const client = await qboFactory.forCompany(companyId);
+  const fresh = await client.fetchTxn(current.qboType as QboTxn['qboType'], current.qboId);
+  if (fresh === null) return { transactionId, outcome: 'missing_in_qbo' };
+
+  const holdingIds = jsonStringArray(company.holdingAccountIds);
+  if (!fresh.lines.some((line) => holdingIds.includes(line.accountQboId))) {
+    return { transactionId, outcome: 'not_in_holding' };
+  }
+  if (isStaleProviderToken(fresh.syncToken, current.qboSyncToken)) {
+    return { transactionId, outcome: 'stale' };
+  }
+
+  const key = entityKey(companyId, current);
+  const mutation = await withSyncEntityLease(
+    key,
+    mutationDependencies,
+    async (owner) => prisma.$transaction(async (tx) => {
+      await mutationDependencies.fence(key, owner, tx);
+      const updated = await tx.transaction.updateMany({
+        where: {
+          id: current.id,
+          companyId,
+          revision: current.revision,
+          qboSyncToken: current.qboSyncToken,
+          qboMutationAttempts: { none: { status: { in: [...ACTIVE_MUTATION_STATUSES] } } },
+        },
+        data: {
+          qboSyncToken: fresh.syncToken,
+          date: new Date(fresh.date),
+          payee: fresh.payee,
+          memo: fresh.memo ?? null,
+          amount: fresh.amount,
+          bankAccount: fresh.bankAccount,
+          rawData: fresh.raw as Prisma.InputJsonValue,
+        },
+      });
+      if (updated.count === 1) {
+        await ensureUnknownProviderActionability(
+          {
+            id: current.id,
+            companyId,
+            revision: current.revision,
+            qboSyncToken: fresh.syncToken,
+            qboType: fresh.qboType,
+            qboId: fresh.qboId,
+            date: new Date(fresh.date),
+          },
+          tx as unknown as ProviderActionabilityDb,
+        );
+      }
+      return updated.count === 1 ? 'refreshed' as const : 'contended' as const;
+    }),
+  );
+  return { transactionId, outcome: mutation ?? 'busy' };
 }
 
 function syncTokenOrder(
@@ -200,6 +313,253 @@ const CDC_MAX_AGE_MS = 25 * 24 * 60 * 60 * 1000;
  */
 const inFlightSyncs = new Map<string, Promise<unknown>>();
 
+/**
+ * Replaces the company account cache as one authoritative snapshot. Any
+ * enabled canonical rule whose category disappeared, became inactive, or no
+ * longer belongs to its declared direction is disabled inside the same
+ * company mutation fence before sync can emit rule-backed work.
+ */
+export async function replaceAccountReferenceCache(
+  companyId: string,
+  accounts: readonly QboAccountInfo[],
+  db: PrismaClient = prisma,
+): Promise<void> {
+  await runCompanyMutationTransaction(db, companyId, async (tx) => {
+    for (const account of accounts) {
+      const fullName = account.fullName.split(':').join(' · ');
+      await tx.qboAccount.upsert({
+        where: { companyId_qboId: { companyId, qboId: account.qboId } },
+        create: {
+          companyId,
+          qboId: account.qboId,
+          name: account.name,
+          fullName,
+          classification: account.classification,
+          accountType: account.accountType,
+          active: account.active,
+        },
+        update: {
+          name: account.name,
+          fullName,
+          classification: account.classification,
+          accountType: account.accountType,
+          active: account.active,
+        },
+      });
+    }
+    const accountIds = accounts.map(({ qboId }) => qboId);
+    await tx.qboAccount.updateMany({
+      where: accountIds.length > 0
+        ? { companyId, qboId: { notIn: accountIds } }
+        : { companyId },
+      data: { active: false },
+    });
+
+    const currentAccounts = new Map(accounts.map((account) => [account.qboId, account]));
+    const rules = await tx.rule.findMany({
+      where: { companyId, canonicalVersion: { not: null }, enabled: true },
+      select: { id: true, revision: true, direction: true, categoryQboId: true },
+    });
+    for (const rule of rules) {
+      const account = rule.categoryQboId === null
+        ? undefined
+        : currentAccounts.get(rule.categoryQboId);
+      const valid = account?.active === true && (
+        (rule.direction === 'Purchase'
+          && (account.classification === 'Expenses' || account.classification === 'COGS'))
+        || (rule.direction === 'Deposit' && account.classification === 'Income')
+      );
+      if (!valid) {
+        await disableRuleForSafetyInTransaction(tx, {
+          companyId,
+          ruleId: rule.id,
+          expectedRevision: rule.revision,
+          reason: `Category reference ${rule.categoryQboId ?? 'missing'} is unavailable for this rule direction.`,
+          actor: 'system:account-reference-refresh',
+        });
+      }
+    }
+  });
+}
+
+async function suppressLegacyRuleRuntime(
+  companyId: string,
+  validateCanonicalRules: boolean,
+): Promise<void> {
+  await runCompanyMutationTransaction(prisma, companyId, async (tx) => {
+    if (validateCanonicalRules) {
+      const rules = await tx.rule.findMany({
+        where: { companyId, canonicalVersion: { not: null }, enabled: true },
+        include: { ruleTags: true, candidateOrigin: true },
+      });
+      for (const rule of rules) {
+        let failure: string | null = null;
+        if (rule.direction === null) {
+          failure = 'Rule direction is missing.';
+        } else if (rule.reviewRequiredAt !== null || rule.repairReason !== null) {
+          failure = rule.repairReason ?? rule.reviewReason ?? 'Rule requires reviewed repair.';
+        } else {
+          try {
+            await validateExistingRuleAction(tx, companyId, rule);
+          } catch (error) {
+            failure = error instanceof Error ? error.message : 'Rule action validation failed.';
+          }
+        }
+        if (failure !== null) {
+          await disableRuleForSafetyInTransaction(tx, {
+            companyId,
+            ruleId: rule.id,
+            expectedRevision: rule.revision,
+            reason: `Canonical runtime validation failed: ${failure}`.slice(0, 500),
+            actor: 'system:canonical-runtime-validation',
+          });
+        }
+      }
+    }
+    await tx.transaction.updateMany({
+      where: {
+        companyId,
+        status: 'PENDING',
+        suggestion: { path: ['source'], equals: 'rule' },
+      },
+      data: { suggestion: Prisma.DbNull },
+    });
+  });
+}
+
+async function currentRuleRuntimeMode(companyId: string): Promise<string> {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    select: { ruleRuntimeMode: true },
+  });
+  if (company === null) throw new Error(`Company ${companyId} not found`);
+  return company.ruleRuntimeMode;
+}
+
+function permitsLegacySuggestions(mode: string): boolean {
+  return mode === 'legacy' || mode === 'bridge';
+}
+
+interface CanonicalRuleAutoPostCandidate {
+  transactionId: string;
+  sourceRevision: number;
+  ruleId: string;
+  ruleRevision: number;
+}
+
+interface CanonicalRuleAutoPostDeps {
+  rememberBusy(input: DeferredRuleCandidate): Promise<void>;
+  recover(companyId: string): Promise<RecoveryReport>;
+  prepare(input: {
+    companyId: string;
+    transactionId: string;
+    ruleId: string;
+    ruleRevision: number;
+  }): Promise<{ preparationId: string }>;
+  resume(preparationId: string): Promise<void>;
+  loadState(preparationId: string): Promise<string | null>;
+  listCandidates(companyId: string): Promise<CanonicalRuleAutoPostCandidate[]>;
+}
+
+async function listCanonicalRuleAutoPostCandidates(
+  companyId: string,
+): Promise<CanonicalRuleAutoPostCandidate[]> {
+  const [transactions, rules] = await Promise.all([
+    prisma.transaction.findMany({
+      where: { companyId, status: 'PENDING' },
+      select: { id: true, qboType: true, payee: true, revision: true },
+    }),
+    prisma.rule.findMany({
+      where: {
+        companyId,
+        enabled: true,
+        retiredAt: null,
+        reviewRequiredAt: null,
+        reviewReason: null,
+        repairReason: null,
+        canonicalVersion: 2,
+      },
+      select: {
+        id: true,
+        revision: true,
+        matchText: true,
+        direction: true,
+        priority: true,
+        createdAt: true,
+        autoPost: true,
+      },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+    }),
+  ]);
+  return transactions.flatMap((transaction) => {
+    const winner = rules
+      .filter((rule) => ruleMatches(
+        { matchText: rule.matchText, direction: rule.direction },
+        { description: transaction.payee, type: transaction.qboType },
+      ))
+      .sort(compareRuleWinner)[0];
+    return winner === undefined || !winner.autoPost ? [] : [{
+      transactionId: transaction.id,
+      sourceRevision: transaction.revision,
+      ruleId: winner.id,
+      ruleRevision: winner.revision,
+    }];
+  });
+}
+
+const defaultCanonicalRuleAutoPostDeps: CanonicalRuleAutoPostDeps = {
+  rememberBusy: rememberBusyRulePreparation,
+  recover: recoverRuleAutoPosts,
+  prepare: prepareRuleAutoPost,
+  resume: resumeRuleAutoPost,
+  loadState: async (preparationId) => (
+    await prisma.ruleAutoPostPreparation.findUnique({
+      where: { id: preparationId },
+      select: { state: true },
+    })
+  )?.state ?? null,
+  listCandidates: listCanonicalRuleAutoPostCandidates,
+};
+
+export async function runCanonicalRuleAutoPosts(
+  companyId: string,
+  dependencies: Partial<CanonicalRuleAutoPostDeps> = defaultCanonicalRuleAutoPostDeps,
+): Promise<{ recovered: number; autoPosted: number; failed: number }> {
+  const deps = { ...defaultCanonicalRuleAutoPostDeps, ...dependencies };
+  const recovery = await deps.recover(companyId);
+  let autoPosted = 0;
+  let failed = recovery.failed;
+  for (const candidate of await deps.listCandidates(companyId)) {
+    let prepared: { preparationId: string };
+    try {
+      const { sourceRevision: _sourceRevision, ...authority } = candidate;
+      prepared = await deps.prepare({ companyId, ...authority });
+    } catch (error) {
+      if ((error instanceof EntityLeaseError && error.code === 'ENTITY_BUSY')
+        || (error instanceof RuleSuggestionApplicationError && error.code === 'RULE_SUGGESTION_BUSY')) {
+        try {
+          await deps.rememberBusy({ companyId, ...candidate });
+        } catch (persistError) {
+          const errorCode = persistError instanceof Prisma.PrismaClientKnownRequestError
+            && /^P[0-9]{4}$/.test(persistError.code) ? persistError.code : 'UNKNOWN';
+          console.warn('[sync] rule preparation retry could not be recorded', { errorCode });
+        }
+      }
+      failed += 1;
+      continue;
+    }
+    try {
+      await deps.resume(prepared.preparationId);
+      const state = await deps.loadState(prepared.preparationId);
+      if (state === 'VERIFIED' || state === 'DRY_RUN') autoPosted += 1;
+      else if (state === 'REJECTED' || state === 'CANCELLED') failed += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { recovered: recovery.completed, autoPosted, failed };
+}
+
 export function syncCompany(
   companyId: string,
   kind: SyncKind,
@@ -234,30 +594,7 @@ async function runSyncCompany(
 
     // ---- 1. chart of accounts (reference data for pickers + name resolution) ----
     const accounts = await client.listAccounts();
-    for (const a of accounts) {
-      // Store the display path with ' · ' separators ("Expenses · Meals"),
-      // converted from QBO's colon-style FullyQualifiedName.
-      const fullName = a.fullName.split(':').join(' · ');
-      await prisma.qboAccount.upsert({
-        where: { companyId_qboId: { companyId, qboId: a.qboId } },
-        create: {
-          companyId,
-          qboId: a.qboId,
-          name: a.name,
-          fullName,
-          classification: a.classification,
-          accountType: a.accountType,
-          active: a.active,
-        },
-        update: {
-          name: a.name,
-          fullName,
-          classification: a.classification,
-          accountType: a.accountType,
-          active: a.active,
-        },
-      });
-    }
+    await replaceAccountReferenceCache(companyId, accounts);
 
     // Tax references are auxiliary to transaction sync. Their own service
     // persists a safe not-ready diagnostic on failure; preserve the successful
@@ -319,6 +656,7 @@ async function runSyncCompany(
       ).map((t) => `${t.qboType}:${t.qboId}`),
     );
     let created = 0;
+    const mirrorStats = { created: 0, refreshed: 0, stale: 0, busy: 0, contended: 0 };
     for (const t of holdingTxns) {
       // Refresh the QBO mirror on every sync (fresh SyncToken + raw JSON);
       // local categorization state (status/category/splits/tags) is untouched.
@@ -352,7 +690,7 @@ async function runSyncCompany(
             },
           });
           if (current === null) {
-            await tx.transaction.upsert({
+            const mirrored = await tx.transaction.upsert({
               where: {
                 companyId_qboType_qboId: {
                   companyId,
@@ -368,13 +706,26 @@ async function runSyncCompany(
                 ...mirror,
               },
               update: mirror,
+              select: {
+                id: true,
+                companyId: true,
+                revision: true,
+                qboSyncToken: true,
+                qboType: true,
+                qboId: true,
+                date: true,
+              },
             });
-            return { created: true };
+            await ensureUnknownProviderActionability(
+              mirrored,
+              tx as unknown as ProviderActionabilityDb,
+            );
+            return { created: true, outcome: 'created' as const };
           }
           if (isStaleProviderToken(t.syncToken, current.qboSyncToken)) {
-            return { created: false };
+            return { created: false, outcome: 'stale' as const };
           }
-          await tx.transaction.updateMany({
+          const updated = await tx.transaction.updateMany({
             where: {
               id: current.id,
               revision: current.revision,
@@ -385,12 +736,34 @@ async function runSyncCompany(
             },
             data: mirror,
           });
-          return { created: false };
+          if (updated.count === 1) {
+            await ensureUnknownProviderActionability(
+              {
+                id: current.id,
+                companyId,
+                revision: current.revision,
+                qboSyncToken: t.syncToken,
+                qboType: t.qboType,
+                qboId: t.qboId,
+                date: new Date(t.date),
+              },
+              tx as unknown as ProviderActionabilityDb,
+            );
+          }
+          return { created: false, outcome: updated.count === 1 ? 'refreshed' as const : 'contended' as const };
         }),
       );
+      if (mutation === null) {
+        mirrorStats.busy += 1;
+        continue;
+      }
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
+      if (mutation.outcome === 'created') mirrorStats.created += 1;
+      if (mutation.outcome === 'refreshed') mirrorStats.refreshed += 1;
+      if (mutation.outcome === 'stale') mirrorStats.stale += 1;
+      if (mutation.outcome === 'contended') mirrorStats.contended += 1;
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -424,96 +797,46 @@ async function runSyncCompany(
     }
 
     // ---- 5. suggestion snapshots for the queue ----
-    await refreshSuggestions(companyId);
-
-    // ---- 6. auto-post rules (respects dry-run via the write-back service) ----
-    let autoPosted = 0;
-    const autoPostFailures: string[] = [];
-    const pending = await prisma.transaction.findMany({
-      where: { companyId, status: 'PENDING' },
-      include: { txnTags: true, _count: { select: { splitLines: true } } },
-    });
-    const rules = await prisma.rule.findMany({ where: { companyId }, include: { ruleTags: true } });
-    for (const txn of pending) {
-      const suggestion = txn.suggestion as unknown as SuggestionDto | null;
-      if (!suggestion || suggestion.source !== 'rule' || !suggestion.ruleId) continue;
-      const rule = rules.find((r) => r.id === suggestion.ruleId);
-      if (!rule?.autoPost) continue;
-      // A human is mid-flight on this txn (staged category/splits/tags) —
-      // never auto-post over their work.
-      if (txn.category !== null || txn._count.splitLines > 0 || txn.txnTags.length > 0) continue;
-      // One bad rule/txn must never kill the sync: post each in its own
-      // try/catch, log, note it in the SyncLog, and continue.
-      try {
-        const key = entityKey(companyId, txn);
-        const result = await withSyncEntityLease(
-          key,
-          mutationDependencies,
-          async (owner) => {
-            const staged = await prisma.$transaction(async (tx) => {
-              await mutationDependencies.fence(key, owner, tx);
-              const updated = await tx.transaction.updateMany({
-                where: {
-                  id: txn.id,
-                  status: 'PENDING',
-                  revision: txn.revision,
-                  qboSyncToken: txn.qboSyncToken,
-                  category: null,
-                  splitLines: { none: {} },
-                  txnTags: { none: {} },
-                  qboMutationAttempts: {
-                    none: {
-                      status: { in: [...ACTIVE_MUTATION_STATUSES] },
-                    },
-                  },
-                },
-                data: {
-                  category: rule.category,
-                  categoryQboId: rule.categoryQboId,
-                },
-              });
-              if (updated.count !== 1) return false;
-              for (const rt of rule.ruleTags) {
-                await tx.txnTag.upsert({
-                  where: {
-                    txnId_tagId: {
-                      txnId: txn.id,
-                      tagId: rt.tagId,
-                    },
-                  },
-                  create: { txnId: txn.id, tagId: rt.tagId },
-                  update: {},
-                });
-              }
-              return true;
-            });
-            if (!staged) return null;
-            return postTransaction(
-              txn.id,
-              { id: null, label: 'system' },
-              { auto: true },
-            );
-          },
-        );
-        if (result === null) continue;
-        if (result.ok) autoPosted += 1;
-        else autoPostFailures.push(`${txn.payee}: ${result.error?.message ?? 'unknown error'}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[sync] auto-post failed for txn ${txn.id} (${txn.payee}):`, err);
-        autoPostFailures.push(`${txn.payee}: ${msg}`);
+    // Keep legacy suggestion snapshots out of the canonical runtime. Its reads
+    // derive complete actions from the current immutable rule revisions.
+    let ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
+    if (permitsLegacySuggestions(ruleRuntimeMode)) {
+      await refreshSuggestions(companyId);
+      // A sync may span the operator's pause/backfill boundary. Re-read after
+      // the legacy writer completes and erase anything it created if the mode
+      // changed while the run was in flight.
+      ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
+      if (!permitsLegacySuggestions(ruleRuntimeMode)) {
+        await suppressLegacyRuleRuntime(companyId, ruleRuntimeMode === 'canonical');
+      }
+    } else {
+      await suppressLegacyRuleRuntime(companyId, ruleRuntimeMode === 'canonical');
+      if (ruleRuntimeMode === 'canonical') {
+        // AI/history remain non-authoritative hints. Complete rule proofs are
+        // derived from current revisions on reads, never stored by this path.
+        await refreshSuggestions(companyId, { includeRuleSuggestions: false });
+        ruleRuntimeMode = await currentRuleRuntimeMode(companyId);
       }
     }
+
+    // ---- 6. auto-post rules ----
+    // The bridge auto-post path snapshots mutable, category-only rule data and
+    // cannot hold the company safety fence through the QuickBooks write. Keep
+    // it fail-closed outside the durable, revision-bound canonical path.
+    const autoPostReport = ruleRuntimeMode === 'canonical'
+      ? await runCanonicalRuleAutoPosts(companyId)
+      : { autoPosted: 0, failed: 0 };
+    const { autoPosted } = autoPostReport;
 
     // ---- 7. bookkeeping ----
     await prisma.company.update({ where: { id: companyId }, data: { lastSyncedAt: startedAt } });
     let message = buildMessage(created, dropped, autoPosted, accounts.length);
     if (taxDiagnostic) message += ` — ${taxDiagnostic}`;
-    if (autoPostFailures.length > 0) {
-      message += ` — ${plural(autoPostFailures.length, 'auto-post failure')} (${autoPostFailures[0]})`;
+    if (autoPostReport.failed > 0) {
+      message += ` — ${plural(autoPostReport.failed, 'auto-post failure')}`;
     }
     await prisma.syncLog.create({ data: { companyId, kind, ok: true, message } });
-    return { ok: true, message };
+    return { ok: true, message, mirror: mirrorStats };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await prisma.syncLog

@@ -5,6 +5,8 @@ afterEach(() => {
   vi.resetModules();
 });
 
+// Cold imports transpile the complete server graph; each assertion below tests
+// the separate simulated schema-validator deadline, not that setup duration.
 describe('Recat MCP authored schema startup validation', () => {
   it('allows fresh module startup when static conversion spans hundreds of milliseconds', async () => {
     let simulatedNow = 0;
@@ -17,7 +19,7 @@ describe('Recat MCP authored schema startup validation', () => {
     await expect(import('./readTools.js')).resolves.toHaveProperty(
       'createRecatMcpServer',
     );
-  });
+  }, 20_000);
 
   it('still fails closed when static conversion exceeds its startup budget', async () => {
     let simulatedNow = 0;

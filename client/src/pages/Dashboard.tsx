@@ -8,8 +8,10 @@ import type { CSSProperties, DragEvent, MouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { DashboardDataDto, DashboardWidget, WidgetType } from '@recat/shared';
 import { useApp } from '../state/AppContext';
-import { companies as companiesApi, dashboardLayout } from '../lib/api';
+import { ApiError, companies as companiesApi, dashboardLayout } from '../lib/api';
 import { moneyK } from '../lib/format';
+import { ReadFailureCard } from '../components/ReadFailureCard';
+import { Spinner } from '../components/ui';
 
 const DEFAULT_WIDGETS: DashboardWidget[] = [
   { t: 'rev', sp: 1 },
@@ -30,6 +32,10 @@ const WIDGET_LABELS: { t: WidgetType; label: string }[] = [
   { t: 'break', label: 'Where the money went' },
   { t: 'pl', label: 'P&L summary' },
 ];
+
+function defaultWidgets(): DashboardWidget[] {
+  return DEFAULT_WIDGETS.map((widget) => ({ ...widget }));
+}
 
 /** Default span when a widget is (re-)added from the ＋ Add widget menu. */
 function defaultSpan(t: WidgetType): 1 | 2 {
@@ -85,11 +91,14 @@ const widgetCtl: CSSProperties = {
 };
 
 export default function Dashboard() {
-  const { activeCompany, activeCompanyId, toast } = useApp();
+  const { activeCompany, activeCompanyId } = useApp();
   const navigate = useNavigate();
 
   const [data, setData] = useState<DashboardDataDto | null>(null);
-  const [widgets, setWidgets] = useState<DashboardWidget[]>(DEFAULT_WIDGETS);
+  const [dataState, setDataState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [dataError, setDataError] = useState<ApiError | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [widgets, setWidgets] = useState<DashboardWidget[] | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   // Track the dragged widget by its stable key (widget types are unique on the
   // board), not by index — indices drift as dragover reorders the array.
@@ -110,20 +119,32 @@ export default function Dashboard() {
 
   // ---- dashboard data ----
   useEffect(() => {
-    if (!activeCompanyId) return;
+    if (!activeCompanyId) {
+      setData(null);
+      setDataError(null);
+      setDataState('ready');
+      return;
+    }
     let cancelled = false;
+    setData(null);
+    setDataError(null);
+    setDataState('loading');
     companiesApi
       .dashboard(activeCompanyId)
       .then((d) => {
-        if (!cancelled) setData(d);
+        if (cancelled) return;
+        setData(d);
+        setDataState('ready');
       })
-      .catch(() => {
-        if (!cancelled) toast('Could not load dashboard data');
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setDataError(error instanceof ApiError ? error : null);
+        setDataState('error');
       });
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, toast]);
+  }, [activeCompanyId, reloadKey]);
 
   // ---- layout: load once on mount; default board only when never saved ----
   // A persisted `[]` means the user deliberately emptied the board — honor it.
@@ -132,10 +153,10 @@ export default function Dashboard() {
     dashboardLayout
       .get()
       .then((res) => {
-        if (!cancelled && res.widgets) setWidgets(res.widgets);
+        if (!cancelled) setWidgets(res.widgets ?? defaultWidgets());
       })
       .catch(() => {
-        // keep the default layout
+        if (!cancelled) setWidgets(defaultWidgets());
       });
     return () => {
       cancelled = true;
@@ -170,14 +191,14 @@ export default function Dashboard() {
 
   const addWidget = (t: WidgetType) => (e: MouseEvent) => {
     e.stopPropagation();
-    const next: DashboardWidget[] = [...widgets, { t, sp: defaultSpan(t) }];
+    const next: DashboardWidget[] = [...(widgets ?? []), { t, sp: defaultSpan(t) }];
     setWidgets(next);
     setAddOpen(false);
     persist(next);
   };
 
   const cycleSize = (i: number) => () => {
-    const next = widgets.map((w, j) =>
+    const next = (widgets ?? []).map((w, j) =>
       j === i ? { ...w, sp: ((w.sp % 4) + 1) as 1 | 2 | 3 | 4 } : w,
     );
     setWidgets(next);
@@ -185,7 +206,7 @@ export default function Dashboard() {
   };
 
   const removeWidget = (i: number) => () => {
-    const next = widgets.filter((_, j) => j !== i);
+    const next = (widgets ?? []).filter((_, j) => j !== i);
     setWidgets(next);
     persist(next);
   };
@@ -207,12 +228,13 @@ export default function Dashboard() {
     const d = dragRef.current;
     if (d === null || d === t) return;
     setWidgets((ws) => {
-      const from = ws.findIndex((w) => w.t === d);
-      const to = ws.findIndex((w) => w.t === t);
-      if (from === -1 || to === -1 || from === to) return ws;
-      const a = [...ws];
+      const current = ws ?? [];
+      const from = current.findIndex((w) => w.t === d);
+      const to = current.findIndex((w) => w.t === t);
+      if (from === -1 || to === -1 || from === to) return current;
+      const a = [...current];
       const mv = a.splice(from, 1)[0];
-      if (!mv) return ws;
+      if (!mv) return current;
       a.splice(to, 0, mv);
       return a;
     });
@@ -225,10 +247,16 @@ export default function Dashboard() {
 
   const onDragEnd = () => {
     setDrag(null);
-    persist(widgets);
+    persist(widgets ?? []);
   };
 
-  const addOpts = WIDGET_LABELS.filter((p) => !widgets.some((w) => w.t === p.t));
+  const addOpts = WIDGET_LABELS.filter((p) => !(widgets ?? []).some((w) => w.t === p.t));
+
+  const restoreDefaults = () => {
+    const next = defaultWidgets();
+    setWidgets(next);
+    persist(next);
+  };
 
   // ---- derived KPI values (prototype lines 1489–1504) ----
   const last = data ? data.months.length - 1 : 0;
@@ -537,6 +565,8 @@ export default function Dashboard() {
         </div>
         <span style={{ position: 'relative' }}>
           <button
+            type="button"
+            disabled={widgets === null}
             onClick={(e) => {
               e.stopPropagation();
               setAddOpen((v) => !v);
@@ -604,8 +634,54 @@ export default function Dashboard() {
         </span>
       </div>
 
+      {dataState === 'loading' && (
+        <div aria-busy="true" aria-label="Loading dashboard" style={{ display: 'flex', justifyContent: 'center', padding: '48px 0' }}>
+          <Spinner />
+        </div>
+      )}
+
+      {dataState === 'error' && (
+        <ReadFailureCard
+          title="Dashboard could not load"
+          context={activeCompany?.nickname ?? 'Selected company'}
+          error={dataError}
+          onRetry={() => setReloadKey((value) => value + 1)}
+        />
+      )}
+
+      {dataState === 'ready' && data?.source === 'local_fallback' && (
+        <div role="status" style={{ color: 'var(--fnt)', fontSize: 12.5, marginBottom: 14 }}>
+          Partial data from Recat&apos;s posted transactions · refreshed {new Date(data.retrievedAt).toLocaleString()}
+        </div>
+      )}
+
+      {dataState === 'ready' && data && widgets?.length === 0 && (
+        <div style={{ color: 'var(--fnt)', fontSize: 13.5, padding: '28px 0' }}>
+          <div>Your dashboard has no widgets.</div>
+          <button
+            type="button"
+            onClick={restoreDefaults}
+            className="hov-hl"
+            style={{
+              border: '1px solid var(--bd)',
+              background: 'var(--card)',
+              color: 'var(--ink)',
+              borderRadius: 7,
+              padding: '8px 14px',
+              fontSize: 13.5,
+              fontWeight: 600,
+              cursor: 'pointer',
+              font: 'inherit',
+              marginTop: 12,
+            }}
+          >
+            Restore defaults
+          </button>
+        </div>
+      )}
+
       {/* widget grid */}
-      {data && (
+      {dataState === 'ready' && data && widgets && widgets.length > 0 && (
         <div
           style={{
             display: 'grid',

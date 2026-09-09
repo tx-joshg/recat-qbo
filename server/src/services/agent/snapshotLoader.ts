@@ -1,4 +1,6 @@
 import { prisma } from '../../lib/prisma.js';
+import { compareRuleWinner, transactionDirection } from '../ruleMatching.js';
+import { cachedTaxCodeSupport, cachedTaxRates } from '../tax/cache.js';
 import type { AgentSnapshotSource } from './core/snapshot.js';
 
 const MAX_RETAINED_ITEMS = 20;
@@ -24,6 +26,7 @@ interface CurrentRow {
   companyId: unknown;
   revision: unknown;
   status: unknown;
+  qboType: unknown;
   date: unknown;
   amount: unknown;
   currency: unknown;
@@ -34,6 +37,7 @@ interface CurrentRow {
   taxSupportStatus: unknown;
   taxUsingSalesTax: unknown;
   configVersion: unknown;
+  ruleRuntimeMode: unknown;
 }
 
 interface AccountRow {
@@ -50,7 +54,23 @@ interface TaxRow {
   active: unknown;
   taxable: unknown;
   purchaseTaxRateList: unknown;
-  combinedPurchaseRate: unknown;
+  salesTaxRateList: unknown;
+}
+
+type UsableTaxRow = TaxRow & {
+  qboId: string;
+  name: string;
+  active: true;
+  taxable: boolean;
+  purchaseTaxRateList: unknown[];
+  salesTaxRateList: unknown[];
+};
+
+interface TaxRateRow {
+  qboId: unknown;
+  name: unknown;
+  active: unknown;
+  rateValue: unknown;
 }
 
 interface TagRow {
@@ -60,13 +80,18 @@ interface TagRow {
 
 interface RuleRow {
   id: unknown;
+  revision: unknown;
   priority: unknown;
+  createdAt: unknown;
   matchField: unknown;
   matchText: unknown;
+  direction: unknown;
+  category: unknown;
   categoryQboId: unknown;
   taxCalculation: unknown;
   taxCodeQboId: unknown;
   tagIds: unknown;
+  autoPost: unknown;
 }
 
 interface HistoryRow {
@@ -129,7 +154,7 @@ export async function loadAgentSnapshotSourceInTransaction(
   identifier(transactionId);
   const currentRows = await tx.$queryRawUnsafe<CurrentRow[]>(
     `/* agent-snapshot:current */
-     SELECT txn."id", txn."companyId", txn."revision", txn."status", txn."date",
+     SELECT txn."id", txn."companyId", txn."revision", txn."status", txn."qboType", txn."date",
        txn."amount"::text AS "amount",
        txn."rawData" #>> '{CurrencyRef,value}' AS "currency",
        CASE txn."qboType"
@@ -158,7 +183,7 @@ export async function loadAgentSnapshotSourceInTransaction(
          ELSE NULL
        END AS "sourceAccountQboId",
        txn."payee", txn."memo", company."holdingAccountIds",
-       company."taxSupportStatus", company."taxUsingSalesTax",
+       company."taxSupportStatus", company."taxUsingSalesTax", company."ruleRuntimeMode",
        config."configVersion"
      FROM "Transaction" AS txn
      JOIN "Company" AS company ON company."id" = txn."companyId"
@@ -170,9 +195,10 @@ export async function loadAgentSnapshotSourceInTransaction(
   );
   const current = currentRows[0];
   if (current === undefined) invalid();
+  const currentDirection = supportedDirection(current.qboType);
   const currentSourceAccountId = reference(current.sourceAccountQboId);
 
-  const [accounts, taxRows, tagRows, ruleRows, historyRows] = await Promise.all([
+  const [accounts, taxRows, taxRateRows, tagRows, ruleRows, historyRows] = await Promise.all([
     tx.$queryRawUnsafe<AccountRow[]>(
       `/* agent-snapshot:accounts */
        SELECT "qboId", "fullName", "classification", "accountType", "active"
@@ -189,12 +215,21 @@ export async function loadAgentSnapshotSourceInTransaction(
     ),
     tx.$queryRawUnsafe<TaxRow[]>(
       `/* agent-snapshot:tax */
-       SELECT "qboId", "name", "active", "taxable", "purchaseTaxRateList",
-         "combinedPurchaseRate"::text AS "combinedPurchaseRate"
+       SELECT "qboId", "name", "active", "taxable", "purchaseTaxRateList", "salesTaxRateList"
        FROM "QboTaxCode"
        WHERE "companyId" = $1
          AND "active" = TRUE
        ORDER BY "name", "qboId"
+       LIMIT ${MAX_QUERY_ITEMS + 1}`,
+      companyId,
+    ),
+    tx.$queryRawUnsafe<TaxRateRow[]>(
+      `/* agent-snapshot:rates */
+       SELECT "qboId", "name", "active", "rateValue"::text AS "rateValue"
+       FROM "QboTaxRate"
+       WHERE "companyId" = $1
+         AND "active" = TRUE
+       ORDER BY "qboId"
        LIMIT ${MAX_QUERY_ITEMS + 1}`,
       companyId,
     ),
@@ -207,10 +242,11 @@ export async function loadAgentSnapshotSourceInTransaction(
        LIMIT ${MAX_QUERY_ITEMS + 1}`,
       companyId,
     ),
-    tx.$queryRawUnsafe<RuleRow[]>(
+    current.ruleRuntimeMode === 'canonical' ? tx.$queryRawUnsafe<RuleRow[]>(
       `/* agent-snapshot:rules */
-       SELECT rule."id", rule."priority", rule."matchField", rule."matchText",
-         rule."categoryQboId", rule."taxCalculation", rule."taxCodeQboId",
+       SELECT rule."id", rule."revision", rule."priority", rule."createdAt", rule."matchField", rule."matchText",
+         rule."direction", rule."category", rule."categoryQboId",
+         rule."taxCalculation", rule."taxCodeQboId", rule."autoPost",
          COALESCE(
            array_agg(rule_tag."tagId" ORDER BY rule_tag."tagId")
              FILTER (WHERE rule_tag."tagId" IS NOT NULL),
@@ -219,14 +255,22 @@ export async function loadAgentSnapshotSourceInTransaction(
        FROM "Rule" AS rule
        LEFT JOIN "RuleTag" AS rule_tag ON rule_tag."ruleId" = rule."id"
        WHERE rule."companyId" = $1
+         AND rule."enabled" = true
+         AND rule."retiredAt" IS NULL
+         AND rule."reviewRequiredAt" IS NULL
+         AND rule."repairReason" IS NULL
+         AND rule."canonicalVersion" = 2
+         AND rule."direction"::text = $3
          AND rule."matchField" = 'payee'
-         AND position(lower(rule."matchText") in lower($2)) > 0
+         AND rule_match_key(rule."matchText") <> ''
+         AND position(rule_match_key(rule."matchText") in rule_match_key($2)) > 0
        GROUP BY rule."id"
-       ORDER BY rule."priority", rule."id"
+       ORDER BY rule."priority", rule."createdAt" DESC, rule."id"
        LIMIT ${MAX_QUERY_ITEMS + 1}`,
       companyId,
       text(current.payee, 160),
-    ),
+      currentDirection,
+    ) : Promise.resolve<RuleRow[]>([]),
     tx.$queryRawUnsafe<HistoryRow[]>(
       `/* agent-snapshot:history */
        WITH latest_verified AS (
@@ -297,6 +341,7 @@ export async function loadAgentSnapshotSourceInTransaction(
     current,
     accounts,
     taxRows,
+    taxRateRows,
     tagRows,
     ruleRows,
     historyRows,
@@ -310,6 +355,7 @@ function mapSource(input: {
   current: CurrentRow;
   accounts: AccountRow[];
   taxRows: TaxRow[];
+  taxRateRows: TaxRateRow[];
   tagRows: TagRow[];
   ruleRows: RuleRow[];
   historyRows: HistoryRow[];
@@ -324,6 +370,7 @@ function mapSource(input: {
   const transactionId = uuid(current.id);
   const revision = nonnegativeInteger(current.revision);
   const currency = currencyCode(current.currency);
+  const currentDirection = supportedDirection(current.qboType);
   const sourceAccountId = reference(current.sourceAccountQboId);
   const holdingIds = new Set(stringArray(current.holdingAccountIds).filter(isReference));
 
@@ -351,9 +398,13 @@ function mapSource(input: {
   const candidateCategories = normalizedAccounts
     .filter((row) =>
       !holdingIds.has(row.qboId)
-      && (row.classification === 'Income'
-        || row.classification === 'COGS'
-        || row.classification === 'Expenses'))
+      && (currentDirection === 'Purchase'
+        ? row.classification === 'COGS' || row.classification === 'Expenses'
+        : currentDirection === 'Deposit'
+          ? row.classification === 'Income'
+          : row.classification === 'Income'
+            || row.classification === 'COGS'
+            || row.classification === 'Expenses'))
     .sort((left, right) =>
       left.fullName.localeCompare(right.fullName)
       || left.qboId.localeCompare(right.qboId))
@@ -361,8 +412,12 @@ function mapSource(input: {
     .map((row) => ({ qboId: row.qboId, name: row.fullName }));
   const categoryIds = new Set(candidateCategories.map((entry) => entry.qboId));
 
-  const eligibleReferences = input.taxRows
-    .filter(isUsableTaxRow)
+  const cachedRates = cachedTaxRates(input.taxRateRows);
+  const usableTaxRows = currentDirection === null
+    ? []
+    : input.taxRows.filter((row): row is UsableTaxRow =>
+        isUsableTaxRow(row, cachedRates, currentDirection));
+  const eligibleReferences = usableTaxRows
     .map((row) => ({
       qboId: reference(row.qboId),
       label: text(row.name, 160),
@@ -379,7 +434,13 @@ function mapSource(input: {
   const tax: AgentSnapshotSource['tax'] = taxStatus === 'ready'
     ? {
         status: 'ready',
-        supportedCalculationModes: ['TaxInclusive', 'TaxExcluded'],
+        supportedCalculationModes: usableTaxRows.some(
+          (row) => (currentDirection === 'Deposit'
+            ? row.salesTaxRateList
+            : row.purchaseTaxRateList).length > 1,
+        )
+          ? ['TaxInclusive']
+          : ['TaxInclusive', 'TaxExcluded'],
         eligibleReferences,
       }
     : { status: taxStatus, supportedCalculationModes: [], eligibleReferences: [] };
@@ -395,34 +456,53 @@ function mapSource(input: {
   const tagIds = new Set(tags.map((entry) => entry.id));
 
   const rules = input.ruleRows.flatMap((row) => {
+    const createdAt = maybeDate(row.createdAt);
     if (
       !isUuid(row.id)
+      || !Number.isInteger(row.revision)
+      || (row.revision as number) <= 0
       || !Number.isInteger(row.priority)
       || (row.priority as number) < 0
       || (row.priority as number) > 1_000_000
+      || createdAt === null
       || row.matchField !== 'payee'
+      || row.direction !== currentDirection
       || typeof row.matchText !== 'string'
       || row.matchText.trim() === ''
       || row.matchText.length > 160
       || !isReference(row.categoryQboId)
       || !categoryIds.has(row.categoryQboId)
+      || typeof row.category !== 'string'
+      || row.category.trim() === ''
+      || row.category.length > 160
+      || typeof row.autoPost !== 'boolean'
     ) return [];
     const calculation = normalizedTaxCalculation(row.taxCalculation, row.taxCodeQboId);
     if (calculation === null || !validTaxReference(calculation, row.taxCodeQboId, tax, taxIds)) return [];
     const ruleTagIds = validReferencedIds(row.tagIds, tagIds);
     if (ruleTagIds === null) return [];
+    const direction = row.direction as 'Purchase' | 'Deposit';
     return [{
       id: row.id,
+      ruleRevision: row.revision as number,
       priority: row.priority as number,
+      createdAt,
       matchField: 'payee' as const,
       matchText: row.matchText.trim(),
-      categoryQboId: row.categoryQboId,
-      taxCalculation: calculation,
-      taxCodeQboId: calculation === 'NotApplicable' ? null : row.taxCodeQboId as string,
-      tagIds: ruleTagIds,
+      action: {
+        version: 2 as const,
+        direction,
+        category: row.category.trim(),
+        categoryQboId: row.categoryQboId,
+        taxCalculation: calculation,
+        taxCodeQboId: calculation === 'NotApplicable' ? null : row.taxCodeQboId as string,
+        tagIds: ruleTagIds,
+      },
+      autoPost: row.autoPost,
     }];
-  }).sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id))
-    .slice(0, MAX_RETAINED_ITEMS);
+  }).sort(compareRuleWinner)
+    .slice(0, MAX_RETAINED_ITEMS)
+    .map(({ createdAt: _createdAt, ...rule }) => rule);
 
   const linesByTransaction = new Map<string, HistoryLineRow[]>();
   for (const line of input.historyLineRows) {
@@ -543,7 +623,11 @@ function mapSource(input: {
   };
 }
 
-function isUsableTaxRow(row: TaxRow): boolean {
+function isUsableTaxRow(
+  row: TaxRow,
+  rates: ReturnType<typeof cachedTaxRates>,
+  direction: 'Purchase' | 'Deposit',
+): row is UsableTaxRow {
   if (
     row.active !== true
     || !isReference(row.qboId)
@@ -551,13 +635,13 @@ function isUsableTaxRow(row: TaxRow): boolean {
     || row.name.trim() === ''
     || row.name.length > 160
     || !Array.isArray(row.purchaseTaxRateList)
+    || !Array.isArray(row.salesTaxRateList)
   ) return false;
-  if (row.taxable === false) {
-    return row.purchaseTaxRateList.length === 0 && row.combinedPurchaseRate === null;
-  }
-  if (row.taxable !== true || row.purchaseTaxRateList.length !== 1) return false;
-  const rate = Number(row.combinedPurchaseRate);
-  return Number.isFinite(rate) && rate >= 0 && rate <= 999.999999;
+  return cachedTaxCodeSupport(
+    row,
+    rates,
+    direction === 'Purchase' ? 'purchase' : 'sales',
+  ).supported;
 }
 
 function normalizedTaxStatus(
@@ -591,6 +675,7 @@ function validTaxReference(
 ): boolean {
   if (calculation === 'NotApplicable') return taxCodeQboId === null;
   if (tax.status !== 'ready') return false;
+  if (!tax.supportedCalculationModes.includes(calculation)) return false;
   if (transactionLevel && (taxCodeQboId === null || taxCodeQboId === undefined)) return true;
   return isReference(taxCodeQboId) && taxIds.has(taxCodeQboId);
 }
@@ -660,10 +745,25 @@ function maybeTimestamp(value: unknown): string | null {
   }
 }
 
+function maybeDate(value: unknown): Date | null {
+  try {
+    return checkedDate(value);
+  } catch {
+    return null;
+  }
+}
+
 function checkedDate(value: unknown): Date {
   const date = value instanceof Date ? value : new Date(typeof value === 'string' ? value : Number.NaN);
   if (Number.isNaN(date.getTime())) invalid();
   return date;
+}
+
+function supportedDirection(value: unknown): 'Purchase' | 'Deposit' {
+  if (typeof value !== 'string') invalid();
+  const direction = transactionDirection(value);
+  if (direction === null) invalid();
+  return direction;
 }
 
 function currencyCode(value: unknown): string {

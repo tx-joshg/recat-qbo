@@ -30,6 +30,10 @@ import {
   assertCurrentMcpCategorizationAuthorization,
   type McpCategorizationAuthorizationStore,
 } from './categorization.js';
+import {
+  assertTransactionProviderActionability,
+  type ProviderActionabilityDb,
+} from '../providerActionability.js';
 
 const TOOL_NAME = 'prepare_transfer';
 const MAX_PRISMA_INT = 2_147_483_647;
@@ -286,22 +290,38 @@ export async function prepareMcpTransfer(
         input.companyId,
         currentTime(dependencies),
       );
-      if (idempotencyKey === null) return { kind: 'continue' };
-      const existing = await store.mcpOperation.findFirst({
-        where: {
-          tokenId: principal.tokenId,
-          userId: principal.userId,
-          toolName: TOOL_NAME,
-          idempotencyKey,
-        },
-      });
-      if (existing === null) return { kind: 'continue' };
-      const coordinator = await loadCoordinator(store, existing);
-      assertExactPrepareInput(existing, coordinator, principal, input);
-      return {
-        kind: 'return',
-        value: preparedDto(existing, coordinator),
-      };
+      if (idempotencyKey !== null) {
+        const existing = await store.mcpOperation.findFirst({
+          where: {
+            tokenId: principal.tokenId,
+            userId: principal.userId,
+            toolName: TOOL_NAME,
+            idempotencyKey,
+          },
+        });
+        if (existing !== null) {
+          const coordinator = await loadCoordinator(store, existing);
+          assertExactPrepareInput(existing, coordinator, principal, input);
+          return {
+            kind: 'return',
+            value: preparedDto(existing, coordinator),
+          };
+        }
+      }
+      const providerDb = store as unknown as ProviderActionabilityDb;
+      await assertTransactionProviderActionability(
+        input.companyId,
+        input.transactionId,
+        providerDb,
+        currentTime(dependencies),
+      );
+      await assertTransactionProviderActionability(
+        input.companyId,
+        input.counterpartTransactionId,
+        providerDb,
+        currentTime(dependencies),
+      );
+      return { kind: 'continue' };
     },
     afterPrepare: async (rawStore, receipt) => {
       const store = rawStore as unknown as McpTransferStore;

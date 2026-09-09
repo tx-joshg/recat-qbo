@@ -1,8 +1,19 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { TaxReadinessDto, TransactionDto } from '@recat/shared';
 import SplitEditor from './SplitEditor';
+
+async function chooseControl(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+  optionName: string,
+) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  const search = screen.queryByRole('textbox', { name: label });
+  if (search) await user.type(search, optionName);
+  await user.click(screen.getByRole('option', { name: optionName }));
+}
 
 const toast = vi.fn();
 vi.mock('../state/AppContext', () => ({
@@ -94,6 +105,36 @@ const SALES_READY: TaxReadinessDto = {
 };
 
 describe('SplitEditor tax fields', () => {
+  it.each([
+    { amount: -100, sourceGrossCents: -11200, expected: '112.00' },
+    { amount: 100, sourceGrossCents: 11200, expected: '112.00' },
+    { amount: -100, sourceGrossCents: undefined, expected: '100.00' },
+  ])('seeds allocation from proven gross or the legacy amount: $sourceGrossCents', ({ amount, sourceGrossCents, expected }) => {
+    render(<SplitEditor txn={{ ...TXN, amount, sourceGrossCents, splits: null }}
+      tags={[]} catOpts={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getByLabelText('Amount for split line 1')).toHaveValue(expected);
+    expect(screen.getByText(/assign every dollar to a category/)).toHaveTextContent(`$${expected}`);
+  });
+
+  it('keeps a name-only draft category visibly selected and selected on reopen', async () => {
+    const user = userEvent.setup();
+    render(
+      <SplitEditor
+        txn={TXN}
+        tags={[]}
+        catOpts={[{ group: 'Expenses', name: 'Generic expense' }]}
+        taxReadiness={READY}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+
+    const category = screen.getByRole('combobox', { name: 'Category for split line 1' });
+    expect(category).toHaveTextContent('Expenses · Generic expense');
+    await user.click(category);
+    expect(screen.getByRole('option', { name: /Generic expense/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
   it('saves the calculation, memo, and purchase tax selection on every line', async () => {
     const onSave = vi.fn();
     const user = userEvent.setup();
@@ -108,17 +149,11 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for split'),
-      'TaxExcluded',
-    );
+    await chooseControl(user, 'Tax calculation for split', 'Tax exclusive');
     const firstMemo = screen.getByLabelText('Memo for split line 1');
     await user.clear(firstMemo);
     await user.type(firstMemo, 'Updated generic memo');
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      'TAX_CODE_STANDARD',
-    );
+    await chooseControl(user, 'Purchase tax for split line 2', 'Standard purchase tax · 5%');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(
@@ -214,10 +249,7 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      '',
-    );
+    await chooseControl(user, 'Purchase tax for split line 2', 'No tax');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).not.toHaveBeenCalled();
@@ -251,10 +283,10 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    expect(screen.getByLabelText('Sales tax for split line 1')).toHaveTextContent('Standard sales tax');
+    expect(screen.getByRole('combobox', { name: 'Sales tax for split line 1' })).toHaveTextContent('No tax');
     expect(screen.queryByLabelText('Purchase tax for split line 1')).not.toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 1'), 'SALES_TAX_CODE');
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 2'), 'SALES_TAX_CODE');
+    await chooseControl(user, 'Sales tax for split line 1', 'Standard sales tax · 5%');
+    await chooseControl(user, 'Sales tax for split line 2', 'Standard sales tax · 5%');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(
@@ -297,4 +329,19 @@ describe('SplitEditor tax fields', () => {
       'Select a usable sales tax code for every taxed split line.',
     );
   });
+});
+
+
+it('opens an accessible dialog and restores the opener without scrolling', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  opener.focus();
+  const focus = vi.spyOn(opener, 'focus');
+  const view = render(<SplitEditor txn={TXN} tags={[]} catOpts={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+  const dialog = screen.getByRole('dialog', { name: 'Split transaction' });
+  expect(dialog).toHaveAttribute('aria-modal', 'true');
+  await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+  view.unmount();
+  await waitFor(() => expect(focus).toHaveBeenCalledWith({ preventScroll: true }));
+  opener.remove();
 });

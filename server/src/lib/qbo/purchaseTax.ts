@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { StagedCategorization, TaxCalculation } from '@recat/shared';
+import { QBO_NOT_APPLICABLE_TAX_CODE, type StagedCategorization, type TaxCalculation } from '@recat/shared';
 import {
   QboSyncTokenConflict,
   type QboPreparedWrite,
@@ -116,9 +116,27 @@ function toSafeCents(value: bigint): number {
 }
 
 interface ResolvedTaxLine {
-  rateQboId: string | null;
-  rate: { numerator: bigint; denominator: bigint } | null;
+  components: {
+    rateQboId: string;
+    rate: { numerator: bigint; denominator: bigint };
+  }[];
   treatment: PurchaseTaxTreatment;
+}
+
+function sumRateRatios(
+  rates: readonly { numerator: bigint; denominator: bigint }[],
+): { numerator: bigint; denominator: bigint } {
+  const denominator = rates.reduce(
+    (largest, rate) => rate.denominator > largest ? rate.denominator : largest,
+    1n,
+  );
+  return {
+    numerator: rates.reduce(
+      (sum, rate) => sum + rate.numerator * (denominator / rate.denominator),
+      0n,
+    ),
+    denominator,
+  };
 }
 
 type TaxDirection = 'purchase' | 'sales';
@@ -196,7 +214,7 @@ function resolveTaxLine(
   if (code.taxable === false) {
     if (components.length !== 0) return 'TAX_CODE_MALFORMED';
     if (input.nonTaxTreatment === undefined) return 'TAX_TREATMENT_AMBIGUOUS';
-    return { rateQboId: null, rate: null, treatment: input.nonTaxTreatment };
+    return { components: [], treatment: input.nonTaxTreatment };
   }
 
   if (taxCalculation === 'NotApplicable') return 'TAX_CODE_MALFORMED';
@@ -204,29 +222,38 @@ function resolveTaxLine(
   if (components.length === 0) {
     return direction === 'purchase' ? 'TAX_CODE_SALES_ONLY' : 'TAX_CODE_PURCHASE_ONLY';
   }
-  if (components.length !== 1) return 'TAX_RATE_UNSUPPORTED';
-  const component = components[0];
-  if (
-    !isRuntimeRecord(component) ||
-    !isNonEmptyIdentity(component.taxRateQboId) ||
-    !isNonEmptyIdentity(component.taxTypeApplicable)
-  ) {
-    return 'TAX_RATE_MALFORMED';
-  }
-  if (component.taxTypeApplicable !== 'TaxOnAmount') return 'TAX_RATE_UNSUPPORTED';
+  const resolvedComponents: ResolvedTaxLine['components'] = [];
+  const seenRateIds = new Set<string>();
+  for (const component of components) {
+    if (
+      !isRuntimeRecord(component) ||
+      !isNonEmptyIdentity(component.taxRateQboId) ||
+      !isNonEmptyIdentity(component.taxTypeApplicable)
+    ) {
+      return 'TAX_RATE_MALFORMED';
+    }
+    if (component.taxTypeApplicable !== 'TaxOnAmount') return 'TAX_RATE_UNSUPPORTED';
+    if (seenRateIds.has(component.taxRateQboId)) return 'TAX_CODE_MALFORMED';
+    seenRateIds.add(component.taxRateQboId);
 
-  const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
-  if (!taxRate) return 'TAX_RATE_UNAVAILABLE';
-  if (!isNonEmptyIdentity(taxRate.qboId) || typeof taxRate.active !== 'boolean') {
-    return 'TAX_RATE_MALFORMED';
+    const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
+    if (!taxRate) return 'TAX_RATE_UNAVAILABLE';
+    if (!isNonEmptyIdentity(taxRate.qboId) || typeof taxRate.active !== 'boolean') {
+      return 'TAX_RATE_MALFORMED';
+    }
+    if (!taxRate.active) return 'TAX_RATE_INACTIVE';
+    if (!isSupportedTaxRateValue(taxRate.rateValue)) return 'TAX_RATE_MALFORMED';
+    resolvedComponents.push({
+      rateQboId: taxRate.qboId,
+      rate: rateValueToRatio(taxRate.rateValue),
+    });
   }
-  if (!taxRate.active) return 'TAX_RATE_INACTIVE';
-  if (!isSupportedTaxRateValue(taxRate.rateValue)) return 'TAX_RATE_MALFORMED';
 
   return {
-    rateQboId: taxRate.qboId,
-    rate: rateValueToRatio(taxRate.rateValue),
-    treatment: taxRate.rateValue === 0 ? 'zero_rated' : 'standard',
+    components: resolvedComponents,
+    treatment: resolvedComponents.some((component) => component.rate.numerator !== 0n)
+      ? 'standard'
+      : 'zero_rated',
   };
 }
 
@@ -280,7 +307,7 @@ function allocateExcludedTax(
     centsToAllocate -= 1n;
   }
   for (const share of shares) {
-    lines.lines[share.index]!.taxCents = toSafeCents(BigInt(sign) * share.taxCents);
+    lines.lines[share.index]!.taxCents += toSafeCents(BigInt(sign) * share.taxCents);
   }
   return null;
 }
@@ -458,7 +485,7 @@ function reconstructTaxExcludedTransaction(
   if (!validation.eligible) return validation;
 
   const resolved: ResolvedTaxLine[] = [];
-  for (const line of input.lines) {
+  for (const [lineIndex, line] of input.lines.entries()) {
     const resolution = resolveTaxLine(
       line,
       'TaxExcluded',
@@ -468,7 +495,9 @@ function reconstructTaxExcludedTransaction(
     if (typeof resolution === 'string') {
       return { eligible: false, reason: resolution };
     }
-    if (!resolution.rateQboId || !resolution.rate) return null;
+    if (resolution.components.length !== 1) {
+      return { eligible: false, reason: 'TAX_RATE_UNSUPPORTED', lineIndex };
+    }
     resolved.push(resolution);
   }
 
@@ -489,12 +518,13 @@ function reconstructTaxExcludedTransaction(
     { indexes: number[]; rate: { numerator: bigint; denominator: bigint } }
   >();
   for (const [index, resolution] of resolved.entries()) {
-    const group = groups.get(resolution.rateQboId!);
+    const component = resolution.components[0]!;
+    const group = groups.get(component.rateQboId);
     if (group) group.indexes.push(index);
     else {
-      groups.set(resolution.rateQboId!, {
+      groups.set(component.rateQboId, {
         indexes: [index],
-        rate: resolution.rate!,
+        rate: component.rate,
       });
     }
   }
@@ -608,12 +638,13 @@ function calculateTaxTransaction(
 
   if (input.taxCalculation === 'TaxInclusive') {
     for (const [index, resolution] of resolved.entries()) {
-      if (!resolution.rate) continue;
+      if (resolution.components.length === 0) continue;
+      const rate = sumRateRatios(resolution.components.map((component) => component.rate));
       const gross = BigInt(result.lines[index]!.grossCents);
-      const denominator = resolution.rate.denominator * 100n;
+      const denominator = rate.denominator * 100n;
       try {
         const net = toSafeCents(
-          roundRatio(gross * denominator, denominator + resolution.rate.numerator),
+          roundRatio(gross * denominator, denominator + rate.numerator),
         );
         result.lines[index]!.netCents = net;
         result.lines[index]!.taxCents = result.lines[index]!.grossCents - net;
@@ -622,15 +653,19 @@ function calculateTaxTransaction(
       }
     }
   } else if (input.taxCalculation === 'TaxExcluded') {
-    const componentGroups = new Map<string, { indexes: number[]; rate: ResolvedTaxLine['rate'] }>();
+    const componentGroups = new Map<string, {
+      indexes: number[];
+      rate: { numerator: bigint; denominator: bigint };
+    }>();
     for (const [index, resolution] of resolved.entries()) {
-      if (!resolution.rateQboId || !resolution.rate) continue;
-      const group = componentGroups.get(resolution.rateQboId);
-      if (group) group.indexes.push(index);
-      else componentGroups.set(resolution.rateQboId, { indexes: [index], rate: resolution.rate });
+      for (const component of resolution.components) {
+        const group = componentGroups.get(component.rateQboId);
+        if (group) group.indexes.push(index);
+        else componentGroups.set(component.rateQboId, { indexes: [index], rate: component.rate });
+      }
     }
     for (const group of componentGroups.values()) {
-      const failure = allocateExcludedTax(result, group.indexes, group.rate!);
+      const failure = allocateExcludedTax(result, group.indexes, group.rate);
       if (failure) return { eligible: false, reason: failure };
     }
   }
@@ -685,14 +720,21 @@ export function calculatePurchaseLine(
     if (code.taxable !== false) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
     return { grossCents: input.grossCents, netCents: input.grossCents, taxCents: 0 };
   }
-  if (code.purchaseRates.length !== 1 || code.purchaseRates[0]?.taxTypeApplicable !== 'TaxOnAmount') {
+  if (code.purchaseRates.length === 0 || code.purchaseRates.some(
+    (component) => component.taxTypeApplicable !== 'TaxOnAmount',
+  )) {
     throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
   }
-
-  const taxRate = reference.rates.find((candidate) => candidate.qboId === code.purchaseRates[0]?.taxRateQboId);
-  if (!taxRate || !taxRate.active) throw new PurchaseTaxError('TAX_RATE_UNAVAILABLE');
-  if (!isSupportedTaxRateValue(taxRate.rateValue)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
-  const rate = rateValueToRatio(taxRate.rateValue);
+  const rateIds = new Set<string>();
+  const rates = code.purchaseRates.map((component) => {
+    if (rateIds.has(component.taxRateQboId)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
+    rateIds.add(component.taxRateQboId);
+    const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
+    if (!taxRate || !taxRate.active) throw new PurchaseTaxError('TAX_RATE_UNAVAILABLE');
+    if (!isSupportedTaxRateValue(taxRate.rateValue)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
+    return rateValueToRatio(taxRate.rateValue);
+  });
+  const rate = sumRateRatios(rates);
 
   const grossCents = BigInt(input.grossCents);
   const taxDenominator = rate.denominator * 100n;
@@ -701,7 +743,13 @@ export function calculatePurchaseLine(
     : grossCents;
   const taxCents = input.taxCalculation === 'TaxInclusive'
     ? grossCents - netCents
-    : roundRatio(grossCents * rate.numerator, taxDenominator);
+    : rates.reduce(
+        (sum, component) => sum + roundRatio(
+          grossCents * component.numerator,
+          component.denominator * 100n,
+        ),
+        0n,
+      );
 
   return {
     grossCents: input.grossCents,
@@ -807,6 +855,50 @@ function requestHash(body: RawPurchase): string {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
+function fingerprint(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function preservedPurchaseEntity(raw: RawPurchase): Record<string, unknown> {
+  const {
+    Id: _id,
+    SyncToken: _syncToken,
+    TotalAmt: _total,
+    Line: _lines,
+    GlobalTaxCalculation: _taxMode,
+    TxnTaxDetail: _taxDetail,
+    HomeTotalAmt: _homeTotal,
+    MetaData: _metadata,
+    status: _status,
+    sparse: _sparse,
+    domain: _domain,
+    ...preserved
+  } = raw;
+  return preserved;
+}
+
+function categoryOnlyLine(raw: RawPurchaseLine): RawPurchaseLine {
+  const line = normalizedClone(raw);
+  const accountRef = line.AccountBasedExpenseLineDetail?.AccountRef;
+  if (accountRef !== undefined) {
+    accountRef.value = '__CATEGORY_ACCOUNT__';
+    delete accountRef.name;
+  }
+  return line;
+}
+
+export function purchasePreservedHash(raw: RawPurchase): string {
+  return fingerprint(preservedPurchaseEntity(raw));
+}
+
+export function purchaseRawLineHash(raw: RawPurchaseLine): string {
+  return fingerprint(raw);
+}
+
+export function purchaseCategoryOnlyLineHash(raw: RawPurchaseLine): string {
+  return fingerprint(categoryOnlyLine(raw));
+}
+
 function purchaseSign(raw: RawPurchase): 1 | -1 {
   return raw.Credit === true ? 1 : -1;
 }
@@ -842,10 +934,12 @@ function snapshotLine(
     taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
     taxAmountCents,
     taxInclusiveCents,
+    rawHash: purchaseRawLineHash(raw),
+    categoryOnlyHash: purchaseCategoryOnlyLineHash(raw),
   };
 }
 
-function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
+export function mapPurchaseTaxSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
   if (
     typeof raw !== 'object' ||
     raw === null ||
@@ -898,12 +992,60 @@ function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
           ? null
           : derivedTotalTaxCents
         : directionalCents(raw.TxnTaxDetail.TotalTax, sign),
+    preservedHash: purchasePreservedHash(raw),
     lines: raw.Line.map((line) => snapshotLine(line, sign, raw.GlobalTaxCalculation)),
   };
 }
 
+/**
+ * Returns the signed gross represented by the selected holding lines.
+ * QBO stores TaxInclusive Purchase line Amount as net, so callers must not
+ * use amountCents alone when proving that a tax correction preserves cash.
+ */
+export function purchaseHoldingGrossCents(
+  snapshot: QboPurchaseSnapshot,
+  holdingLineIndexes: readonly number[],
+): number | null {
+  if (holdingLineIndexes.length === 0) return null;
+  const gross: number[] = [];
+  for (const index of holdingLineIndexes) {
+    const line = snapshot.lines[index];
+    if (!line) return null;
+    if (snapshot.globalTaxCalculation === 'TaxInclusive') {
+      if (line.taxInclusiveCents !== null) {
+        gross.push(line.taxInclusiveCents);
+        continue;
+      }
+      if (
+        line.taxCodeQboId === null
+        && (line.taxAmountCents === null || line.taxAmountCents === 0)
+      ) {
+        gross.push(line.amountCents);
+        continue;
+      }
+      return null;
+    }
+    if (snapshot.globalTaxCalculation === 'TaxExcluded') {
+      if (line.taxAmountCents === null) return null;
+      const total = line.amountCents + line.taxAmountCents;
+      if (!Number.isSafeInteger(total)) return null;
+      gross.push(total);
+      continue;
+    }
+    gross.push(line.amountCents);
+  }
+  try {
+    return safeCentSum(gross);
+  } catch {
+    return null;
+  }
+}
+
+const snapshotFromRaw = mapPurchaseTaxSnapshot;
+
 function canonicalSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
   return JSON.stringify([
+    line.rawHash,
     line.id,
     line.amountCents,
     line.description,
@@ -939,9 +1081,11 @@ export function purchaseTargetLineMatches(
   actualTotalTaxCents: number | null,
   expected: QboPurchaseSnapshot['lines'][number],
   actual: QboPurchaseSnapshot['lines'][number],
+  taxDisposition: QboPurchaseExpectedState['taxDisposition'] = 'set',
 ): boolean {
   const providerDefaultNonTaxCode =
-    globalTaxCalculation === 'NotApplicable'
+    taxDisposition !== 'preserve_current'
+    && globalTaxCalculation === 'NotApplicable'
     && zeroOrUnspecifiedTax(expectedTotalTaxCents)
     && zeroOrUnspecifiedTax(actualTotalTaxCents)
     && expected.taxCodeQboId === null
@@ -951,7 +1095,16 @@ export function purchaseTargetLineMatches(
     && actual.taxAmountCents === null
     && expected.taxInclusiveCents === null
     && actual.taxInclusiveCents === null;
-  return expected.amountCents === actual.amountCents
+  const exactCategoryOnlyLine =
+    taxDisposition !== 'preserve_current'
+    || (
+      expected.id !== null
+      && expected.id === actual.id
+      && typeof expected.categoryOnlyHash === 'string'
+      && expected.categoryOnlyHash === actual.categoryOnlyHash
+    );
+  return exactCategoryOnlyLine
+    && expected.amountCents === actual.amountCents
     && expected.description === actual.description
     && expected.accountQboId === actual.accountQboId
     && expected.customerQboId === actual.customerQboId
@@ -966,8 +1119,15 @@ export function purchaseTargetLineMatches(
 
 function assertSnapshotEqualsBefore(actual: QboPurchaseSnapshot, before: QboPurchaseSnapshot): void {
   if (actual.syncToken !== before.syncToken) throw new QboSyncTokenConflict();
-  const comparableActual = { ...actual, syncToken: undefined };
-  const comparableBefore = { ...before, syncToken: undefined };
+  const comparableActual = normalizedClone({ ...actual, syncToken: undefined });
+  const comparableBefore = normalizedClone({ ...before, syncToken: undefined });
+  if (before.preservedHash === undefined) delete comparableActual.preservedHash;
+  for (const [index, line] of before.lines.entries()) {
+    if (line.rawHash === undefined) delete comparableActual.lines[index]!.rawHash;
+    if (line.categoryOnlyHash === undefined) {
+      delete comparableActual.lines[index]!.categoryOnlyHash;
+    }
+  }
   if (canonicalJson(comparableActual) !== canonicalJson(comparableBefore)) {
     preparationError('QBO_STATE_DRIFT', 'Purchase changed after its before snapshot was stored.');
   }
@@ -986,6 +1146,7 @@ function expectedBase(
     direction: snapshot.direction,
     globalTaxCalculation,
     totalTaxCents,
+    preservedHash: snapshot.preservedHash,
   };
 }
 
@@ -1008,6 +1169,8 @@ function stagedLineToRaw(
     if (taxCalculation === 'TaxInclusive') {
       detail.TaxInclusiveAmt = moneyFromCents(line.totalCents);
     }
+  } else if (line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE) {
+    detail.TaxCodeRef = { value: QBO_NOT_APPLICABLE_TAX_CODE };
   } else if (line.taxCodeQboId !== null) {
     preparationError('QBO_PURCHASE_UNSUPPORTED', 'NotApplicable Purchase lines cannot carry a tax code.');
   }
@@ -1030,7 +1193,11 @@ function stagedLineToSnapshot(
     accountQboId: line.categoryQboId,
     customerQboId: null,
     classQboId: null,
-    taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
+    taxCodeQboId: taxCalculation === 'NotApplicable'
+      ? line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
+        ? QBO_NOT_APPLICABLE_TAX_CODE
+        : null
+      : line.taxCodeQboId,
     taxAmountCents: taxCalculation === 'NotApplicable' ? null : line.taxCents,
     taxInclusiveCents:
       taxCalculation === 'TaxInclusive' ? line.totalCents : null,
@@ -1076,7 +1243,19 @@ function assertStagedAmounts(
   if (canonicalJson(totals) !== canonicalJson(staged.totals)) {
     preparationError('QBO_STATE_DRIFT', 'Prepared Purchase totals do not match its split lines.');
   }
-  const holdingTotal = safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
+  const holdingGross = purchaseHoldingGrossCents(current, holdingLineIndexes);
+  const holdingTotal = staged.taxDisposition === 'set'
+    || (
+      staged.taxDisposition === 'preserve_current'
+      && staged.taxCalculation === current.globalTaxCalculation
+      && (current.globalTaxCalculation === 'TaxInclusive' || current.globalTaxCalculation === 'TaxExcluded')
+      && holdingGross !== null
+    )
+    ? holdingGross
+    : safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
+  if (holdingTotal === null) {
+    preparationError('QBO_STATE_DRIFT', 'Purchase holding-account gross could not be proven.');
+  }
   if (holdingTotal !== staged.totals.totalCents) {
     preparationError('QBO_STATE_DRIFT', 'Prepared Purchase total changed from the holding-account amount.');
   }
@@ -1125,6 +1304,87 @@ export function preparePurchaseRecategorization(args: {
   }
   assertStagedAmounts(args.staged, current, holdingLineIndexes);
 
+  if (args.staged.taxDisposition === 'preserve_current') {
+    if (
+      args.staged.taxCalculation !== current.globalTaxCalculation
+      || holdingLineIndexes.length !== 1
+      || args.staged.lines.length !== 1
+      || args.staged.tagIds.length !== 0
+      || typeof args.before.preservedHash !== 'string'
+      || args.before.lines.some(
+        (line) => typeof line.rawHash !== 'string' || typeof line.categoryOnlyHash !== 'string',
+      )
+    ) {
+      preparationError(
+        'QBO_PURCHASE_UNSUPPORTED',
+        'Preserve-current requires one Purchase holding line with the exact source tax mode.',
+      );
+    }
+    const targetIndex = holdingLineIndexes[0]!;
+    const sourceRawLine = args.current.Line![targetIndex]!;
+    const sourceSnapshotLine = current.lines[targetIndex]!;
+    const stagedLine = args.staged.lines[0]!;
+    const targetAccountQboId = requiredIdentity(
+      stagedLine.categoryQboId,
+      'category account reference',
+    );
+    const expectedTaxCodeQboId = requiredIdentity(
+      stagedLine.taxCodeQboId,
+      'source tax code reference',
+    );
+    requiredIdentity(sourceRawLine.Id, 'holding line identity');
+    const sourceGrossCents = current.globalTaxCalculation === 'TaxInclusive'
+      ? sourceSnapshotLine.taxInclusiveCents ?? sourceSnapshotLine.amountCents
+      : current.globalTaxCalculation === 'TaxExcluded' && sourceSnapshotLine.taxAmountCents !== null
+        ? safeCentSum([sourceSnapshotLine.amountCents, sourceSnapshotLine.taxAmountCents])
+        : sourceSnapshotLine.amountCents;
+    if (
+      sourceRawLine.DetailType !== 'AccountBasedExpenseLineDetail'
+      || sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef === undefined
+      || sourceSnapshotLine.taxCodeQboId !== expectedTaxCodeQboId
+      || sourceGrossCents !== stagedLine.totalCents
+      || stagedLine.memo !== null
+      || (stagedLine.tagIds?.length ?? 0) !== 0
+    ) {
+      preparationError(
+        'QBO_STATE_DRIFT',
+        'Preserve-current Purchase source facts do not match the staged precondition.',
+      );
+    }
+
+    const body = normalizedClone(args.current);
+    const targetDetail = body.Line![targetIndex]!.AccountBasedExpenseLineDetail!;
+    targetDetail.AccountRef = {
+      ...targetDetail.AccountRef!,
+      value: targetAccountQboId,
+    };
+    const targetSnapshotLine = snapshotLine(
+      body.Line![targetIndex]!,
+      purchaseSign(body),
+      body.GlobalTaxCalculation,
+    );
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: current.qboId,
+      requestId: args.requestId,
+      requestHash: requestHash(body),
+      body,
+      before: normalizedClone(current),
+      expected: {
+        ...expectedBase(
+          current,
+          current.globalTaxCalculation,
+          current.totalTaxCents,
+        ),
+        taxDisposition: 'preserve_current',
+        targetLines: [targetSnapshotLine],
+        untouchedLineHashes: keptSnapshotLines.map(canonicalSnapshotLine),
+      },
+    };
+    return deepFreeze(prepared);
+  }
+
   const keptTaxBearing = keptSnapshotLines.some(
     (line) =>
       line.taxCodeQboId !== null ||
@@ -1140,9 +1400,78 @@ export function preparePurchaseRecategorization(args: {
       'Purchase tax mode cannot change while untouched tax-bearing lines remain.',
     );
   }
-  const newRawLines = args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
-  const newSnapshotLines = args.staged.lines.map((line) =>
-    stagedLineToSnapshot(line, args.staged.taxCalculation));
+  const sourceRawLine = holdingLineIndexes.length === 1
+    ? args.current.Line![holdingLineIndexes[0]!]!
+    : null;
+  const sourceSnapshotLine = holdingLineIndexes.length === 1
+    ? current.lines[holdingLineIndexes[0]!]!
+    : null;
+  const stagedLine = args.staged.lines.length === 1 ? args.staged.lines[0]! : null;
+  const hasOneToOneSource =
+    sourceRawLine !== null
+    && sourceSnapshotLine !== null
+    && stagedLine !== null
+    && sourceRawLine.DetailType === 'AccountBasedExpenseLineDetail'
+    && sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef !== undefined
+    && args.staged.taxCalculation === current.globalTaxCalculation;
+  const canPreserveOneToOneSourceExactly =
+    hasOneToOneSource
+    && sourceSnapshotLine.amountCents === stagedLine.subtotalCents
+    && sourceSnapshotLine.taxCodeQboId === stagedLine.taxCodeQboId
+    && (
+      sourceSnapshotLine.taxAmountCents === stagedLine.taxCents
+      || (
+        zeroOrUnspecifiedTax(sourceSnapshotLine.taxAmountCents)
+        && stagedLine.taxCents === 0
+      )
+    )
+    && (
+      args.staged.taxCalculation !== 'TaxInclusive'
+      || sourceSnapshotLine.taxInclusiveCents === stagedLine.totalCents
+    );
+  const canPreserveOneToOneMetadata =
+    hasOneToOneSource;
+  const newRawLines = canPreserveOneToOneSourceExactly
+    ? [(() => {
+        const cloned = normalizedClone(sourceRawLine);
+        const detail = cloned.AccountBasedExpenseLineDetail!;
+        detail.AccountRef = {
+          ...detail.AccountRef!,
+          value: requiredIdentity(stagedLine.categoryQboId, 'category account reference'),
+        };
+        if (stagedLine.memo !== null) cloned.Description = stagedLine.memo;
+        return cloned;
+      })()]
+    : canPreserveOneToOneMetadata
+      ? [(() => {
+          const stagedRaw = stagedLineToRaw(stagedLine, args.staged.taxCalculation);
+          const sourceDetail = sourceRawLine.AccountBasedExpenseLineDetail!;
+          const stagedDetail = stagedRaw.AccountBasedExpenseLineDetail!;
+          if (sourceRawLine.Id !== undefined) stagedRaw.Id = sourceRawLine.Id;
+          if (stagedLine.memo !== null) {
+            stagedRaw.Description = stagedLine.memo;
+          } else if (sourceRawLine.Description !== undefined) {
+            stagedRaw.Description = sourceRawLine.Description;
+          }
+          if (sourceRawLine.CustomField !== undefined) {
+            stagedRaw.CustomField = normalizedClone(sourceRawLine.CustomField);
+          }
+          if (sourceDetail.BillableStatus !== undefined) {
+            stagedDetail.BillableStatus = sourceDetail.BillableStatus;
+          }
+          if (sourceDetail.CustomerRef !== undefined) {
+            stagedDetail.CustomerRef = normalizedClone(sourceDetail.CustomerRef);
+          }
+          if (sourceDetail.ClassRef !== undefined) {
+            stagedDetail.ClassRef = normalizedClone(sourceDetail.ClassRef);
+          }
+          return stagedRaw;
+        })()]
+    : args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
+  const newSnapshotLines = canPreserveOneToOneSourceExactly || canPreserveOneToOneMetadata
+    ? [snapshotLine(newRawLines[0]!, purchaseSign(args.current), args.current.GlobalTaxCalculation)]
+    : args.staged.lines.map((line) =>
+        stagedLineToSnapshot(line, args.staged.taxCalculation));
   const provenTaxCents = (
     line: QboPurchaseSnapshot['lines'][number],
   ): number | null =>
@@ -1194,7 +1523,7 @@ export function preparePurchaseRecategorization(args: {
     requestId: args.requestId,
     requestHash: requestHash(body),
     body,
-    before: normalizedClone(args.before),
+    before: normalizedClone(current),
     expected: {
       ...expectedBase(current, args.staged.taxCalculation, totalTaxCents),
       targetLines: newSnapshotLines,
@@ -1220,6 +1549,13 @@ function assertExpectedCurrent(
       expected.totalTaxCents,
       actual.totalTaxCents,
     )
+    || (
+      expected.taxDisposition === 'preserve_current'
+      && (
+        typeof expected.preservedHash !== 'string'
+        || expected.preservedHash !== actual.preservedHash
+      )
+    )
   ) {
     return preparationError('QBO_STATE_DRIFT', 'Purchase fields drifted before restore preparation.');
   }
@@ -1242,6 +1578,7 @@ function assertExpectedCurrent(
         actual.totalTaxCents,
         target,
         line,
+        expected.taxDisposition,
       ));
     if (index === -1) {
       return preparationError('QBO_STATE_DRIFT', 'Prepared Purchase target line drifted before restore.');
@@ -1321,6 +1658,51 @@ export function preparePurchaseRestore(args: {
   const current = snapshotFromRaw(args.current);
   const targetIndexes = new Set(assertExpectedCurrent(args.prepared.expected, current));
   const targetsBefore = beforeTargetLines(args.prepared);
+  if (args.prepared.expected.taxDisposition === 'preserve_current') {
+    if (targetIndexes.size !== 1 || targetsBefore.length !== 1) {
+      preparationError(
+        'QBO_PURCHASE_UNSUPPORTED',
+        'Preserve-current restore requires exactly one identified target line.',
+      );
+    }
+    const [targetIndex] = targetIndexes;
+    const sourceAccountQboId = requiredIdentity(
+      targetsBefore[0]!.accountQboId,
+      'restore account reference',
+    );
+    const body = normalizedClone(args.current);
+    const targetDetail = body.Line![targetIndex!]!.AccountBasedExpenseLineDetail;
+    if (targetDetail?.AccountRef === undefined) {
+      preparationError('QBO_STATE_DRIFT', 'Restore target lost its category account reference.');
+    }
+    targetDetail.AccountRef = {
+      ...targetDetail.AccountRef,
+      value: sourceAccountQboId,
+    };
+    const restored = snapshotFromRaw(body);
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'restore',
+      qboType: 'Purchase',
+      qboId: current.qboId,
+      requestId: args.requestId,
+      requestHash: requestHash(body),
+      body,
+      before: normalizedClone(current),
+      expected: {
+        ...expectedBase(
+          args.prepared.before,
+          args.prepared.before.globalTaxCalculation,
+          args.prepared.before.totalTaxCents,
+        ),
+        taxDisposition: 'preserve_current',
+        targetLines: [restored.lines[targetIndex!]!],
+        untouchedLineHashes: current.lines
+          .filter((_line, index) => index !== targetIndex)
+          .map(canonicalSnapshotLine),
+      },
+    };
+    return deepFreeze(prepared);
+  }
   const keptRaw = args.current.Line!.filter((_line, index) => !targetIndexes.has(index));
   const keptSnapshot = current.lines.filter((_line, index) => !targetIndexes.has(index));
   const restoredLines = restoreLinesInBeforeOrder(args.prepared.before, keptRaw, keptSnapshot);

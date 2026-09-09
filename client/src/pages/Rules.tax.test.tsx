@@ -1,4 +1,6 @@
 import { render, screen } from '@testing-library/react';
+import { createElement } from 'react';
+import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -33,44 +35,47 @@ vi.mock('../state/AppContext', () => ({
       salesTaxCodes: [],
     },
     toast: mocks.toast,
+    activeCompany: { id: 'COMPANY_GENERIC', holdingAccountIds: [] },
   }),
 }));
 
 vi.mock('../lib/api', () => ({
+  createCategorizationRequestId: vi.fn(() => '99999999-9999-4999-8999-999999999999'),
+  ruleOperations: { prepare: vi.fn(), commit: vi.fn() },
   rules: {
-    list: mocks.list,
-    create: vi.fn(),
-    patch: vi.fn(),
-    del: vi.fn(),
-    reorder: vi.fn(),
+    lifecycle: mocks.list,
+
     test: vi.fn(),
   },
   ruleCandidates: {
     list: vi.fn().mockResolvedValue({ candidates: [], nextCursor: null }),
-    activate: vi.fn(),
-    dismiss: vi.fn(),
   },
+}));
+
+vi.mock('react-router-dom', () => ({
+  Link: ({ to, children, ...props }: { to: string; children: ReactNode } & AnchorHTMLAttributes<HTMLAnchorElement>) =>
+    createElement('a', { href: to, ...props }, children),
 }));
 
 import Rules from './Rules';
 
 describe('Rules historical tax validation', () => {
   it('shows an invalid stored tax reference instead of silently applying it', async () => {
-    mocks.list.mockResolvedValue([{
-      id: 'RULE_GENERIC',
-      companyId: 'COMPANY_GENERIC',
-      priority: 0,
-      matchField: 'payee',
-      matchText: 'Generic supplier',
-      category: 'Generic expense',
-      categoryQboId: 'EXPENSE_ACCOUNT',
-      taxCalculation: 'TaxInclusive',
-      taxCode: 'Historical purchase tax',
-      taxCodeQboId: 'TAX_CODE_HISTORICAL',
-      tagIds: [],
-      autoPost: false,
-      createdAt: '2026-07-28T00:00:00.000Z',
-    }]);
+    mocks.list.mockResolvedValue({ runtimeMode: 'canonical', items: [{
+      state: 'disabled',
+      reviewRequiredAt: null,
+      reviewReason: null,
+      repairReason: 'Tax reference unavailable: Historical purchase tax.',
+      revision: {
+        id: 'REVISION_GENERIC', ruleId: 'RULE_GENERIC', companyId: 'COMPANY_GENERIC',
+        revision: 2, state: 'enabled', condition: { matchField: 'payee', matchText: 'Generic supplier' },
+        direction: 'Purchase', action: null, taxCodeName: 'Historical purchase tax',
+        autoPost: false, originIntent: null, sourceCaseId: null,
+        sourceCandidateId: null, changedBy: null, createdAt: '2026-07-28T00:00:00.000Z',
+        repairReason: 'Tax reference unavailable: Historical purchase tax.', affectedJournalEntryCount: 0, valid: false,
+        invalidReasons: ['Tax reference unavailable: Historical purchase tax.'],
+      },
+    }], nextCursor: null });
 
     render(<Rules />);
 

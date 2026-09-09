@@ -120,6 +120,42 @@ function undoOperation(
   });
 }
 
+function taxRefundOperation(
+  overrides: Partial<McpOperationRecord> = {},
+): McpOperationRecord {
+  return operation({
+    toolName: 'prepare_tax_refund',
+    kind: 'tax_refund',
+    idempotencyKey: 'example-refund',
+    qboType: 'Deposit',
+    qboId: 'TEST-DEPOSIT-1',
+    qboSyncToken: '0',
+    sourceRevision: 0,
+    preparedRevision: 0,
+    payload: {
+      capability: 'manual_required',
+      preview: {
+        action: 'record_gst_hst_refund',
+        operatorPath: 'Sales Tax > Filed > Record refund',
+        sourceDepositQboId: 'TEST-DEPOSIT-1',
+        taxAgencyQboId: 'CRA',
+        filedReturnRef: '2025-Q4',
+        filingEvidenceSha256: 'a'.repeat(64),
+        suspenseAccountQboId: '55',
+        bankAccountQboId: 'BANK-1',
+        refundDate: '2026-01-15',
+        principalCents: 123_456,
+        interestCents: 0,
+        interestAccountQboId: null,
+        totalBankCreditCents: 123_456,
+        existingDepositTreatment: 'replace_or_match_before_verification',
+      },
+      warnings: [],
+    },
+    ...overrides,
+  });
+}
+
 function fixture(status: string | null = null) {
   const operations = [operation()];
   const attempts: Array<{
@@ -328,7 +364,7 @@ function undoFixture(status: string | null = null) {
         ) ?? null
   ));
   value.transactionStatus.value = status === 'VERIFIED'
-    ? 'REVERTED'
+    ? 'PENDING'
     : status === 'UNCERTAIN'
       ? 'ERROR'
       : 'POSTED';
@@ -389,13 +425,13 @@ function undoFixture(status: string | null = null) {
       errorCode: null,
       errorMessage: null,
     });
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: target.id,
       ok: true,
-      status: 'REVERTED' as const,
+      status: 'PENDING' as const,
       outcome: 'VERIFIED' as const,
     };
   });
@@ -407,13 +443,13 @@ function undoFixture(status: string | null = null) {
       status: 'REVERTED',
       newSyncToken: '9',
     };
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: value.operations[0]!.id,
       ok: true,
-      status: 'REVERTED',
+      status: 'PENDING',
       outcome: 'VERIFIED',
     };
   });
@@ -453,6 +489,113 @@ describe('MCP attachment operation dispatch', () => {
       },
     };
   }
+
+  it('projects a manual tax refund without offering commit or retry', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'awaiting_commit',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
+  });
+
+  it('hides another creator manual refund from an authorized company categorizer', async () => {
+    const value = fixture();
+    const foreign = taxRefundOperation({ userId: 'other-company-member' });
+    value.operations.splice(0, 1, foreign);
+    await expect(getMcpOperation(principal, { operationId: foreign.id }, value.deps))
+      .rejects.toMatchObject({ code: 'OPERATION_NOT_FOUND' });
+    expect(value.commit).not.toHaveBeenCalled();
+  });
+
+  it('keeps a manual refund visible after the creating MCP token rotates', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      tokenId: 'retired-token',
+      tokenPrefix: 'rct_retired',
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      error: { code: 'MANUAL_QBO_TAX_REFUND_REQUIRED' },
+    });
+  });
+
+  it('preserves a disconnected-company error when reading a manual refund', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+    vi.mocked(value.deps.store!.company.findUnique).mockResolvedValue({
+      disconnectedAt: new Date('2026-09-04T22:00:00.000Z'),
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+  });
+
+  it('projects an acknowledged manual refund as awaiting verification, not another QBO action', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      manualRecordedAt: new Date('2026-09-04T22:06:00.000Z'),
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_VERIFICATION_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+  });
+
+  it('rejects a hash-valid but incomplete tax refund envelope', async () => {
+    const value = fixture();
+    const payload = structuredClone(taxRefundOperation().payload) as Record<string, any>;
+    delete payload.preview.filingEvidenceSha256;
+    value.operations.splice(0, 1, taxRefundOperation({ payload }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
+  });
 
   it('falls back only to an operation owned by the exact MCP actor key', async () => {
     const value = fixture();
@@ -516,6 +659,178 @@ describe('MCP attachment operation dispatch', () => {
 });
 
 describe('MCP categorization operation execution', () => {
+  it('returns an unchanged retry child after reconciliation without creating another child', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'UNCHANGED';
+      value.attempts[1]!.verification = {
+        outcome: 'UNCHANGED',
+        status: 'PENDING',
+      };
+      value.transactionStatus.value = 'PENDING';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'PENDING',
+        outcome: 'UNCHANGED',
+      };
+    });
+
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'retryable',
+      phase: 'write_unchanged',
+      actions: { canRetry: false },
+    });
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
+  it('reads and resumes the existing retry child when called with the root id', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'VERIFIED';
+      value.attempts[1]!.responseSnapshot = {};
+      value.attempts[1]!.verification = {
+        outcome: 'VERIFIED',
+        status: 'POSTED',
+        newSyncToken: '8',
+      };
+      value.transactionStatus.value = 'POSTED';
+      value.transactionSync.value = '8';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'POSTED',
+        outcome: 'VERIFIED',
+      };
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'committed',
+      phase: 'verified',
+    });
+    expect(value.reconcile).toHaveBeenCalledOnce();
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
+  it('projects a deterministic provider rejection as terminal and non-retryable', async () => {
+    const value = fixture('REJECTED');
+    value.attempts[0]!.verification = {
+      outcome: 'REJECTED',
+      status: 'PENDING',
+    };
+    value.attempts[0]!.errorCode = 'QBO_WRITE_REJECTED';
+    value.attempts[0]!.errorMessage = 'private provider detail';
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      state: 'rejected',
+      phase: 'write_rejected',
+      result: { outcome: 'REJECTED', status: 'PENDING' },
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction.',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: false,
+      },
+    });
+    await expect(commitMcpCategorization(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    expect(value.commit).not.toHaveBeenCalled();
+    expect(value.reconcile).not.toHaveBeenCalled();
+    expect(JSON.stringify(await getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    ))).not.toContain('private provider detail');
+  });
+
   it('routes transfer status and retry through the shared paired-operation adapter', async () => {
     const f = fixture();
     f.operations[0] = operation({
@@ -633,7 +948,9 @@ describe('MCP categorization operation execution', () => {
       companyId: 'company-1',
       expectedRevision: 2,
       requestId: 'operation-1',
-      expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      // Exact pre-taxDisposition digest of the stored legacy preview.
+      expectedStageHash: '9982f5f56cf0ed8452a80cfbf707e92c099d1a67c2cd7651002e91d0c3e5d08b',
+      expectedTaxDisposition: 'set',
       expectedQboBinding: {
         qboType: 'Purchase',
         qboId: 'qbo-private',
@@ -645,6 +962,43 @@ describe('MCP categorization operation execution', () => {
         tokenId: 'token-1',
         tokenPrefix: 'rct_example',
       },
+    }));
+  });
+
+  it('binds a preserve-current commit to its immutable tax disposition', async () => {
+    const { deps, commit, operations } = fixture();
+    const payload = operations[0]!.payload as {
+      preview: {
+        taxDisposition?: 'set' | 'preserve_current';
+        lines: Array<{ taxCodeQboId: string | null }>;
+      };
+    };
+    payload.preview.taxDisposition = 'preserve_current';
+    payload.preview.lines[0]!.taxCodeQboId = 'NON';
+    operations[0]!.payloadHash = hashOperationPayload(operations[0]!.payload);
+    operations[0]!.inputHash = hashOperationPayload({
+      tokenId: operations[0]!.tokenId,
+      tokenPrefix: operations[0]!.tokenPrefix,
+      userId: operations[0]!.userId,
+      companyId: operations[0]!.companyId,
+      transactionId: operations[0]!.transactionId,
+      toolName: operations[0]!.toolName,
+      kind: operations[0]!.kind,
+      idempotencyKey: operations[0]!.idempotencyKey,
+      payloadHash: operations[0]!.payloadHash,
+      sourceRevision: operations[0]!.sourceRevision,
+      preparedRevision: operations[0]!.preparedRevision,
+      qboType: operations[0]!.qboType,
+      qboId: operations[0]!.qboId,
+      qboSyncToken: operations[0]!.qboSyncToken,
+      retryOfId: operations[0]!.retryOfId,
+    });
+
+    await commitMcpCategorization(principal, { operationId: 'operation-1' }, deps);
+
+    expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     }));
   });
 
@@ -762,6 +1116,7 @@ describe('MCP categorization operation execution', () => {
       expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
         requestId: 'operation-1',
         expectedStageHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        expectedTaxDisposition: 'set',
         expectedQboBinding: {
           qboType: 'Purchase',
           qboId: 'qbo-private',
@@ -1014,6 +1369,40 @@ describe('MCP categorization operation execution', () => {
 });
 
 describe('MCP undo operation execution', () => {
+  it('accepts only restore POSTED→REVERTED evidence with a PENDING queue state', async () => {
+    const verified = undoFixture('VERIFIED');
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      verified.deps,
+    )).resolves.toMatchObject({
+      kind: 'undo',
+      state: 'committed',
+      result: { outcome: 'VERIFIED', status: 'PENDING' },
+    });
+
+    verified.attempts[0]!.operation = 'recategorize';
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      verified.deps,
+    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
+
+    const dryRun = undoFixture('DRY_RUN');
+    dryRun.attempts[0]!.verification = {
+      outcome: 'DRY_RUN',
+      status: 'DRY_RUN',
+    };
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      dryRun.deps,
+    )).resolves.toMatchObject({
+      state: 'reconciliation_required',
+      phase: 'corrupt',
+    });
+  });
+
   it('projects an unattempted undo as a redacted prepared operation', async () => {
     const { deps } = undoFixture();
 
@@ -1104,7 +1493,7 @@ describe('MCP undo operation execution', () => {
         kind: 'undo',
         state: 'committed',
         phase: 'verified',
-        result: { outcome: 'VERIFIED', status: 'REVERTED' },
+        result: { outcome: 'VERIFIED', status: 'PENDING' },
       });
       expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
         requestId: 'operation-1',
@@ -1128,39 +1517,7 @@ describe('MCP undo operation execution', () => {
     },
   );
 
-  it('accepts only restore POSTED→REVERTED verified evidence for undo', async () => {
-    const verified = undoFixture('VERIFIED');
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      verified.deps,
-    )).resolves.toMatchObject({
-      kind: 'undo',
-      state: 'committed',
-      result: { outcome: 'VERIFIED', status: 'REVERTED' },
-    });
 
-    verified.attempts[0]!.operation = 'recategorize';
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      verified.deps,
-    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
-
-    const dryRun = undoFixture('DRY_RUN');
-    dryRun.attempts[0]!.verification = {
-      outcome: 'DRY_RUN',
-      status: 'DRY_RUN',
-    };
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      dryRun.deps,
-    )).resolves.toMatchObject({
-      state: 'reconciliation_required',
-      phase: 'corrupt',
-    });
-  });
 
   it('projects persisted undo evidence as corrupt when restore or current-post hashes differ', async () => {
     const value = undoFixture('VERIFIED');
