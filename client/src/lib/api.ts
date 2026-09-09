@@ -483,12 +483,18 @@ export const auth = {
   session: () => api.get<SessionDto>('/api/session'),
 };
 
+export interface CompanySyncResult {
+  ok: boolean;
+  message: string;
+  lastSyncedAt: string | null;
+}
+
 export const companies = {
   list: () => api.get<CompanyDto[]>('/api/companies'),
   patch: (id: string, body: CompanyPatchBody) => api.patch<CompanyDto>(`/api/companies/${id}`, body),
   attachmentStoragePolicy: (id: string) =>
     api.get<AttachmentStoragePolicyDto>(`/api/companies/${id}/attachment-storage-policy`),
-  sync: (id: string) => api.post<void>(`/api/companies/${id}/sync`),
+  sync: (id: string) => api.post<CompanySyncResult>(`/api/companies/${id}/sync`),
   /** Consent URL for connecting a (new) company — mode=demo → the built-in
    * fake consent page; mode=real → Intuit OAuth (env picks sandbox/production). */
   connectUrl: (params: ConnectUrlParams) =>
