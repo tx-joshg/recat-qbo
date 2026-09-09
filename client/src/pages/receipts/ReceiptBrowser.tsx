@@ -1,3 +1,4 @@
+import { Select } from '../../components/SelectCombobox';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
@@ -13,6 +14,7 @@ import ReceiptFilters from '../../components/receipts/ReceiptFilters';
 import ReceiptDropzone from '../../components/receipts/ReceiptDropzone';
 import type { ReceiptQuickFilter } from '../../components/receipts/ReceiptFilters';
 import ReceiptTable from '../../components/receipts/ReceiptTable';
+import ReceiptSummary from '../../components/receipts/ReceiptSummary';
 import { useApp } from '../../state/AppContext';
 
 export default function ReceiptBrowser() {
@@ -33,6 +35,7 @@ export default function ReceiptBrowser() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [acting, setActing] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [refreshRevision, setRefreshRevision] = useState(0);
   const [advancedFilters, setAdvancedFilters] = useState<ReceiptListParams>({});
   const requestSequence = useRef(0);
   const mutable = role === 'admin' || role === 'categorizer';
@@ -89,20 +92,23 @@ export default function ReceiptBrowser() {
   }, [activeCompanyId, filters, quick.duplicate, toast]);
 
   useEffect(() => {
-    requestSequence.current += 1;
     setRows([]);
     setSelected(new Set());
+  }, [load]);
+
+  useEffect(() => {
+    requestSequence.current += 1;
     void load();
     return () => {
       requestSequence.current += 1;
     };
-  }, [load]);
+  }, [load, refreshRevision]);
 
   const polling = rows.some((receipt) =>
     receipt.status === 'QUEUED' || receipt.status === 'PROCESSING');
   useEffect(() => {
     if (!polling) return;
-    const timer = window.setInterval(() => void load(), 3_000);
+    const timer = window.setInterval(() => setRefreshRevision((value) => value + 1), 3_000);
     return () => window.clearInterval(timer);
   }, [load, polling]);
 
@@ -123,7 +129,7 @@ export default function ReceiptBrowser() {
       const result = await operation();
       toast(`${result.updated} receipt${result.updated === 1 ? '' : 's'} ${label}`);
       setSelected(new Set());
-      await load();
+      setRefreshRevision((value) => value + 1);
     } catch (error) {
       toast(error instanceof Error ? error.message : 'Receipt action failed');
     } finally {
@@ -156,14 +162,38 @@ export default function ReceiptBrowser() {
   }
   const pages = Math.max(1, Math.ceil(total / pageSize));
   return (
-    <main style={{ maxWidth: 1280, margin: '0 auto', padding: '28px clamp(14px,3vw,32px) 80px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <h1 className="page-title" style={{ margin: 0 }}>Receipts</h1>
-        <Link to="/receipts/dashboard" style={{ marginLeft: 'auto', color: 'var(--acc)' }}>
-          Dashboard
-        </Link>
-      </div>
-      <div style={{ margin: '18px 0' }}>
+    <main className="receipt-browser" style={{ maxWidth: 1280, margin: '0 auto', padding: '28px clamp(14px,3vw,32px) 80px' }}>
+      <h1 className="page-title" style={{ margin: 0 }}>Receipts</h1>
+      <ReceiptSummary
+        companyId={activeCompanyId}
+        refreshKey={refreshRevision}
+        toast={toast}
+        uploadSection={(
+          <section className="receipt-section" aria-labelledby="receipt-upload-title">
+            <h2 id="receipt-upload-title" className="receipt-section-title">Add receipts</h2>
+            <ReceiptDropzone
+              disabled={!mutable || uploading}
+              disabledLabel={!mutable
+                ? 'Receipt uploads require categorizer access'
+                : 'Uploading receipts…'}
+              onFiles={(files) => {
+                setUploading(true);
+                receiptApi.upload(activeCompanyId, files, 'WEB_UPLOAD')
+                  .then(() => {
+                    toast(`${files.length} receipt${files.length === 1 ? '' : 's'} queued`);
+                    setRefreshRevision((value) => value + 1);
+                  })
+                  .catch((error: unknown) => {
+                    toast(error instanceof Error ? error.message : 'Receipt upload failed');
+                  })
+                  .finally(() => setUploading(false));
+              }}
+            />
+          </section>
+        )}
+      />
+      <section className="receipt-section receipt-filter-section" aria-labelledby="receipt-filter-title">
+        <h2 id="receipt-filter-title" className="receipt-section-title">Filters</h2>
         <ReceiptFilters
           quickLabel={quick.label}
           search={searchInput}
@@ -181,38 +211,17 @@ export default function ReceiptBrowser() {
             setSelected(new Set());
           }}
         />
-      </div>
-      {mutable && (
-        <details style={{ marginBottom: 16 }}>
-          <summary>Add receipts</summary>
-          <div style={{ marginTop: 10 }}>
-            <ReceiptDropzone
-              disabled={uploading}
-              onFiles={(files) => {
-                setUploading(true);
-                receiptApi.upload(activeCompanyId, files, 'WEB_UPLOAD')
-                  .then(async () => {
-                    toast(`${files.length} receipt${files.length === 1 ? '' : 's'} queued`);
-                    await load();
-                  })
-                  .catch((error: unknown) => {
-                    toast(error instanceof Error ? error.message : 'Receipt upload failed');
-                  })
-                  .finally(() => setUploading(false));
-              }}
-            />
-          </div>
-        </details>
-      )}
+      </section>
       {!quick.duplicate && selectedRows.length > 0 && (
         <div
           role="toolbar"
           aria-label="Selected receipt actions"
-          style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}
+          className="receipt-toolbar receipt-action-toolbar"
         >
           <span style={{ padding: '7px 0' }}>{selectedRows.length} selected</span>
           {mutable && <button
               type="button"
+              className="btn btn-ghost"
               disabled={acting}
               onClick={() => void mutate('approved', () =>
                 receiptApi.batchApprove(activeCompanyId, body))}
@@ -221,6 +230,7 @@ export default function ReceiptBrowser() {
             </button>}
           {mutable && <button
               type="button"
+              className="btn btn-ghost"
               disabled={acting}
               onClick={() => void mutate('queued', () =>
                 receiptApi.batchReprocess(activeCompanyId, {
@@ -230,11 +240,12 @@ export default function ReceiptBrowser() {
             >
               Reprocess selected
             </button>}
-          <button type="button" disabled={acting} onClick={() => void exportSelected()}>
+          <button className="btn btn-ghost" type="button" disabled={acting} onClick={() => void exportSelected()}>
             Export selected
           </button>
           {mutable && <button
             type="button"
+            className="btn btn-ghost"
             disabled={acting}
             onClick={() => void mutate('deleted', () =>
               receiptApi.batchDelete(activeCompanyId, body))}
@@ -265,26 +276,26 @@ export default function ReceiptBrowser() {
           ))}
         </section>
       )}
-      {!quick.duplicate && <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginBottom: 8 }}>
-        <label>
-          Sort
-          <select
-            aria-label="Sort receipts"
+      {!quick.duplicate && <div className="receipt-toolbar receipt-sort-toolbar">
+        <label className="field receipt-sort-field">
+          <span className="field-label">Sort</span>
+          <Select
+            label="Sort receipts"
             value={sortBy}
-            onChange={(event) => {
-              setSortBy(event.target.value as typeof sortBy);
+            onValueChange={(value) => {
+              setSortBy(value as typeof sortBy);
               setPage(1);
             }}
-          >
-            <option value="createdAt">Uploaded</option>
-            <option value="receiptDate">Receipt date</option>
-            <option value="vendorName">Vendor</option>
-            <option value="totalAmount">Total</option>
-            <option value="status">Status</option>
-          </select>
+            options={[{ value: 'createdAt', label: 'Uploaded' },
+              { value: 'receiptDate', label: 'Receipt date' },
+              { value: 'vendorName', label: 'Vendor' },
+              { value: 'totalAmount', label: 'Total' },
+              { value: 'status', label: 'Status' }]}
+          />
         </label>
         <button
           type="button"
+          className="btn btn-ghost"
           aria-label="Toggle sort direction"
           onClick={() => setSortOrder((value) => value === 'asc' ? 'desc' : 'asc')}
         >
@@ -306,12 +317,12 @@ export default function ReceiptBrowser() {
           )}
         />
       </div>}
-      {!quick.duplicate && <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 12, marginTop: 14 }}>
-        <button type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>
+      {!quick.duplicate && <div className="receipt-toolbar receipt-pagination">
+        <button className="btn btn-ghost" type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>
           Previous
         </button>
         <span>Page {page} of {pages}</span>
-        <button type="button" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>
+        <button className="btn btn-ghost" type="button" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>
           Next
         </button>
       </div>}

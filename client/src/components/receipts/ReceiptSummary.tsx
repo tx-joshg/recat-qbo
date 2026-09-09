@@ -1,9 +1,8 @@
+import { Select } from '../SelectCombobox';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import type { ReactNode } from 'react';
 import type { ReceiptStatsDto } from '@recat/shared';
 import { receipts } from '../../lib/api';
-import ReceiptDropzone from '../../components/receipts/ReceiptDropzone';
-import { useApp } from '../../state/AppContext';
 import { readPreference, writePreference } from '../../lib/storage';
 
 type Timeframe = '30' | '90' | 'all';
@@ -26,29 +25,33 @@ function amount(value: string): string {
     : value;
 }
 
-export default function ReceiptDashboard() {
-  const { activeCompanyId, role, toast } = useApp();
+interface ReceiptSummaryProps {
+  companyId: string;
+  refreshKey: number;
+  toast(message: string): void;
+  uploadSection: ReactNode;
+}
+
+export default function ReceiptSummary({
+  companyId,
+  refreshKey,
+  toast,
+  uploadSection,
+}: ReceiptSummaryProps) {
   const [stats, setStats] = useState<ReceiptStatsDto | null>(null);
   const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
   const requestId = useRef(0);
-  const storageKey = activeCompanyId
-    ? `recat_receipt_dashboard_timeframe:${activeCompanyId}`
-    : null;
+  const storageKey = `recat_receipt_dashboard_timeframe:${companyId}`;
   const [timeframe, setTimeframe] = useState<Timeframe>(() => {
-    const value = activeCompanyId
-      ? readPreference(`recat_receipt_dashboard_timeframe:${activeCompanyId}`)
-      : null;
+    const value = readPreference(storageKey);
     return value === '90' || value === 'all' ? value : '30';
   });
-  const mutable = role === 'admin' || role === 'categorizer';
 
   const reload = useCallback(async () => {
-    if (!activeCompanyId) return;
     const sequence = ++requestId.current;
     setLoading(true);
     try {
-      const result = await receipts.stats(activeCompanyId, rangeFor(timeframe));
+      const result = await receipts.stats(companyId, rangeFor(timeframe));
       if (requestId.current === sequence) setStats(result);
     } catch (error) {
       if (requestId.current === sequence) {
@@ -57,34 +60,19 @@ export default function ReceiptDashboard() {
     } finally {
       if (requestId.current === sequence) setLoading(false);
     }
-  }, [activeCompanyId, timeframe, toast]);
+  }, [companyId, timeframe, toast]);
+
+  useEffect(() => {
+    setStats(null);
+  }, [companyId, timeframe]);
 
   useEffect(() => {
     requestId.current += 1;
-    setStats(null);
     void reload();
     return () => {
       requestId.current += 1;
     };
-  }, [reload]);
-
-  const upload = async (files: File[]) => {
-    if (!activeCompanyId || !mutable) return;
-    setUploading(true);
-    try {
-      await receipts.upload(activeCompanyId, files, 'WEB_UPLOAD');
-      toast(`${files.length} receipt${files.length === 1 ? '' : 's'} queued`);
-      await reload();
-    } catch (error) {
-      toast(error instanceof Error ? error.message : 'Receipt upload failed');
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  if (!activeCompanyId) {
-    return <div style={{ padding: 32 }}>Choose a company to view receipts.</div>;
-  }
+  }, [refreshKey, reload]);
 
   const cards = [
     ['Received', stats?.received ?? '—'],
@@ -92,26 +80,22 @@ export default function ReceiptDashboard() {
     ['Queued / processing', stats ? stats.queued + stats.processing : '—'],
     ['Failed', stats?.failed ?? '—'],
   ];
+
   return (
-    <main style={{ maxWidth: 1180, margin: '0 auto', padding: '28px clamp(14px,3vw,32px) 80px' }}>
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-        <h1 className="page-title" style={{ margin: 0 }}>Receipt dashboard</h1>
-        <Link to="/receipts" style={{ marginLeft: 'auto', color: 'var(--acc)' }}>
-          Browse receipts
-        </Link>
-        <select
-          aria-label="Dashboard timeframe"
+    <>
+      <div className="receipt-toolbar receipt-timeframe-toolbar">
+        <Select
+          label="Dashboard timeframe"
           value={timeframe}
-          onChange={(event) => {
-            const next = event.target.value as Timeframe;
+          onValueChange={(value) => {
+            const next = value as Timeframe;
             setTimeframe(next);
-            if (storageKey) writePreference(storageKey, next);
+            writePreference(storageKey, next);
           }}
-        >
-          <option value="30">Last 30 days</option>
-          <option value="90">Last 90 days</option>
-          <option value="all">All time</option>
-        </select>
+          options={[{ value: '30', label: 'Last 30 days' },
+            { value: '90', label: 'Last 90 days' },
+            { value: 'all', label: 'All time' }]}
+        />
       </div>
       <div
         aria-busy={loading}
@@ -134,23 +118,18 @@ export default function ReceiptDashboard() {
           </section>
         ))}
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(280px,1fr))', gap: 14 }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit,minmax(280px,1fr))',
+        gap: 14,
+      }}>
         <section style={{ border: '1px solid var(--bd2)', borderRadius: 10, padding: 18 }}>
           <h2 style={{ fontSize: 16, marginTop: 0 }}>Receipt totals</h2>
           {stats?.totalByCurrency.map((item) => (
             <div key={item.currency}>{item.currency} {amount(item.amount)}</div>
           ))}
-          {!stats?.totalByCurrency.length && <div style={{ color: 'var(--mut)' }}>No totals yet.</div>}
-        </section>
-        <section style={{ border: '1px solid var(--bd2)', borderRadius: 10, padding: 18 }}>
-          <h2 style={{ fontSize: 16, marginTop: 0 }}>Spend by category</h2>
-          {stats?.totalByCategory.map((item) => (
-            <div key={`${item.category}:${item.currency}`}>
-              {item.category} · {item.currency} {amount(item.amount)}
-            </div>
-          ))}
-          {!stats?.totalByCategory.length && (
-            <div style={{ color: 'var(--mut)' }}>No categorized spend yet.</div>
+          {!stats?.totalByCurrency.length && (
+            <div style={{ color: 'var(--mut)' }}>No totals yet.</div>
           )}
         </section>
         <section style={{ border: '1px solid var(--bd2)', borderRadius: 10, padding: 18 }}>
@@ -163,16 +142,7 @@ export default function ReceiptDashboard() {
           </div>
         </section>
       </div>
-      <section style={{ marginTop: 20 }}>
-        <h2 style={{ fontSize: 17 }}>Add receipts</h2>
-        <ReceiptDropzone
-          disabled={!mutable || uploading}
-          disabledLabel={!mutable
-            ? 'Receipt uploads require categorizer access'
-            : 'Uploading receipts…'}
-          onFiles={(files) => void upload(files)}
-        />
-      </section>
+      {uploadSection}
       <section style={{ marginTop: 20 }}>
         <h2 style={{ fontSize: 17 }}>Recent activity</h2>
         {stats?.recentActivity.map((event) => (
@@ -180,8 +150,10 @@ export default function ReceiptDashboard() {
             {event.action.replaceAll('_', ' ')} · {new Date(event.createdAt).toLocaleString()}
           </div>
         ))}
-        {!stats?.recentActivity.length && <div style={{ color: 'var(--mut)' }}>No recent activity.</div>}
+        {!stats?.recentActivity.length && (
+          <div style={{ color: 'var(--mut)' }}>No recent activity.</div>
+        )}
       </section>
-    </main>
+    </>
   );
 }

@@ -1,5 +1,4 @@
 import { useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
 
 const ACCEPTED = new Set([
   'application/pdf',
@@ -38,22 +37,10 @@ export default function ReceiptDropzone({
     onFiles(values);
   };
 
-  const style: CSSProperties = {
-    display: 'block',
-    border: `2px dashed ${dragging ? 'var(--acc)' : 'var(--bd2)'}`,
-    borderRadius: 12,
-    padding: '22px 18px',
-    textAlign: 'center',
-    background: dragging ? 'var(--hl)' : 'var(--card)',
-    color: disabled ? 'var(--fnt)' : 'var(--ink)',
-    cursor: disabled ? 'not-allowed' : 'pointer',
-    opacity: disabled ? 0.65 : 1,
-  };
-
   return (
     <div>
       <label
-        className="receipt-dropzone"
+        className={`receipt-dropzone${dragging ? ' is-dragging' : ''}${disabled ? ' is-disabled' : ''}`}
         aria-label="Drop receipt files"
         role="button"
         tabIndex={disabled ? -1 : 0}
@@ -74,11 +61,11 @@ export default function ReceiptDropzone({
           setDragging(false);
           if (!disabled) accept(event.dataTransfer.files);
         }}
-        style={style}
       >
         <input
           ref={inputRef}
           type="file"
+          className="receipt-file-input"
           multiple
           accept=".pdf,.jpg,.jpeg,.png,.gif,.tif,.tiff"
           disabled={disabled}
@@ -86,18 +73,11 @@ export default function ReceiptDropzone({
             if (event.target.files) accept(event.target.files);
             event.target.value = '';
           }}
-          style={{
-            position: 'absolute',
-            width: 1,
-            height: 1,
-            overflow: 'hidden',
-            clip: 'rect(0 0 0 0)',
-          }}
         />
         {disabled ? disabledLabel : 'Choose receipt files or drop them here'}
       </label>
       {error && (
-        <div role="alert" style={{ color: 'var(--red)', fontSize: 13, marginTop: 6 }}>
+        <div role="alert" className="receipt-dropzone-error">
           {error}
         </div>
       )}
