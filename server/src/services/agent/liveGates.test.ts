@@ -31,6 +31,7 @@ function config(overrides: Partial<LiveGateConfig> = {}): LiveGateConfig {
     verifierModel: 'verifier-model',
     evidenceThreshold: 50,
     configVersion: 'a'.repeat(64),
+    schedulingGeneration: 0,
     liveRequested: false,
     liveAcceptedPolicyVersion: null,
     liveAcceptedConfigVersion: null,
@@ -157,6 +158,24 @@ describe('guarded live autopilot gates', () => {
 
   beforeEach(() => {
     deps = createDeps();
+  });
+
+  it('changes scheduling intent only after a successful transition into live', async () => {
+    await enableLiveMode('company-1', 'Acme Books', { userId: 'synthetic-admin', isAdmin: true }, deps);
+    expect(deps.config.schedulingGeneration).toBe(1);
+    const configVersion = deps.config.configVersion;
+    await enableLiveMode('company-1', 'Acme Books', { userId: 'synthetic-admin', isAdmin: true }, deps);
+    expect(deps.config.schedulingGeneration).toBe(1);
+    deps.config = { ...deps.config, livePausedAt: NOW, livePauseCode: 'MANUAL_PAUSE' };
+    await enableLiveMode('company-1', 'Acme Books', { userId: 'synthetic-admin', isAdmin: true }, deps);
+    expect(deps.config.schedulingGeneration).toBe(2);
+    expect(deps.config.configVersion).toBe(configVersion);
+  });
+
+  it('does not create scheduling intent when live readiness fails', async () => {
+    deps.getWorkerHealth = async () => ({ healthy: false });
+    await enableLiveMode('company-1', 'Acme Books', { userId: 'synthetic-admin', isAdmin: true }, deps);
+    expect(deps.config.schedulingGeneration).toBe(0);
   });
 
   afterEach(() => {

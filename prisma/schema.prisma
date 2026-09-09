@@ -922,6 +922,8 @@ model AgentCompanyConfig {
   dailyLiveWriteLimit         Int       @default(25)
   limits                      Json
   configVersion               String
+  /// Explicit operator scheduling intent; separate from model/evidence identity.
+  schedulingGeneration        Int       @default(0)
   liveRequested               Boolean   @default(false)
   liveAcceptedPolicyVersion   String?
   liveAcceptedConfigVersion   String?
@@ -946,23 +948,24 @@ model LiveWritePermit {
 }
 
 model AgentJob {
-  id             String     @id @default(uuid())
-  companyId      String
-  company        Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  transactionId  String
-  revision       Int
-  configVersion  String
-  status         String
-  dueAt          DateTime
-  lockOwner      String?
-  leaseExpiresAt DateTime?
-  attemptCount   Int        @default(0)
-  lastErrorCode  String?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  runs           AgentRun[]
+  id                   String     @id @default(uuid())
+  companyId            String
+  company              Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId        String
+  revision             Int
+  configVersion        String
+  schedulingGeneration Int        @default(0)
+  status               String
+  dueAt                DateTime
+  lockOwner            String?
+  leaseExpiresAt       DateTime?
+  attemptCount         Int        @default(0)
+  lastErrorCode        String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  runs                 AgentRun[]
 
-  @@unique([companyId, transactionId, revision, configVersion])
+  @@unique([companyId, transactionId, revision, configVersion, schedulingGeneration], map: "AgentJob_scheduling_intent_key")
   @@index([status, dueAt])
 }
 

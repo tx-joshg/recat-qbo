@@ -1179,6 +1179,46 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
     }
   });
 
+  it('denies an old scheduling intent before staging a current revision', async () => {
+    const fixture = await seed({ staged: false });
+    try {
+      await prisma.agentCompanyConfig.update({
+        where: { companyId: fixture.companyId }, data: { schedulingGeneration: { increment: 1 } },
+      });
+      await expect(stageGuardedLiveCategorization({
+        transactionId: fixture.transactionId, companyId: fixture.companyId, expectedRevision: 0,
+        proposal: { taxCalculation: 'NotApplicable', lines: [{
+          grossCents: -1_000, categoryQboId: 'expense-generic', taxCodeQboId: null, tagIds: [],
+        }], tagIds: [] },
+      }, fixture.context, fixture.proof)).rejects.toMatchObject({ code: 'LIVE_AUTHORITY_DENIED' });
+      await expect(prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
+        .resolves.toMatchObject({ revision: 0, taxCalculation: null });
+    } finally { await cleanup(fixture); }
+  });
+
+  it('keeps old PREPARED recovery on its original request but denies a fresh send after new intent', async () => {
+    const fixture = await seed();
+    const claimed = await seedExpiredRecovery(fixture, 'PREPARED');
+    const nextTurn = vi.fn();
+    const send = vi.fn(async () => ({ ok: true as const, newSyncToken: '8' }));
+    const qbo = client(fixture, async () => beforeSnapshot(fixture), send);
+    const factory = vi.spyOn(qboFactory, 'forCompany').mockResolvedValue(qbo);
+    try {
+      await prisma.agentCompanyConfig.update({
+        where: { companyId: fixture.companyId }, data: { schedulingGeneration: { increment: 1 } },
+      });
+      await runProductionClaimedLiveJob(claimed, 'worker-recovery', recoveryModels(nextTurn));
+      expect(nextTurn).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      await expect(prisma.qboMutationAttempt.findMany({ where: { transactionId: fixture.transactionId } }))
+        .resolves.toMatchObject([{ requestId: fixture.jobId }]);
+      await expect(liveWritePermitCount(fixture)).resolves.toBe(0);
+    } finally {
+      factory.mockRestore();
+      await cleanup(fixture);
+    }
+  });
+
   it('rolls back staging when a live configuration pause wins before the fenced authority read', async () => {
       const fixture = await seed({ staged: false });
       const leaseLocked = deferred<void>();

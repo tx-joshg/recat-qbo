@@ -610,6 +610,23 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
     }
   });
 
+  it('rejects a superseded scheduling intent after run start without inference', async () => {
+    const fixture = await seed();
+    try {
+      const decision = model('decision-model');
+      await runClaimedShadowJob(fixture.job, deps(decision, model('review-model'), {
+        afterStarted: async () => {
+          await secondClient.agentCompanyConfig.update({
+            where: { companyId: fixture.companyId }, data: { schedulingGeneration: { increment: 1 } },
+          });
+        },
+      }));
+      expect(decision.nextTurn).not.toHaveBeenCalled();
+      await expect(firstClient.agentRun.findFirstOrThrow({ where: { jobId: fixture.job.id } }))
+        .resolves.toMatchObject({ status: 'failed', errorCode: 'AGENT_SUPERSEDED' });
+    } finally { await cleanup(fixture); }
+  });
+
   it('revalidates after the started run and records stale without inference', async () => {
     const fixture = await seed();
     try {

@@ -36,6 +36,7 @@ function job(id: string, companyId: string): ClaimedAgentJob {
     transactionId: `transaction-${id}`,
     revision: 0,
     configVersion: 'config-v1',
+    schedulingGeneration: 0,
     status: 'running',
     dueAt: NOW,
     lockOwner: 'opaque-worker',

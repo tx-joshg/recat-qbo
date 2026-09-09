@@ -28,6 +28,7 @@ function job(): ClaimedAgentJob {
     transactionId: TRANSACTION_ID,
     revision: 4,
     configVersion: CONFIG_VERSION,
+    schedulingGeneration: 0,
     status: 'running',
     dueAt: now,
     lockOwner: 'worker-generic',
