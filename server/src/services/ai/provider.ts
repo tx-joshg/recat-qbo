@@ -1,13 +1,26 @@
-import { getInstanceSettings } from '../instanceSettings.js';
+import { getInstanceSettings, type InstanceSettings } from '../instanceSettings.js';
+
+export type CategoryProviderSettings = Pick<InstanceSettings,
+  | 'suggestionProvider'
+  | 'suggestionModel'
+  | 'aiEndpoint'
+  | 'aiApiKey'
+  | 'openrouterApiKey'
+  | 'openrouterReferer'
+  | 'openrouterTitle'
+>;
 
 interface ChatCompletionResponse {
   choices?: { message?: { content?: string } }[];
 }
 
 /** Complete the category-only prompt using the active configured provider. */
-export async function completeCategory(prompt: string): Promise<string | null> {
+export async function completeCategory(
+  prompt: string,
+  providerSettings?: CategoryProviderSettings,
+): Promise<string | null> {
   try {
-    const settings = await getInstanceSettings();
+    const settings = providerSettings ?? await getInstanceSettings();
     const openrouter = settings.suggestionProvider === 'openrouter';
     const baseUrl = openrouter ? 'https://openrouter.ai/api/v1' : settings.aiEndpoint;
     if (baseUrl === '') return null;
