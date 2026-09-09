@@ -101,7 +101,10 @@ const SORT_LABELS: Record<SortKey, string> = {
 // The date track holds fmtDate's widest output. That is 'May 28, 2024' (~90px at
 // --rfs 14.5) now that fmtDate appends the year outside the current year — 80px
 // fit the year-less form only and wrapped these onto a second line.
-const GRID_COLS = '38px 96px minmax(180px,1fr) 104px 118px minmax(200px,240px) 110px';
+const GRID_COLS = '38px 96px minmax(180px,1fr) 104px 118px minmax(200px,240px) minmax(270px, 290px)';
+
+// Column minima, six gaps, and horizontal row padding.
+const GRID_MIN_WIDTH = 38 + 96 + 180 + 104 + 118 + 200 + 270 + 6 * 12 + 2 * 18;
 
 const SHORTCUT_TIP =
   '↑↓ or j/k — move between rows · x — select · t — open tags · Enter — post the active row.';
@@ -1719,15 +1722,8 @@ export default function Queue() {
     const isSplit = !!(t.splits && t.splits.length);
     const locked = hasActiveMutation(t);
     return (
-      <span
-        style={{
-          display: 'grid',
-          gridTemplateColumns: isSplit ? '1fr auto' : 'minmax(130px,1fr) minmax(120px,1fr) auto',
-          gap: 6,
-          alignItems: 'end',
-          marginTop: 8,
-        }}
-      >
+      <span className="queue-tax-controls">
+        <span className={`queue-tax-line${isMobile ? ' queue-tax-line-mobile' : ''}`}>
         {!isSplit && (
           <TaxCodePicker
             id={`tax-code-${t.id}`}
@@ -1779,6 +1775,15 @@ export default function Queue() {
             No tax selected
           </span>
         )}
+        {readyStage !== null && (
+          <span className="queue-tax-totals">
+            <span>Subtotal {centsLabel(readyStage.totals.subtotalCents)}</span>
+            <span>Tax {centsLabel(readyStage.totals.taxCents)}</span>
+            <span>Total {centsLabel(readyStage.totals.totalCents)}</span>
+          </span>
+        )}
+        </span>
+        <span className="queue-tax-feedback">
         {!locked && stageBodyFor(t, state) === null && <span style={{ gridColumn: '1 / -1', color: 'var(--amT)', fontSize: 12 }}>
           {t.splits?.length ? 'Open Split to review its categories and tax codes before calculating tax.'
             : 'Choose an available category and tax code before calculating tax.'}
@@ -1804,22 +1809,7 @@ export default function Queue() {
           <button type="button" className="btn-ghost" onClick={(event) => { event.stopPropagation(); stageCoordinatorsRef.current[t.id]?.retry(); }}>Retry calculation</button>
         </span>}
         {state.stage.status === 'conflict' && <span style={{ gridColumn: '1 / -1', color: 'var(--erT)', fontSize: 12 }}>{state.stage.error}</span>}
-        {readyStage !== null && (
-          <span
-            style={{
-              gridColumn: '1 / -1',
-              display: 'flex',
-              gap: 10,
-              color: 'var(--mut)',
-              fontSize: 12,
-              flexWrap: 'wrap',
-            }}
-          >
-            <span>Subtotal {centsLabel(readyStage.totals.subtotalCents)}</span>
-            <span>Tax {centsLabel(readyStage.totals.taxCents)}</span>
-            <span>Total {centsLabel(readyStage.totals.totalCents)}</span>
-          </span>
-        )}
+        </span>
       </span>
     );
   };
@@ -1875,11 +1865,11 @@ export default function Queue() {
     }
     if (mutation?.outcome === 'UNCERTAIN' || mutation?.outcome === 'IN_PROGRESS') {
       return (
-        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, alignItems: 'center' }}>
+        <span className="queue-recovery-content">
           <span style={{ color: 'var(--erT)', fontSize: 12 }}>
             Verify in QuickBooks — outcome uncertain
           </span>
-          <span style={{ display: 'inline-flex', gap: 7 }}>
+          <span className="queue-recovery-actions">
             <button className="btn-ghost" onClick={() => reconcileTax(v.t, false)}>
               Reconcile
             </button>
@@ -2240,7 +2230,7 @@ export default function Queue() {
             overflowX: 'auto',
           }}
         >
-          <div style={{ minWidth: 1020 }}>
+          <div style={{ minWidth: GRID_MIN_WIDTH }}>
             <div
               style={{
                 display: 'grid',
@@ -2466,7 +2456,7 @@ export default function Queue() {
                     )}
 
                   </span>
-                  <span style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
+                  <span className="queue-status-cell" style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
                 </div>
                 {activeCompanyId && attachmentOpenId === t.id && (
                   <AttachmentPanel
@@ -2645,8 +2635,8 @@ export default function Queue() {
                     </a>
                   </span>
                 )}
-                <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
-                  <span style={{ position: 'relative', flex: 1, minWidth: 0 }}>
+                <div className="queue-mobile-actions" style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+                  <span style={{ position: 'relative', flex: '1 1 150px', minWidth: 0 }}>
                     {rowCategoryPicker(v, true)}
 
                   </span>
@@ -2676,7 +2666,7 @@ export default function Queue() {
                       Split
                     </button>
                   )}
-                  <span style={{ flex: 'none', display: 'inline-flex', alignItems: 'center' }}>
+                  <span className="queue-status-cell" style={{ flex: '1 1 240px', maxWidth: '100%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
                     {statusCell(v, true)}
                   </span>
                 </div>

@@ -1922,3 +1922,120 @@ async function expectInFlightChangeRestages(
   expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 5 });
   expect(await screen.findByText(/subtotal/i)).toBeInTheDocument();
 }
+
+describe('Queue tax layout', () => {
+  it('keeps tax controls and server totals ordered and allows wrapping instead of clipping', async () => {
+    const style = installGlobalStyles();
+    document.body.classList.add('rr');
+    try {
+      await renderQueue();
+      await userEvent.setup().click(screen.getByRole('button', { name: /preview tax/i }));
+
+      const taxCode = screen.getByRole('combobox', { name: 'Purchase tax for Generic supplier' });
+      const calculation = screen.getByRole('combobox', {
+        name: 'Tax calculation for Generic supplier',
+      });
+      const subtotal = await screen.findByText('Subtotal −$10.00');
+      const tax = screen.getByText('Tax −$0.50');
+      const total = screen.getByText('Total −$10.50');
+      const taxLine = taxCode.closest('.queue-tax-line');
+
+      expect(taxLine).not.toBeNull();
+      expect(taxLine).toContainElement(calculation);
+      expect(taxLine).toContainElement(subtotal);
+      expect(taxCode.compareDocumentPosition(calculation) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBeTruthy();
+      expect(calculation.compareDocumentPosition(subtotal) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBeTruthy();
+      expect(getComputedStyle(taxLine!).display).toBe('flex');
+      expect(getComputedStyle(taxLine!).flexWrap).toBe('wrap');
+      expect(getComputedStyle(taxLine!).maxWidth).toBe('100%');
+      expect(getComputedStyle(taxLine!).overflowX).not.toBe('auto');
+      expect([subtotal, tax, total].map((label) => getComputedStyle(label).whiteSpace))
+        .toEqual(['nowrap', 'nowrap', 'nowrap']);
+    } finally {
+      document.body.classList.remove('rr');
+      style.remove();
+    }
+  });
+
+  it('stacks the tax line inside a narrow mobile card', async () => {
+    mockMobileMedia();
+    const style = installGlobalStyles();
+    document.body.classList.add('rr');
+    try {
+      await renderQueue();
+
+      const taxCode = screen.getByRole('combobox', { name: 'Purchase tax for Generic supplier' });
+      const taxLine = taxCode.closest<HTMLElement>('.queue-tax-line');
+      expect(taxLine).toHaveClass('queue-tax-line-mobile');
+      expect(document.querySelector('.queue-mobile-actions > span')).toHaveStyle({ flex: '1 1 150px' });
+      expect(getComputedStyle(taxLine!).display).toBe('grid');
+      expect(getComputedStyle(taxLine!).whiteSpace).toBe('normal');
+    } finally {
+      document.body.classList.remove('rr');
+      style.remove();
+    }
+  });
+
+  it('keeps recovery actions on one row in a shrinkable desktop status cell', async () => {
+    mocks.commit.mockResolvedValue(mutation({
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+      error: {
+        code: 'QBO_WRITE_UNCERTAIN',
+        message: 'The write may have succeeded.',
+      },
+    }));
+    const style = installGlobalStyles();
+    document.body.classList.add('rr');
+    try {
+      const user = userEvent.setup();
+      await renderQueue();
+      await user.click(screen.getByRole('button', { name: /preview tax/i }));
+      await user.click(screen.getByRole('button', { name: /^post$/i }));
+
+      const recoveryCopy = await screen.findByText(/verify in quickbooks/i);
+      const statusCell = recoveryCopy.closest<HTMLElement>('.queue-status-cell');
+      const recoveryActions = screen.getByRole('button', { name: /^reconcile$/i })
+        .closest<HTMLElement>('.queue-recovery-actions');
+
+      expect(statusCell).not.toBeNull();
+      expect(recoveryActions).not.toBeNull();
+      expect(statusCell).toContainElement(recoveryActions);
+      expect(getComputedStyle(statusCell!).minWidth).toBe('0px');
+      expect(getComputedStyle(statusCell!).overflowWrap).toBe('anywhere');
+      expect(getComputedStyle(recoveryActions!).flexWrap).toBe('nowrap');
+    } finally {
+      document.body.classList.remove('rr');
+      style.remove();
+    }
+  });
+
+  it('lets the mobile recovery cell take a bounded wrapping row', async () => {
+    mockMobileMedia();
+    mocks.commit.mockResolvedValue(mutation({ ok: false, status: 'ERROR', outcome: 'UNCERTAIN' }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+      await user.click(screen.getByRole('button', { name: /^post$/i }));
+
+    const statusCell = (await screen.findByText(/verify in quickbooks/i))
+      .closest<HTMLElement>('.queue-status-cell');
+    expect(statusCell?.parentElement).toHaveClass('queue-mobile-actions');
+    expect(statusCell).toHaveStyle({ flex: '1 1 240px', maxWidth: '100%' });
+  });
+
+});
+
+function mockMobileMedia() {
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({
+        matches: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    });
+}
