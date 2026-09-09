@@ -1108,14 +1108,15 @@ export class RealQboClient implements QboClient {
   }
 
   private async doRefresh(): Promise<void> {
-    this.tokens = await refreshTokenGrant({
+    const rotated = await refreshTokenGrant({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
       refreshToken: this.tokens.refreshToken,
     });
-    // Persist BEFORE any further API call — losing a rotated refresh token
-    // strands the connection until the admin reconnects.
-    await this.onTokensRefreshed(this.tokens);
+    // A failed persistence/authority check must never leave a usable token in
+    // this client, including for a later call after the failed refresh.
+    await this.onTokensRefreshed(rotated);
+    this.tokens = rotated;
   }
 
   // ---- HTTP ----

@@ -226,6 +226,22 @@ model Company {
   receiptIntakeOperations ReceiptIntakeOperation[]
   receiptCompanyConfig ReceiptCompanyConfig?
   receiptEvents ReceiptEvent[]
+  qboTokenRevocations QboTokenRevocation[]
+}
+
+/// Quarantined disconnect snapshots, never active connection credentials.
+model QboTokenRevocation {
+  id                    String   @id @default(uuid())
+  companyId             String
+  company               Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  realmId               String
+  encryptedRefreshToken String
+  createdAt             DateTime @default(now())
+  leaseOwner            String?
+  leaseExpiresAt        DateTime?
+
+  @@index([companyId])
+  @@index([leaseExpiresAt, createdAt])
 }
 
 model Transaction {
