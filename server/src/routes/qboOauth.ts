@@ -193,6 +193,7 @@ qboOauthRouter.get(
         const pending = await prisma.company.create({
           data: {
             realmId,
+            ruleRuntimeMode: 'canonical',
             legalName: inspected.info.legalName,
             nickname: defaultNickname(inspected.info.legalName),
             env: 'sandbox',
@@ -221,6 +222,7 @@ qboOauthRouter.get(
           data: {
             ...tokenData,
             disconnectedAt: null,
+            qboTokenRevocations: { deleteMany: {} },
             legalName: inspected.info.legalName,
             ...(choice.mode === 'demo' && existing.disconnectedAt !== null
               ? { connectedAt: new Date() }
@@ -232,6 +234,7 @@ qboOauthRouter.get(
         company = await prisma.company.create({
           data: {
             realmId,
+            ruleRuntimeMode: 'canonical',
             legalName: inspected.info.legalName,
             nickname: defaultNickname(inspected.info.legalName),
             env: companyEnv,

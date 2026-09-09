@@ -42,6 +42,7 @@ export interface AgentCompanyConfigRow {
   dailyLiveWriteLimit: number;
   limits: unknown;
   configVersion: string;
+  schedulingGeneration: number;
   liveRequested?: boolean;
   liveAcceptedPolicyVersion?: string | null;
   liveAcceptedConfigVersion?: string | null;
@@ -162,7 +163,11 @@ export async function updateShadowSettings(
     validateConfiguredModels(next, instance);
 
     const configVersion = versionFor(next);
-    const data: AgentCompanyConfigData = { ...next, companyId, configVersion };
+    const data: AgentCompanyConfigData = {
+      ...next, companyId, configVersion,
+      schedulingGeneration: (row?.schedulingGeneration ?? 0)
+        + (current.mode !== 'shadow' && next.mode === 'shadow' ? 1 : 0),
+    };
     const invalidateLiveAcceptance = row?.liveRequested === true && row.configVersion !== configVersion;
     const stored = await db.agentCompanyConfig.upsert({
       where: { companyId },

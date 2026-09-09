@@ -112,6 +112,55 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
+  it('requires the exact literal tax code for preserve-current Purchase verification', () => {
+    const preservedTarget = {
+      ...targetLine,
+      id: 'preserved-target',
+      taxCodeQboId: 'NON',
+      taxAmountCents: null,
+      taxInclusiveCents: null,
+      rawHash: 'exact-target-line',
+      categoryOnlyHash: 'category-only-line',
+    };
+    const preservedExpected: ExpectedPurchaseResult = {
+      ...expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-top-level',
+      targetLines: [preservedTarget],
+      untouchedLineHashes: [],
+    };
+    const preservedActual = {
+      ...actual,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: null,
+      preservedHash: 'preserved-top-level',
+      lines: [{ ...preservedTarget, rawHash: 'provider-normalized-reference-name' }],
+    };
+
+    expect(verifyPurchaseResult(preservedExpected, preservedActual)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{
+        ...preservedActual.lines[0]!,
+        taxCodeQboId: 'PROVIDER_DEFAULT_NON_TAX',
+      }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      preservedHash: 'changed-top-level',
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{
+        ...preservedTarget,
+        rawHash: 'changed-custom-field',
+        categoryOnlyHash: 'changed-non-category-field',
+      }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
   it('accepts omitted redundant tax fields when the inclusive amount proves the exact tax', () => {
     const expectedTarget = {
       ...targetLine,
@@ -162,6 +211,74 @@ describe('verifyPurchaseResult', () => {
       ok: false,
       code: 'QBO_STATE_DRIFT',
     });
+  });
+
+  it('accepts only a one-cent QBO TaxInclusive transaction-tax rounding residual', () => {
+    const roundedExpected: ExpectedPurchaseResult = {
+      ...expected,
+      totalCents: -20_667,
+      totalTaxCents: -2_214,
+      targetLines: [{
+        ...targetLine,
+        amountCents: -18_452,
+        taxAmountCents: -2_214,
+        taxInclusiveCents: -20_666,
+      }],
+      untouchedLineHashes: [],
+    };
+    const qboRoundedReadback = {
+      ...actual,
+      totalCents: -20_667,
+      totalTaxCents: -2_215,
+      lines: [{
+        ...roundedExpected.targetLines[0],
+        id: 'provider-target',
+      }],
+    };
+
+    expect(verifyPurchaseResult(roundedExpected, qboRoundedReadback)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(roundedExpected, {
+      ...qboRoundedReadback,
+      totalTaxCents: -2_216,
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(roundedExpected, {
+      ...qboRoundedReadback,
+      lines: [{ ...qboRoundedReadback.lines[0], taxInclusiveCents: -20_665 }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
+  it('accepts a one-cent QBO TotalAmt residual only when the single inclusive line remains exact', () => {
+    const foreignCurrencyExpected: ExpectedPurchaseResult = {
+      ...expected,
+      totalCents: -20_666,
+      totalTaxCents: -2_214,
+      targetLines: [{
+        ...targetLine,
+        amountCents: -18_452,
+        taxAmountCents: -2_214,
+        taxInclusiveCents: -20_666,
+      }],
+      untouchedLineHashes: [],
+    };
+    const qboRoundedReadback = {
+      ...actual,
+      totalCents: -20_667,
+      totalTaxCents: -2_215,
+      lines: [{
+        ...foreignCurrencyExpected.targetLines[0],
+        id: 'provider-target',
+      }],
+    };
+
+    expect(verifyPurchaseResult(foreignCurrencyExpected, qboRoundedReadback)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(foreignCurrencyExpected, {
+      ...qboRoundedReadback,
+      totalCents: -20_668,
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(foreignCurrencyExpected, {
+      ...qboRoundedReadback,
+      lines: [{ ...qboRoundedReadback.lines[0], taxInclusiveCents: -20_665 }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
   it.each([

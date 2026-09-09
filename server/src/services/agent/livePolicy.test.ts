@@ -544,13 +544,20 @@ describe('evaluateLiveEligibility', () => {
       ...source(),
       rules: [{
         id: '88888888-8888-4888-8888-888888888888',
+        ruleRevision: 1,
         priority: 1,
         matchField: 'payee',
         matchText: 'test',
-        categoryQboId: 'category-a',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: 'tax-a',
-        tagIds: [TAG_A_ID],
+        action: {
+          version: 2,
+          direction: 'Purchase',
+          category: 'Category A',
+          categoryQboId: 'category-a',
+          taxCalculation: 'TaxExcluded',
+          taxCodeQboId: 'tax-a',
+          tagIds: [TAG_A_ID],
+        },
+        autoPost: false,
       }],
     });
     const decision = proposal();

@@ -48,7 +48,7 @@ describe('rule candidate bounded reads', () => {
       autopilotRuleCandidateEvidence: {
         groupBy: vi.fn(async () => [{ source: 'user', _count: { _all: 60 } }]),
       },
-      qboAccount: { findFirst: vi.fn(async () => ({ name: 'Office expense' })) },
+      qboAccount: { findFirst: vi.fn(async () => ({ name: 'Office expense', classification: 'Expenses' })) },
       qboTaxCode: { findFirst: vi.fn(async () => null) },
       tag: { count: vi.fn(async () => 0) },
       agentCompanyConfig: { findUnique: vi.fn(async () => null) },
@@ -56,6 +56,7 @@ describe('rule candidate bounded reads', () => {
         findUnique: vi.fn(async () => ({
           taxSupportStatus: 'needs_setup',
           taxUsingSalesTax: false,
+          ruleRuntimeMode: 'legacy',
         })),
       },
       rule: {

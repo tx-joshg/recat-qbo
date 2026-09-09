@@ -211,15 +211,15 @@ export function verifyAgentDecision(
         const rule = rules.get(evidence.id);
         if (rule === undefined) return rejected('AGENT_EVIDENCE_RULE_INVALID');
         if (
-          rule.taxCalculation !== decision.taxCalculation
+          rule.action.taxCalculation !== decision.taxCalculation
           || !selectedPairs.has(categoryTaxPair(
-            rule.categoryQboId,
-            rule.taxCodeQboId,
+            rule.action.categoryQboId,
+            rule.action.taxCodeQboId,
           ))
         ) {
           return rejected('AGENT_EVIDENCE_RULE_INCONSISTENT');
         }
-        evidencedPairs.add(categoryTaxPair(rule.categoryQboId, rule.taxCodeQboId));
+        evidencedPairs.add(categoryTaxPair(rule.action.categoryQboId, rule.action.taxCodeQboId));
         break;
       }
       case 'similar_transaction': {

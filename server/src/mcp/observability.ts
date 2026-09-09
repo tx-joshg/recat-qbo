@@ -27,6 +27,8 @@ export interface McpToolLogEvent extends McpToolLogContext {
   durationMs: number;
   count: number;
   outcome: 'success' | 'error';
+  errorClass?: string;
+  errorCode?: string;
 }
 
 export type McpToolLogger = (event: McpToolLogEvent) => void;
@@ -73,6 +75,60 @@ function resultCount(value: unknown): number {
     return Math.min((value as { items: unknown[] }).items.length, 100);
   }
   return 1;
+}
+
+// Error properties can come from providers. Accept explicit public identities,
+// never arbitrary strings that merely look like identifiers. Keep these local
+// to avoid importing the service graph into the tracing boundary.
+const PUBLIC_ERROR_CLASSES = new Set([
+  'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError',
+  'URIError', 'EvalError', 'AggregateError', 'HttpError',
+  'QboDepositPreparationError', 'QboPurchasePreparationError', 'PurchaseTaxError',
+  'QboAuthError', 'QboRequestTimeout', 'QboRateLimitError', 'QboAttachmentNotFoundError',
+  'QboAttachmentAdapterError', 'QboWriteSafetyError',
+  'QboHttpNotFoundError', 'QboObjectNotFoundError',
+  'McpSchemaBoundsError', 'InvalidMcpToolOutputError',
+  'CategorizationError', 'McpCategorizationError', 'McpOperationError',
+  'McpOperationExecutionError', 'McpUndoError', 'McpTransferExecutionError',
+  'TransferExecutionError', 'TransferOperationError', 'WritebackLifecycleError',
+  'AttachmentError', 'ReceiptError',
+]);
+
+// Public tool result codes, QBO diagnostics, and schema-bound failure codes.
+// New identities require an explicit addition; unknown codes stay out of logs.
+const PUBLIC_ERROR_CODES = new Set([
+  'FORBIDDEN', 'NOT_FOUND', 'INVALID_INPUT', 'COMPANY_UNAVAILABLE',
+  'QBO_DISCONNECTED', 'RATE_LIMITED', 'QBO_RATE_LIMITED', 'QBO_PERIOD_CLOSED',
+  'QBO_TRANSACTION_LOCKED', 'QBO_WRITE_SAFETY_UNAVAILABLE',
+  'QBO_AMOUNT_UNSAFE', 'QBO_DEPOSIT_UNSUPPORTED', 'QBO_PURCHASE_UNSUPPORTED',
+  'QBO_REFERENCE_MISSING', 'QBO_STATE_DRIFT', 'SYNC_TOKEN_CONFLICT',
+  'QBO_AUTH', 'QBO_TIMEOUT', 'QBO_ATTACHMENT_NOT_FOUND',
+  'QBO_ATTACHMENT_INVALID_INPUT', 'QBO_ATTACHMENT_REQUEST_TOO_LARGE',
+  'QBO_ATTACHMENT_RESPONSE_INVALID',
+  'INPUT_BYTES', 'INPUT_DEPTH', 'INPUT_KEYS', 'INPUT_SERIALIZATION',
+  'OUTPUT_BYTES', 'OUTPUT_SERIALIZATION', 'RESPONSE_TOO_LARGE',
+  'SCHEMA_BYTES', 'SCHEMA_DEPTH', 'SCHEMA_KEYS', 'SCHEMA_SUBSCHEMAS',
+  'SCHEMA_SERIALIZATION', 'EXTERNAL_REF', 'INVALID_REF', 'INVALID_SCHEMA',
+  'CYCLIC_VALUE', 'VALIDATION_TIME',
+]);
+
+function internalErrorIdentity(error: unknown): { errorClass: string; errorCode?: string } {
+  try {
+    if (error instanceof Error) {
+      // Read once: even Error instances may have accessor-backed properties.
+      const name = error.name;
+      const code = (error as Error & { code?: unknown }).code;
+      return {
+        errorClass: PUBLIC_ERROR_CLASSES.has(name) ? name : 'UnknownError',
+        ...(typeof code === 'string' && PUBLIC_ERROR_CODES.has(code)
+          ? { errorCode: code }
+          : {}),
+      };
+    }
+  } catch {
+    // Diagnostic inspection must not replace the original thrown value.
+  }
+  return { errorClass: 'UnknownError' };
 }
 
 function loggedTokenPrefix(
@@ -174,6 +230,7 @@ export async function observeMcpToolCall<T>(
       durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
       count: 0,
       outcome: 'error',
+      ...internalErrorIdentity(error),
     });
     throw error;
   } finally {

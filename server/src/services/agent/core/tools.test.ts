@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildAgentSnapshot, type AgentSnapshotSource } from './snapshot.js';
 import {
   AgentToolError,
@@ -36,13 +36,20 @@ function sourceWithManyItems(): AgentSnapshotSource {
     tags: [{ id: TAG_ID, name: 'Project' }],
     rules: categories.map((category, index) => ({
       id: uuid(index + 1),
+      ruleRevision: 1,
       priority: index + 1,
       matchField: 'payee' as const,
       matchText: `Merchant ${String(index + 1).padStart(2, '0')}`,
-      categoryQboId: category.qboId,
-      taxCalculation: 'NotApplicable' as const,
-      taxCodeQboId: null,
-      tagIds: [TAG_ID],
+      action: {
+        version: 2 as const,
+        direction: 'Purchase' as const,
+        category: category.name,
+        categoryQboId: category.qboId,
+        taxCalculation: 'NotApplicable' as const,
+        taxCodeQboId: null,
+        tagIds: [TAG_ID],
+      },
+      autoPost: false,
     })),
     similarVerifiedTransactions: categories.map((_category, index) => ({
       transactionId: uuid(index + 31),
@@ -81,8 +88,11 @@ function sourceWithTaxCodes(): AgentSnapshotSource {
     },
     rules: source.rules.slice(0, 2).map((rule) => ({
       ...rule,
-      taxCalculation: 'TaxExcluded',
-      taxCodeQboId: 'tax-01',
+      action: {
+        ...rule.action,
+        taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'tax-01',
+      },
     })),
     similarVerifiedTransactions: source.similarVerifiedTransactions.slice(0, 2).map((transaction) => ({
       ...transaction,
@@ -98,6 +108,34 @@ function expectSafeToolError(error: unknown, code: AgentToolError['code'], secre
   if (secret !== undefined) expect((error as Error).message).not.toContain(secret);
 }
 
+function conflictingCandidate(conflictingEvidenceCount: number) {
+  return {
+    id: 'rule_candidate:candidate-1', sourceId: 'candidate-1', kind: 'rule_candidate' as const,
+    companyId: 'company-a', companyName: 'Company A', companyRelation: 'current' as const,
+    executable: false, advisory: true, matchedIn: ['candidate' as const], score: 0.5,
+    vendorIdentityId: null, vendorName: 'Example merchant',
+    action: {
+      categoryQboId: 'category-01', taxCalculation: 'NotApplicable' as const,
+      taxCodeQboId: null, tagIds: [],
+    },
+    actionSummary: {
+      categoryName: 'Expense 01', taxCalculation: 'NotApplicable' as const,
+      taxCodeName: null, tagNames: [],
+    },
+    originIntent: 'auto_candidate' as const, evidenceCount: 5, conflictingEvidenceCount,
+    conflicts: [{
+      id: 'conflict-1', companyId: 'company-a', sourceId: 'evidence-1', kind: 'case' as const,
+      reason: 'A bounded returned contradiction.', action: null, actionSummary: null, evidenceCount: 1,
+    }],
+    provenance: {
+      source: 'candidate' as const, sourceId: 'candidate-1', actorId: null,
+      recordedAt: '2026-08-31T00:00:00.000Z',
+    },
+    rationale: null, examples: [], counterexamples: [], jurisdiction: null, currency: null,
+    verifiedAt: null, ruleRevision: null, observation: null,
+  };
+}
+
 describe('createSnapshotTools', () => {
   it('publishes strict OpenAI-compatible function definitions', () => {
     const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()));
@@ -107,11 +145,160 @@ describe('createSnapshotTools', () => {
       'list_tax_codes',
       'list_rules',
       'find_similar_transactions',
+      'search_classification_knowledge',
     ]);
 
     for (const definition of tools.definitions) {
       expectStrictFunctionDefinition(definition);
     }
+  });
+
+  it('routes both similarity names through canonical evidence search with bounded transaction context', async () => {
+    const snapshot = buildAgentSnapshot(sourceWithTaxCodes());
+    const classificationSearch = vi.fn(async (request) => ({
+      query: request.query,
+      companyId: 'company-a',
+      scope: 'current_company' as const,
+      mode: request.mode === 'auto' ? 'lexical' as const : request.mode,
+      requestedMode: request.mode,
+      degraded: request.mode === 'auto',
+      degradedReason: request.mode === 'auto' ? 'embedding_not_configured' as const : null,
+      status: 'no_match' as const,
+      noMatch: true,
+      hits: [],
+      total: 0,
+    }));
+    const tools = createSnapshotTools(snapshot, { classificationSearch });
+
+    const legacy = await tools.call('find_similar_transactions', { query: 'Coffee', limit: 5 });
+    const explicit = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'lexical', limit: 5,
+    });
+
+    expect(legacy).toMatchObject({
+      items: [],
+      search: {
+        requestedMode: 'auto', mode: 'lexical', degraded: true, noMatch: true,
+        context: {
+          transactionDirection: 'out', qboType: null, sourceAccountName: null,
+          currency: 'CAD', transactionPeriod: '2026-07', jurisdiction: null, taxStatus: 'ready',
+        },
+      },
+    });
+    expect(explicit).toMatchObject({
+      items: [],
+      search: { requestedMode: 'lexical', mode: 'lexical', degraded: false, noMatch: true },
+    });
+    expect(classificationSearch).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      query: 'Coffee', mode: 'auto', limit: 5,
+      transaction: {
+        transactionId: TRANSACTION_ID,
+        date: '2026-07-20',
+        signedAmountCents: -10000,
+        currency: 'CAD',
+        sourceAccountName: null,
+        payee: 'Example merchant',
+        memo: 'Generic fixture',
+        transactionDirection: 'out',
+        qboType: null,
+        transactionPeriod: '2026-07',
+        jurisdiction: null,
+        taxStatus: 'ready',
+      },
+    }));
+  });
+
+  it('rejects schema-invalid canonical search output without exposing its contents', async () => {
+    const secret = 'PRIVATE_CANONICAL_OUTPUT_SENTINEL';
+    const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => ({ secret }) as never,
+    });
+
+    const error = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'lexical', limit: 5,
+    }).catch((failure: unknown) => failure);
+
+    expectSafeToolError(error, 'AGENT_TOOL_INVALID_OUTPUT', secret);
+  });
+
+  it('accepts aggregate conflict counts above bounded returned conflicts and rejects undercounts', async () => {
+    const result = (conflictingEvidenceCount: number) => ({
+      query: 'merchant', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      hits: [conflictingCandidate(conflictingEvidenceCount)], total: 1,
+    });
+    const accepted = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(3),
+    });
+    await expect(accepted.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).resolves.toMatchObject({
+      items: [{ conflictingEvidenceCount: 3, conflicts: [expect.any(Object)] }],
+    });
+
+    const rejected = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(0),
+    });
+    await expect(rejected.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).rejects.toMatchObject({ code: 'AGENT_TOOL_INVALID_OUTPUT' });
+  });
+
+  it('returns display-only historical observations and rejects executable observation data', async () => {
+    const observation = {
+      ...conflictingCandidate(0),
+      id: 'historical_observation:observation-1', sourceId: 'observation-1',
+      kind: 'historical_observation' as const, matchedIn: ['observation'] as const,
+      action: null, originIntent: null, evidenceCount: 0, conflicts: [],
+      provenance: {
+        source: 'historical_observation' as const, sourceId: 'observation-1', actorId: null,
+        recordedAt: '2026-08-31T00:00:00.000Z',
+      },
+      observation: {
+        sourceTransactionId: TRANSACTION_ID, sourceQboType: 'Purchase' as const, sourceQboId: 'purchase-1',
+        sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED' as const,
+        sourceUpdatedAt: '2026-08-31T00:00:00.000Z', observedAt: '2026-08-31T00:00:00.000Z',
+      },
+    };
+    const result = (item: typeof observation) => ({
+      query: 'merchant', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      hits: [item], total: 1,
+    });
+    const accepted = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(observation),
+    });
+    await expect(accepted.call('find_similar_transactions', {
+      query: 'merchant', limit: 5,
+    })).resolves.toMatchObject({ items: [{ kind: 'historical_observation', executable: false, action: null }] });
+    await expect(accepted.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).resolves.toMatchObject({ items: [{ kind: 'historical_observation', executable: false, action: null }] });
+
+    const rejected = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result({
+        ...observation,
+        action: { categoryQboId: 'category-01', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      }),
+    });
+    await expect(rejected.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).rejects.toMatchObject({ code: 'AGENT_TOOL_INVALID_OUTPUT' });
+  });
+
+  it('reports an unavailable canonical search dependency without relabelling it invalid output', async () => {
+    const secret = 'PRIVATE_CANONICAL_FAILURE_SENTINEL';
+    const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => { throw new Error(secret); },
+    });
+
+    const error = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'semantic', limit: 5,
+    }).catch((failure: unknown) => failure);
+
+    expectSafeToolError(error, 'AGENT_TOOL_UNAVAILABLE', secret);
   });
 
   it('searches categories case-insensitively and caps a caller-requested limit above twenty', async () => {

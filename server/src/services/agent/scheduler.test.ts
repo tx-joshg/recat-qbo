@@ -36,6 +36,7 @@ function job(id: string, companyId: string): ClaimedAgentJob {
     transactionId: `transaction-${id}`,
     revision: 0,
     configVersion: 'config-v1',
+    schedulingGeneration: 0,
     status: 'running',
     dueAt: NOW,
     lockOwner: 'opaque-worker',
@@ -691,6 +692,7 @@ describe('shadow agent scheduler', () => {
   it('uses the existing jobs timer for start, tick, and stop integration', async () => {
     vi.resetModules();
     vi.useFakeTimers();
+    const sweepQboTokenRevocations = vi.fn(async () => undefined);
     const startAgentScheduler = vi.fn();
     const stopAgentScheduler = vi.fn();
     const runAgentTick = vi.fn(async () => undefined);
@@ -710,6 +712,7 @@ describe('shadow agent scheduler', () => {
         company: { findMany: vi.fn(async () => []) },
       },
     }));
+    vi.doMock('../qboTokenRevocation.js', () => ({ sweepQboTokenRevocations }));
     vi.doMock('../audit.js', () => ({ writeAudit: vi.fn() }));
     vi.doMock('../sync.js', () => ({ syncCompany: vi.fn(async () => undefined) }));
     vi.doMock('../../lib/mailer.js', () => ({
@@ -730,9 +733,11 @@ describe('shadow agent scheduler', () => {
     jobsScheduler.startJobs();
     expect(vi.getTimerCount()).toBe(1);
     expect(startAgentScheduler).toHaveBeenCalledOnce();
+    expect(sweepQboTokenRevocations).toHaveBeenCalledOnce();
     expect(runAgentTick).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(runAgentTick).toHaveBeenCalledTimes(2);
+    expect(sweepQboTokenRevocations).toHaveBeenCalledTimes(2);
     expect(runAttachmentCleanup).toHaveBeenCalledTimes(2);
     expect(recoverStuckAttachmentOperations).toHaveBeenCalledTimes(2);
 
@@ -742,6 +747,7 @@ describe('shadow agent scheduler', () => {
     consoleLog.mockRestore();
     vi.useRealTimers();
     vi.doUnmock('../../lib/prisma.js');
+    vi.doUnmock('../qboTokenRevocation.js');
     vi.doUnmock('../audit.js');
     vi.doUnmock('../sync.js');
     vi.doUnmock('../../lib/mailer.js');

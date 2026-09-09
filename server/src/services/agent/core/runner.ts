@@ -24,6 +24,7 @@ import {
 import {
   AgentToolError,
   createSnapshotTools,
+  type AgentToolDependencies,
   type AgentToolCall,
   type AgentToolName,
   type AgentToolRegistry,
@@ -55,6 +56,7 @@ export interface AgentRunnerClock {
 export interface AgentRunDependencies {
   readonly model: AgentModel;
   readonly reviewModel?: AgentModel;
+  readonly classificationSearch?: AgentToolDependencies['classificationSearch'];
   readonly limits?: Partial<AgentLimits>;
   readonly clock?: AgentRunnerClock;
   readonly signal?: AbortSignal;
@@ -243,7 +245,11 @@ export async function runShadowDecision(
     const validatedSnapshot = deepFreeze(
       JSON.parse(serializedSnapshot),
     ) as AgentTransactionSnapshot;
-    const tools = createSnapshotTools(validatedSnapshot);
+    const tools = createSnapshotTools(validatedSnapshot, {
+      ...(deps.classificationSearch === undefined
+        ? {}
+        : { classificationSearch: deps.classificationSearch }),
+    });
     const primary = await runModelLoop({
       model: deps.model,
       kind: 'decision',

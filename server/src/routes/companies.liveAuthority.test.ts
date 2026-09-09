@@ -41,7 +41,9 @@ const mocks = vi.hoisted(() => {
   const transaction = vi.fn();
   const revoke = vi.fn();
   const qboForCompany = vi.fn();
-  return { company, config, rootCompanyUpdate, transaction, revoke, qboForCompany };
+  return { company, config, rootCompanyUpdate, transaction, revoke, qboForCompany,
+    revocation: null as null | { id: string; realmId: string; encryptedRefreshToken: string } };
+
 });
 
 vi.mock('../lib/prisma.js', () => {
@@ -50,6 +52,13 @@ vi.mock('../lib/prisma.js', () => {
     return { ...mocks.company };
   };
   const transactionDb = {
+    qboTokenRevocation: {
+      create: async ({ data }: { data: { realmId: string; encryptedRefreshToken: string } }) => {
+        mocks.revocation = { id: 'synthetic-revocation', ...data };
+        return { id: mocks.revocation.id };
+      },
+      findFirst: async () => mocks.revocation,
+    },
     company: {
       findUnique: async () => ({ ...mocks.company }),
       update: vi.fn(updateCompany),
@@ -91,6 +100,15 @@ vi.mock('../lib/qbo/factory.js', () => ({
   testCompanyConnection: vi.fn(),
 }));
 
+vi.mock('../services/qboTokenRevocation.js', () => ({
+  processQboTokenRevocation: async (id: string) => {
+    const record = mocks.revocation;
+    if (record === null || record.id !== id) return;
+    await mocks.revoke({ realmId: record.realmId, refreshToken: record.encryptedRefreshToken });
+    mocks.revocation = null;
+  },
+}));
+
 vi.mock('../middleware/auth.js', () => {
   const requireUser: RequestHandler = (req, _res, next) => {
     if (req.header('x-test-admin') !== 'true') {
@@ -126,6 +144,7 @@ function app() {
 }
 
 beforeEach(() => {
+  mocks.revocation = null;
   mocks.company.dryRun = false;
   mocks.company.disconnectedAt = null;
   mocks.company.accessToken = 'encrypted-access';

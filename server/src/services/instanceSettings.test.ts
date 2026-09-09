@@ -132,6 +132,48 @@ describe('OpenRouter provider settings', () => {
 });
 
 describe('suggestion model setting precedence', () => {
+  it.each([
+    ['', 'openrouter', 'openrouter', 'openai/gpt-4o-mini'],
+    ['openrouter', 'custom', 'openrouter', 'openai/gpt-4o-mini'],
+    ['custom', 'openrouter', 'custom', 'gpt-4o-mini'],
+    ['invalid-provider', 'openrouter', 'custom', 'gpt-4o-mini'],
+  ])('uses the effective provider fallback with env=%s and stored=%s', async (envProvider, storedProvider, provider, model) => {
+    mocks.suggestionProvider = envProvider;
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionProvider', value: storedProvider, encrypted: false },
+      { key: 'suggestionModel', value: '', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionProvider: provider,
+      suggestionModel: model,
+      agentDecisionModel: model,
+      agentVerifierModel: model,
+    });
+    await expect(getInstanceSettingsDto()).resolves.toMatchObject({ suggestionModel: model });
+  });
+
+  it.each([
+    ['', 'vendor/stored-model', 'vendor/stored-model'],
+    ['', 'gpt-4o-mini', 'gpt-4o-mini'],
+    ['vendor/env-model', 'vendor/stored-model', 'vendor/env-model'],
+    ['gpt-4o-mini', 'vendor/stored-model', 'gpt-4o-mini'],
+  ])('preserves explicit models with env=%s and stored=%s', async (envModel, storedModel, expected) => {
+    mocks.suggestionProvider = 'openrouter';
+    mocks.suggestionModel = envModel;
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionModel', value: storedModel, encrypted: false },
+      { key: 'agentDecisionModel', value: 'vendor/decision-model', encrypted: false },
+      { key: 'agentVerifierModel', value: 'vendor/verifier-model', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionModel: expected,
+      agentDecisionModel: 'vendor/decision-model',
+      agentVerifierModel: 'vendor/verifier-model',
+    });
+  });
+
   it('uses the stored model when SUGGESTION_MODEL is unset', async () => {
     mocks.appConfig.findMany.mockResolvedValue([
       { key: 'suggestionModel', value: 'stored-model', encrypted: false },

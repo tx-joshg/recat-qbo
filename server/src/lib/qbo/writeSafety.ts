@@ -14,6 +14,7 @@ export interface QboWriteSafetyTarget {
 export class QboWriteSafetyError extends Error {
   readonly code:
     | 'QBO_PERIOD_CLOSED'
+    // Retained for error records persisted before reconciled corrections were allowed.
     | 'QBO_TRANSACTION_LOCKED'
     | 'QBO_WRITE_SAFETY_UNAVAILABLE';
 
@@ -50,9 +51,6 @@ export function assertQboWriteAllowed(
       'QBO_PERIOD_CLOSED',
       `QuickBooks has closed books through ${evidence.bookCloseDate}.`,
     );
-  }
-  if (evidence.cleared || evidence.reconciled) {
-    throw new QboWriteSafetyError('QBO_TRANSACTION_LOCKED');
   }
 }
 

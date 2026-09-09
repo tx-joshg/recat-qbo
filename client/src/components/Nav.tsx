@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from 'react';
 import type { CSSProperties, MouseEvent } from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useNavigate } from 'react-router-dom';
 import { isDemoRealmId } from '@recat/shared';
 import type { Role, UserDto } from '@recat/shared';
 import { useApp } from '../state/AppContext';
@@ -194,9 +194,20 @@ export default function Nav() {
       }}
     >
       {/* logo */}
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 2, fontFamily: "'Spectral',serif" }}>
+      <Link
+        to="/"
+        aria-label="Recat"
+        style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 2,
+          fontFamily: "'Spectral',serif",
+          textDecoration: 'none',
+          color: 'inherit',
+        }}
+      >
         <span style={{ fontSize: 22, fontWeight: 600, letterSpacing: '-.01em' }}>Recat</span>
-        <span
+        <span aria-hidden="true"
           style={{
             width: 6,
             height: 6,
@@ -206,7 +217,7 @@ export default function Nav() {
             marginLeft: 3,
           }}
         />
-      </div>
+      </Link>
 
       {/* tabs (desktop only) */}
       {!isMobile && (

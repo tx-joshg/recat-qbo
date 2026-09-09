@@ -1,10 +1,11 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
+  stats: vi.fn(),
   batchApprove: vi.fn(),
   batchReprocess: vi.fn(),
   batchDelete: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../../lib/api', () => ({
     '00000000-0000-4000-8000-000000000061',
   receipts: {
     list: mocks.list,
+    stats: mocks.stats,
     batchApprove: mocks.batchApprove,
     batchDelete: mocks.batchDelete,
     batchReprocess: mocks.batchReprocess,
@@ -34,10 +36,20 @@ vi.mock('../../state/AppContext', () => ({
     activeCompanyId: 'company-1',
     role: mocks.role,
     toast: mocks.toast,
+    session: { id: 'user-1', isInstanceAdmin: false },
+    sessionLoading: false,
   }),
 }));
 
+vi.mock('../../components/Nav', () => ({ default: () => null }));
+vi.mock('../../components/Toast', () => ({ default: () => null }));
+
 import ReceiptBrowser from './ReceiptBrowser';
+import App from '../../App';
+
+function LocationProbe() {
+  return <output aria-label="Current path">{useLocation().pathname}</output>;
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -62,6 +74,22 @@ beforeEach(() => {
     page: 1,
     pageSize: 20,
   });
+  mocks.stats.mockResolvedValue({
+    received: 3,
+    needsReview: 1,
+    queued: 1,
+    processing: 0,
+    failed: 0,
+    totalByCurrency: [{ currency: 'CAD', amount: '24.40' }],
+    totalByCategory: [{
+      category: 'Synthetic category',
+      currency: 'CAD',
+      amount: '24.40',
+    }],
+    totalTaxByCurrency: [{ currency: 'CAD', amount: '2.40' }],
+    processingCostUsd: '0.02',
+    recentActivity: [],
+  });
   mocks.batchApprove.mockResolvedValue({ updated: 1 });
   mocks.batchReprocess.mockResolvedValue({ updated: 1 });
   mocks.batchDelete.mockResolvedValue({ updated: 1 });
@@ -71,6 +99,178 @@ beforeEach(() => {
 });
 
 describe('ReceiptBrowser', () => {
+  it('refreshes summary totals when polling observes processing completion', async () => {
+    let poll: (() => void) | undefined;
+    const originalInterval = window.setInterval;
+    const timer = vi.spyOn(window, 'setInterval').mockImplementation((handler, delay) => {
+      if (delay !== 3_000) return originalInterval(handler, delay) as unknown as ReturnType<typeof window.setInterval>;
+      poll = handler as () => void;
+      return 123 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    try {
+      const initial = await mocks.list();
+      mocks.list.mockClear();
+      mocks.list.mockResolvedValueOnce({ ...initial, receipts: initial.receipts.map((receipt: object) => ({ ...receipt, status: 'PROCESSING' })) });
+      render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+      await screen.findByText('CAD 24.40');
+      await waitFor(() => expect(poll).toBeDefined());
+      const stats = await mocks.stats.mock.results[0]!.value;
+      mocks.stats.mockResolvedValue({ ...stats, queued: 0, processing: 0, totalByCurrency: [{ currency: 'CAD', amount: '42.00' }] });
+      await act(async () => poll!());
+      await screen.findByText('CAD 42.00');
+      expect(mocks.list).toHaveBeenCalledTimes(2);
+      expect(mocks.stats).toHaveBeenCalledTimes(2);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  it('renders dashboard summary and receipt browser in one workspace', async () => {
+    render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+
+    expect(await screen.findByText('Received')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Receipt totals' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Tax totals' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Add receipts' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Recent activity' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Filters' })).toBeInTheDocument();
+    expect(screen.queryByText('Spend by category')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /dashboard|browse receipts/i }))
+      .not.toBeInTheDocument();
+  });
+
+  it('keeps receipt sections expanded and applies shared control classes', async () => {
+    const view = render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+
+    await screen.findByText('synthetic.pdf');
+    expect(view.container.querySelector('details')).not.toBeInTheDocument();
+    expect(view.container.querySelector('summary')).not.toBeInTheDocument();
+
+    const filtersHeading = screen.getByRole('heading', { name: 'Filters' });
+    const uploadHeading = screen.getByRole('heading', { name: 'Add receipts' });
+    expect(filtersHeading.closest('section')).toHaveClass('receipt-section');
+    expect(uploadHeading.closest('section')).toHaveClass('receipt-section');
+    expect(screen.getByRole('region', { name: 'Filters' })).toHaveClass('receipt-section');
+    expect(screen.getByRole('region', { name: 'Add receipts' })).toHaveClass('receipt-section');
+
+    for (const name of [
+      'Search receipts',
+      'Receipt date from',
+      'Receipt date to',
+      'Document type filter',
+    ]) {
+      expect(screen.getByLabelText(name)).toHaveClass('text-control');
+    }
+    for (const name of [
+      'Dashboard timeframe',
+      'Receipt source filter',
+      'Receipt match filter',
+      'Sort receipts',
+    ]) {
+      expect(screen.getByLabelText(name)).toHaveClass('control-trigger');
+    }
+    expect(screen.getByLabelText('Missing information')).toHaveClass('checkbox-control');
+    expect(screen.getByLabelText('Drop receipt files')).toHaveClass('receipt-dropzone');
+    expect(view.container.querySelector('input[type="file"]')).toHaveClass('receipt-file-input');
+    expect(screen.getByLabelText('Toggle sort direction')).toHaveClass('btn', 'btn-ghost');
+    expect(screen.getByRole('button', { name: 'Previous' })).toHaveClass('btn', 'btn-ghost');
+    expect(screen.getByRole('button', { name: 'Next' })).toHaveClass('btn', 'btn-ghost');
+    for (const button of screen.getAllByRole('button', { name: /^(All|Needs review|Ready|Matched|Attached|Processing|Failed|Duplicates)$/ })) {
+      expect(button).toHaveClass('btn');
+    }
+  });
+
+  it('redirects the legacy dashboard route to the combined receipts workspace', async () => {
+    render(
+      <MemoryRouter initialEntries={['/receipts/dashboard']}>
+        <App />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText('Current path'))
+      .toHaveTextContent('/receipts'));
+    expect(screen.getByRole('heading', { name: 'Filters' })).toBeInTheDocument();
+  });
+
+  it('refreshes the current duplicate mode and stats once after a deferred upload', async () => {
+    let resolveUpload!: (result: { receipts: never[] }) => void;
+    mocks.upload.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    mocks.duplicates.mockResolvedValue([{
+      key: 'synthetic-group',
+      reason: 'document_identity',
+      receipts: [{
+        id: '00000000-0000-4000-8000-000000000072',
+        filename: 'synthetic-copy.pdf',
+        status: 'READY',
+        revision: 1,
+        approved: false,
+        sourceKind: 'WEB_UPLOAD',
+        createdAt: '2026-07-30T00:00:00.000Z',
+      }],
+    }]);
+    render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+    await waitFor(() => {
+      expect(mocks.stats).toHaveBeenCalledTimes(1);
+      expect(mocks.list).toHaveBeenCalledTimes(1);
+    });
+
+    const file = new File(['x'], 'synthetic.png', { type: 'image/png' });
+    fireEvent.drop(screen.getByLabelText(/drop receipt files/i), {
+      dataTransfer: { files: [file] },
+    });
+
+    await waitFor(() => expect(mocks.upload).toHaveBeenCalledWith(
+      'company-1',
+      [expect.objectContaining({ name: 'synthetic.png' })],
+      'WEB_UPLOAD',
+    ));
+    await userEvent.click(screen.getByRole('button', { name: 'Duplicates' }));
+    expect(await screen.findByText('synthetic-copy.pdf')).toBeInTheDocument();
+    expect(mocks.duplicates).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveUpload({ receipts: [] });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(mocks.stats).toHaveBeenCalledTimes(2);
+      expect(mocks.duplicates).toHaveBeenCalledTimes(2);
+    });
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('synthetic-copy.pdf')).toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+  });
+
+  it('keeps the selected rows and current totals visible while an upload refresh is pending', async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+    await screen.findByText('synthetic.pdf');
+    await screen.findByText('CAD 24.40');
+    await user.click(screen.getByRole('checkbox', { name: /select synthetic.pdf/i }));
+    const originalList = await mocks.list.mock.results[0]!.value;
+    const originalStats = await mocks.stats.mock.results[0]!.value;
+    let finishList!: (value: typeof originalList) => void;
+    let finishStats!: (value: typeof originalStats) => void;
+    mocks.list.mockReturnValueOnce(new Promise((resolve) => { finishList = resolve; }));
+    mocks.stats.mockReturnValueOnce(new Promise((resolve) => { finishStats = resolve; }));
+    mocks.upload.mockResolvedValueOnce({ receipts: [] });
+    fireEvent.drop(screen.getByLabelText(/drop receipt files/i), {
+      dataTransfer: { files: [new File(['example'], 'new-example.png', { type: 'image/png' })] },
+    });
+    await waitFor(() => {
+      expect(mocks.list).toHaveBeenCalledTimes(2);
+      expect(mocks.stats).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByRole('checkbox', { name: /select synthetic.pdf/i })).toBeChecked();
+    expect(screen.getByText('CAD 24.40')).toBeInTheDocument();
+    await act(async () => { finishList(originalList); finishStats(originalStats); });
+    expect(screen.getByRole('checkbox', { name: /select synthetic.pdf/i })).toBeChecked();
+  });
+
   it('filters, selects, and batch approves current revisions', async () => {
     render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
 
@@ -83,6 +283,14 @@ describe('ReceiptBrowser', () => {
     await userEvent.click(screen.getByRole('checkbox', {
       name: /select synthetic.pdf/i,
     }));
+    for (const name of [
+      /approve selected/i,
+      /reprocess selected/i,
+      /export selected/i,
+      /delete selected/i,
+    ]) {
+      expect(screen.getByRole('button', { name })).toHaveClass('btn', 'btn-ghost');
+    }
     await userEvent.click(screen.getByRole('button', { name: /approve selected/i }));
 
     expect(mocks.batchApprove).toHaveBeenCalledWith('company-1', {
@@ -93,25 +301,87 @@ describe('ReceiptBrowser', () => {
     });
   });
 
+  it.each(['Approve selected', 'Reprocess selected', 'Delete selected'])(
+    'refreshes both the table and summary once after %s', async (action) => {
+      const user = userEvent.setup();
+      render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+      await screen.findByText('synthetic.pdf');
+      await waitFor(() => expect(screen.getByText('Received').closest('section')).toHaveTextContent('3'));
+      await user.click(screen.getByRole('checkbox', { name: /select synthetic.pdf/i }));
+      mocks.list.mockResolvedValueOnce({ receipts: [], total: 0, page: 1, pageSize: 20 });
+      mocks.stats.mockResolvedValueOnce({
+        received: 0, needsReview: 0, queued: 0, processing: 0, failed: 0,
+        totalByCurrency: [], totalByCategory: [], totalTaxByCurrency: [],
+        processingCostUsd: '0', recentActivity: [],
+      });
+      await user.click(screen.getByRole('button', { name: action }));
+      await waitFor(() => {
+        expect(mocks.list).toHaveBeenCalledTimes(2);
+        expect(mocks.stats).toHaveBeenCalledTimes(2);
+        expect(screen.queryByText('synthetic.pdf')).not.toBeInTheDocument();
+        expect(screen.getByText('Received').closest('section')).toHaveTextContent('0');
+      });
+    },
+  );
+
   it('applies date, type, source, match, and missing-information filters', async () => {
     render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
     await screen.findByText('synthetic.pdf');
-    await userEvent.click(screen.getByText('More filters'));
     await userEvent.type(screen.getByLabelText('Receipt date from'), '2026-07-01');
+    await userEvent.type(screen.getByLabelText('Receipt date to'), '2026-07-31');
     await userEvent.type(screen.getByLabelText('Document type filter'), 'receipt');
-    await userEvent.selectOptions(screen.getByLabelText('Receipt source filter'), 'WEB_UPLOAD');
-    await userEvent.selectOptions(screen.getByLabelText('Receipt match filter'), 'unmatched');
+    await userEvent.click(screen.getByRole('combobox', { name: 'Receipt source filter' }));
+    await userEvent.click(screen.getByRole('option', { name: 'Web upload' }));
+    await userEvent.click(screen.getByRole('combobox', { name: 'Receipt match filter' }));
+    await userEvent.click(screen.getByRole('option', { name: 'Unmatched' }));
     await userEvent.click(screen.getByLabelText('Missing information'));
 
     await waitFor(() => expect(mocks.list).toHaveBeenLastCalledWith(
       'company-1',
       expect.objectContaining({
         dateFrom: '2026-07-01',
+        dateTo: '2026-07-31',
         documentTypes: ['receipt'],
         sourceKinds: ['WEB_UPLOAD'],
         matched: false,
         missingInfo: true,
       }),
+    ));
+  });
+
+  it('preserves debounced search and pagination in list queries', async () => {
+    const result = await mocks.list();
+    mocks.list.mockClear();
+    mocks.list.mockResolvedValue({ ...result, total: 21 });
+    render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+    await screen.findByText('synthetic.pdf');
+
+    fireEvent.change(screen.getByLabelText('Search receipts'), {
+      target: { value: '  Invented Vendor  ' },
+    });
+    await waitFor(() => expect(mocks.list).toHaveBeenLastCalledWith(
+      'company-1',
+      expect.objectContaining({ search: 'Invented Vendor', page: 1 }),
+    ));
+
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(mocks.list).toHaveBeenLastCalledWith(
+      'company-1',
+      expect.objectContaining({ search: 'Invented Vendor', page: 2 }),
+    ));
+  });
+
+  it('preserves sort field and direction in list queries', async () => {
+    render(<MemoryRouter><ReceiptBrowser /></MemoryRouter>);
+    await screen.findByText('synthetic.pdf');
+
+    await userEvent.click(screen.getByRole('combobox', { name: 'Sort receipts' }));
+    await userEvent.click(screen.getByRole('option', { name: 'Receipt date' }));
+    await userEvent.click(screen.getByLabelText('Toggle sort direction'));
+
+    await waitFor(() => expect(mocks.list).toHaveBeenLastCalledWith(
+      'company-1',
+      expect.objectContaining({ sortBy: 'receiptDate', sortOrder: 'asc' }),
     ));
   });
 
@@ -186,6 +456,9 @@ describe('ReceiptBrowser', () => {
     expect(await screen.findByText('same receipt identity')).toBeInTheDocument();
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Sort receipts')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Toggle sort direction')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Previous' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Next' })).not.toBeInTheDocument();
     expect(screen.getByLabelText('Search receipts')).toBeDisabled();
     expect(screen.getAllByRole('link', { name: 'synthetic-copy.pdf' }))
       .toEqual(expect.arrayContaining([

@@ -63,6 +63,7 @@ export interface LiveGateConfig {
   verifierModel: string;
   evidenceThreshold: number;
   configVersion: string;
+  schedulingGeneration: number;
   liveRequested: boolean;
   liveAcceptedPolicyVersion: string | null;
   liveAcceptedConfigVersion: string | null;
@@ -685,6 +686,12 @@ async function enableLiveModeInTransaction(
   if (existing === null) {
     throw new LiveGateError('LIVE_CONFIG_MISSING', 'Live mode is unavailable.');
   }
+  const newSchedulingIntent = !existing.liveRequested
+    || existing.liveEnabledAt === null
+    || existing.livePausedAt !== null
+    || existing.liveAcceptedPolicyVersion !== LIVE_POLICY_VERSION
+    || existing.liveAcceptedConfigVersion !== existing.configVersion
+    || existing.liveAcceptedProviderBinding !== providerHealth.binding;
   await tx.updateConfig(companyId, {
     liveRequested: true,
     liveAcceptedPolicyVersion: LIVE_POLICY_VERSION,
@@ -694,6 +701,7 @@ async function enableLiveModeInTransaction(
   const readiness = await evaluateLiveGates(companyId, freshDeps);
   if (isReady(readiness)) {
     await tx.updateConfig(companyId, {
+      schedulingGeneration: existing.schedulingGeneration + (newSchedulingIntent ? 1 : 0),
       liveEnabledAt: checkedDate(tx.now()),
       liveEnabledByUserId: actor.userId,
       livePausedAt: null,

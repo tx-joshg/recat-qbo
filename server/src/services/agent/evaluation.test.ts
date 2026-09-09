@@ -244,13 +244,20 @@ describe('shadow evidence evaluation', () => {
       tags: [{ id: TAG_ID, name: 'Generic tag' }],
       rules: [{
         id: ruleId,
+        ruleRevision: 1,
         priority: 1,
         matchField: 'payee',
         matchText: 'generic',
-        categoryQboId: 'expense-generic',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: 'tax-generic',
-        tagIds: [],
+        action: {
+          version: 2,
+          direction: 'Purchase',
+          category: 'Generic expense',
+          categoryQboId: 'expense-generic',
+          taxCalculation: 'TaxExcluded',
+          taxCodeQboId: 'tax-generic',
+          tagIds: [],
+        },
+        autoPost: false,
       }],
       similarVerifiedTransactions: [],
       featureVersion: 'feature-v1',
@@ -335,14 +342,14 @@ describe('shadow evidence evaluation', () => {
     expect((await getShadowEvidenceSummary(COMPANY_ID, { db })).eligibleRuns).toBe(0);
 
     db.transactionRows[0]!.revision = 1;
-    db.transactionRows[0]!.status = 'REVERTED';
+    db.transactionRows[0]!.status = 'PENDING';
     expect((await getShadowEvidenceSummary(COMPANY_ID, { db })).eligibleRuns).toBe(0);
   });
 
   it('invalidates prior evidence on a verified revert or corrected post', async () => {
     const db = new FakeEvaluationDb();
     await evaluateShadowRunAgainstOutcome(validOutcome(), { db });
-    db.transactionRows[0]!.status = 'REVERTED';
+    db.transactionRows[0]!.status = 'PENDING';
     await evaluateShadowRunAgainstOutcome(validOutcome('reverted'), { db });
 
     expect((await getShadowEvidenceSummary(COMPANY_ID, { db })).eligibleRuns).toBe(0);

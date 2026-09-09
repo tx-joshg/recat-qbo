@@ -43,6 +43,21 @@ describe('shadow agent company settings', () => {
     deps = createDeps();
   });
 
+  it('creates a new scheduling generation only when moving from off into shadow', async () => {
+    await updateShadowSettings('company-1', { mode: 'off' }, deps);
+    expect(deps.rows.get('company-1')!.schedulingGeneration).toBe(0);
+    const first = await updateShadowSettings('company-1', { mode: 'shadow' }, deps);
+    expect(deps.rows.get('company-1')!.schedulingGeneration).toBe(1);
+    await updateShadowSettings('company-1', { mode: 'shadow' }, deps);
+    expect(deps.rows.get('company-1')!.schedulingGeneration).toBe(1);
+    await updateShadowSettings('company-1', { mode: 'off' }, deps);
+    expect(deps.rows.get('company-1')!.schedulingGeneration).toBe(1);
+    const restored = await updateShadowSettings('company-1', { mode: 'shadow' }, deps);
+    expect(deps.rows.get('company-1')!.schedulingGeneration).toBe(2);
+    expect(restored.configVersion).toBe(first.configVersion);
+    expect(restored).not.toHaveProperty('schedulingGeneration');
+  });
+
   it.each([24, 1001])('rejects evidence threshold %i', async (evidenceThreshold) => {
     await expect(updateShadowSettings('company-1', { evidenceThreshold }, deps))
       .rejects.toMatchObject({ code: 'AGENT_SETTING_INVALID' });

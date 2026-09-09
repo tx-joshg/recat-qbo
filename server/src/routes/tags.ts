@@ -9,6 +9,8 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { runCompanyMutationTransaction } from '../services/companyMutationScope.js';
+import { disableRuleForSafetyInTransaction } from '../services/ruleSafetyTransition.js';
 
 const createBody = z.object({
   name: z.string().trim().min(1).max(60),
@@ -102,7 +104,26 @@ tagsRouter.delete(
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
     const tag = await loadTag(company.id, req.params.id);
-    await prisma.tag.delete({ where: { id: tag.id } });
+    await runCompanyMutationTransaction(prisma, company.id, async (tx) => {
+      const affectedRules = await tx.rule.findMany({
+        where: {
+          companyId: company.id,
+          ruleTags: { some: { tagId: tag.id } },
+        },
+        include: { ruleTags: true },
+      });
+      for (const rule of affectedRules) {
+        await disableRuleForSafetyInTransaction(tx, {
+          companyId: company.id,
+          ruleId: rule.id,
+          expectedRevision: rule.revision,
+          reason: `Rule tag ${tag.id} was deleted and requires reviewed repair.`,
+          actor: req.user!.id,
+          preserveTagIds: rule.ruleTags.map(({ tagId }) => tagId),
+        });
+      }
+      await tx.tag.delete({ where: { id: tag.id } });
+    });
     res.json({ ok: true });
   }),
 );

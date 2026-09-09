@@ -1,6 +1,11 @@
 import type { PrismaClient } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { HttpError } from '../lib/http.js';
+import {
+  actionabilityObservationFromRow,
+  effectiveProviderDisposition,
+  transactionIdentityFromRow,
+} from './providerActionability.js';
 
 export interface PairableTxn {
   id: string;
@@ -213,22 +218,44 @@ export function pairTransfers(
   return pairs;
 }
 
-type CandidateDb = Pick<PrismaClient, 'transaction'>;
+type CandidateDb = Pick<PrismaClient, 'transaction'> & { transactionActionability?: unknown };
 
 export async function transferCandidates(
   companyId: string,
   db: CandidateDb = prisma,
 ): Promise<Map<string, string>> {
+  // Production always has the delegate after migrate-deploy. The fallback is
+  // retained for small legacy unit-test adapters only.
+  const supportsActionability = Boolean(db.transactionActionability);
   const rows = await db.transaction.findMany({
     where: { companyId, status: 'PENDING', category: null, splitLines: { none: {} } },
-    select: { id: true, amount: true, bankAccount: true, date: true },
+    select: {
+      id: true,
+      companyId: true,
+      revision: true,
+      qboSyncToken: true,
+      qboType: true,
+      qboId: true,
+      amount: true,
+      bankAccount: true,
+      date: true,
+      ...(supportsActionability ? { providerActionability: true } : {}),
+    },
     orderBy: [{ date: 'asc' }, { id: 'asc' }],
     take: MAX_TRANSFER_DISCOVERY_TRANSACTIONS + 1,
   });
   if (rows.length > MAX_TRANSFER_DISCOVERY_TRANSACTIONS) {
     throw new TransferDiscoveryOverflowError();
   }
-  return pairTransfers(rows.map((row) => ({
+  const writableRows = supportsActionability
+    ? rows.filter((row) => effectiveProviderDisposition(
+        actionabilityObservationFromRow(
+          (row as unknown as { providerActionability?: unknown }).providerActionability,
+        ),
+        transactionIdentityFromRow(row),
+      ) === 'WRITABLE')
+    : rows;
+  return pairTransfers(writableRows.map((row) => ({
     id: row.id,
     amount: Number(row.amount),
     bankAccount: row.bankAccount,
