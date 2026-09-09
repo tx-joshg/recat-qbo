@@ -239,6 +239,7 @@ const transaction = z.strictObject({
   payee: text,
   memo: nullableText,
   amount: z.number().finite(),
+  sourceGrossCents: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER).optional(),
   bankAccount: text,
   status: transactionStatus,
   revision: z.number().int().nonnegative(),

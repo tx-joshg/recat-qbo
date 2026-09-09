@@ -663,7 +663,7 @@ export default function Queue() {
             tagIds: split.tagIds,
           }))
         : [{
-            amount: t.amount,
+            amount: t.sourceGrossCents === undefined ? t.amount : t.sourceGrossCents / 100,
             categoryQboId: t.categoryQboId ?? (t.category ? qboIdOf(t.category) : null),
             taxCodeQboId: state.taxCodeQboId,
             memo: undefined,

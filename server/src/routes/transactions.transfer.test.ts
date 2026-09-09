@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../lib/prisma.js', () => ({
   prisma: {
+    company: { findUnique: vi.fn(async () => ({ holdingAccountIds: [] })) },
     membership: { findUnique: mocks.membershipFindUnique },
     session: { findUnique: mocks.sessionFindUnique },
     transaction: {

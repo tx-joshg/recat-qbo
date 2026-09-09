@@ -89,6 +89,23 @@ async function legacy(handler: ReturnType<typeof createMcpHandler>, method: stri
 }
 
 describe('Recat MCP read tools', () => {
+  it('returns exact source gross through the strict transaction output schema', async () => {
+    const operations = reads();
+    vi.mocked(operations.getTransaction).mockResolvedValue({
+      ...sampleTransaction, amount: -10, sourceGrossCents: -1120,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const body = await legacy(handler, 'tools/call', {
+      name: 'get_transaction',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+    expect(body.result.isError).not.toBe(true);
+    expect(body.result.structuredContent.transaction).toMatchObject({ amount: -10, sourceGrossCents: -1120 });
+  });
+
   it('does not rerun static schema deadline checks for concurrent fresh servers', async () => {
     let simulatedNow = 0;
     const now = vi.spyOn(performance, 'now').mockImplementation(() => {

@@ -795,6 +795,7 @@ describe('guarded live autopilot gates', () => {
           taxSupportReason: null,
         }),
       },
+      qboTaxRate: { findMany: async () => [] },
       qboTaxCode: {
         findMany: async () => [],
       },

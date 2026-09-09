@@ -48,6 +48,7 @@ import {
 
 import { MOCK_REALM_IDS, type StagedCategorization } from '@recat/shared';
 import {
+  mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
@@ -1063,32 +1064,10 @@ function rawPurchaseSnapshot(
       ? null
       : (raw.Line ?? []).reduce((sum, line) => sum + lineTaxCents(line), 0);
   return {
-    qboId: raw.Id,
+    ...mapPurchaseTaxSnapshot(raw),
     syncToken,
-    totalCents: sign * Math.round((raw.TotalAmt ?? 0) * 100),
-    accountQboId: raw.AccountRef?.value ?? null,
-    date: raw.TxnDate ?? '',
-    direction: sign === 1 ? 'refund' : 'purchase',
-    globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
     totalTaxCents:
       unsignedTotalTaxCents === null ? null : sign * unsignedTotalTaxCents,
-    lines: (raw.Line ?? []).map((line, index) => ({
-      id: line.Id ?? String(index + 1),
-      amountCents: sign * Math.round((line.Amount ?? 0) * 100),
-      description: line.Description ?? null,
-      accountQboId: line.AccountBasedExpenseLineDetail?.AccountRef?.value ?? null,
-      customerQboId: line.AccountBasedExpenseLineDetail?.CustomerRef?.value ?? null,
-      classQboId: line.AccountBasedExpenseLineDetail?.ClassRef?.value ?? null,
-      taxCodeQboId: line.AccountBasedExpenseLineDetail?.TaxCodeRef?.value ?? null,
-      taxAmountCents:
-        line.AccountBasedExpenseLineDetail?.TaxAmount === undefined
-          ? null
-          : sign * Math.round(line.AccountBasedExpenseLineDetail.TaxAmount * 100),
-      taxInclusiveCents:
-        line.AccountBasedExpenseLineDetail?.TaxInclusiveAmt === undefined
-          ? null
-          : sign * Math.round(line.AccountBasedExpenseLineDetail.TaxInclusiveAmt * 100),
-    })),
   };
 }
 

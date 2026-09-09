@@ -107,6 +107,44 @@ function makeDb() {
 describe('company read services', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it('exposes proven Purchase source gross separately from the mirrored net without raw QBO data', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      amount: -100,
+      rawData: {
+        Id: '1001', SyncToken: '1', TxnDate: '2026-01-03',
+        PaymentType: 'Cash', AccountRef: { value: 'bank-1' },
+        GlobalTaxCalculation: 'TaxInclusive', TotalAmt: 112,
+        Line: [{ Id: '1', Amount: 100, DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding-1' }, TaxCodeRef: { value: 'tax-1' }, TaxInclusiveAmt: 112 } }],
+        TxnTaxDetail: { TotalTax: 12 },
+      },
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const result = await service.getTransaction(USER_ID, COMPANY_ID, 'txn-1');
+    expect(result).toMatchObject({ amount: -100, sourceGrossCents: -11200 });
+    expect(result).not.toHaveProperty('rawData');
+  });
+
+  it('omits source gross when the raw Purchase belongs to a different provider transaction', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      amount: -100,
+      rawData: {
+        Id: 'different-purchase', SyncToken: '1', TxnDate: '2026-01-03',
+        PaymentType: 'Cash', AccountRef: { value: 'bank-1' },
+        GlobalTaxCalculation: 'TaxInclusive', TotalAmt: 112,
+        Line: [{ Id: '1', Amount: 100, DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding-1' }, TaxCodeRef: { value: 'tax-1' }, TaxInclusiveAmt: 112 } }],
+        TxnTaxDetail: { TotalTax: 12 },
+      },
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const result = await service.getTransaction(USER_ID, COMPANY_ID, 'txn-1');
+    expect(result).not.toHaveProperty('sourceGrossCents');
+    expect(result).not.toHaveProperty('rawData');
+  });
+
   it('exports every bounded read operation', () => {
     expect([
       createCompanyReadService,

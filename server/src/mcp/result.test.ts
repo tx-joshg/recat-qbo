@@ -143,6 +143,14 @@ describe('MCP tool results', () => {
       ),
       'NOT_FOUND',
     ],
+    ...[
+      'INVALID_TAX_CODE',
+      'PRESERVE_SOURCE_ID_INVALID',
+      'PRESERVE_SOURCE_SHAPE_INVALID',
+      'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
+      'PRESERVE_SOURCE_TAX_CALCULATION_INVALID',
+      'PRESERVE_SOURCE_TOTAL_INVALID',
+    ].map((code) => [new CategorizationError(code, 'PRIVATE_SOURCE_DETAILS'), 'INVALID_INPUT']),
     [
       new CategorizationError(
         'INVALID_ACCOUNT',

@@ -94,6 +94,17 @@ const SALES_READY: TaxReadinessDto = {
 };
 
 describe('SplitEditor tax fields', () => {
+  it.each([
+    { amount: -100, sourceGrossCents: -11200, expected: '112.00' },
+    { amount: 100, sourceGrossCents: 11200, expected: '112.00' },
+    { amount: -100, sourceGrossCents: undefined, expected: '100.00' },
+  ])('seeds allocation from proven gross or the legacy amount: $sourceGrossCents', ({ amount, sourceGrossCents, expected }) => {
+    render(<SplitEditor txn={{ ...TXN, amount, sourceGrossCents, splits: null }}
+      tags={[]} catOpts={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getByLabelText('Amount for split line 1')).toHaveValue(expected);
+    expect(screen.getByText(/assign every dollar to a category/)).toHaveTextContent(`$${expected}`);
+  });
+
   it('saves the calculation, memo, and purchase tax selection on every line', async () => {
     const onSave = vi.fn();
     const user = userEvent.setup();

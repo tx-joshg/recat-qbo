@@ -263,6 +263,7 @@ describe('prepareMcpCategorization', () => {
       preview: {
         transactionId: TRANSACTION_ID,
         revision: 1,
+        taxDisposition: 'set',
         taxCalculation: 'NotApplicable',
         totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
         lines: [{
@@ -270,13 +271,15 @@ describe('prepareMcpCategorization', () => {
           subtotalCents: -1050,
           taxCents: 0,
           totalCents: -1050,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: null,
         }],
         transactionTagCount: 0,
         lineTagCount: 0,
       },
       warnings: [],
     });
-    expect(JSON.stringify(result)).not.toMatch(/Café supplies|EXPENSE_ACCOUNT|QBO_PURCHASE_1/);
+    expect(JSON.stringify(result)).not.toMatch(/Café supplies|QBO_PURCHASE_1/);
     expect(context.revision).toBe(1);
     expect(context.rows.size).toBe(1);
     expect([...context.rows.values()][0]).toMatchObject({

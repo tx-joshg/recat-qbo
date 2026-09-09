@@ -1,3 +1,5 @@
+import { categorizationSourceGrossCents } from './tax/sourceGross.js';
+import { CategorizationError } from './categorizationError.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import type {
@@ -327,11 +329,24 @@ function suggestionDto(value: unknown): SuggestionDto | null {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+function provenSourceGross(row: Row, holdingAccountIds: unknown): number | undefined {
+  try {
+    return categorizationSourceGrossCents({
+      amount: String(row.amount), qboId: String(row.qboId),
+      qboType: String(row.qboType), rawData: row.rawData,
+    }, holdingAccountIds);
+  } catch (error) {
+    if (error instanceof CategorizationError) return undefined;
+    throw error;
+  }
+}
+
 function transactionDto(
   row: Row,
   posterLabel: Map<string, string>,
   liveSuggestion: SuggestionDto | null,
   transferCandidateId: string | null,
+  holdingAccountIds: unknown = [],
 ): TransactionDto {
   const splitLines = Array.isArray(row.splitLines) ? (row.splitLines as Row[]) : [];
   const attempts = Array.isArray(row.qboMutationAttempts) ? (row.qboMutationAttempts as Row[]) : [];
@@ -350,6 +365,7 @@ function transactionDto(
           status: attemptStatus as 'PREPARED' | 'COMMITTING' | 'UNCERTAIN',
         }
       : null;
+  const sourceGrossCents = provenSourceGross(row, holdingAccountIds);
   const posterId = typeof row.postedByUserId === 'string' ? row.postedByUserId : null;
   return {
     id: String(row.id),
@@ -361,6 +377,7 @@ function transactionDto(
     payee: String(row.payee),
     memo: typeof row.memo === 'string' ? row.memo : null,
     amount: Number(row.amount),
+    ...(sourceGrossCents === undefined ? {} : { sourceGrossCents }),
     bankAccount: String(row.bankAccount),
     status: TXN_STATUSES.includes(row.status as TxnStatus) ? row.status as TxnStatus : 'PENDING',
     revision: Number(row.revision),
@@ -532,9 +549,10 @@ async function transactionDtosWithDeps(
   rows: Row[],
   candidatesIn?: Map<string, string>,
 ): Promise<TransactionDto[]> {
-  const [labels, candidates] = await Promise.all([
+  const [labels, candidates, company] = await Promise.all([
     posterLabels(db, rows),
     candidatesIn ? Promise.resolve(candidatesIn) : deps.transferCandidates(companyId),
+    db.company.findUnique({ where: { id: companyId }, select: { holdingAccountIds: true } }),
   ]);
   const pendingRows = rows.filter((row) => row.status === 'PENDING');
   const liveSuggestions = await deps.suggestForMany(
@@ -553,6 +571,7 @@ async function transactionDtosWithDeps(
     labels,
     liveById.get(String(row.id)) ?? null,
     candidates.get(String(row.id)) ?? null,
+    (company as Row | null)?.holdingAccountIds,
   ));
 }
 
