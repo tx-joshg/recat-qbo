@@ -10,6 +10,7 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
+  bankAccounts: vi.fn(),
   categorize: vi.fn(),
   stage: vi.fn(),
   commit: vi.fn(),
@@ -105,6 +106,7 @@ vi.mock('../lib/api', () => {
     ApiError,
     createCategorizationRequestId: mocks.requestId,
     companies: { sync: mocks.sync },
+    reports: { bankAccounts: mocks.bankAccounts },
     rules: { create: mocks.rulesCreate },
     transactions: {
       list: mocks.list,
@@ -300,6 +302,7 @@ beforeEach(() => {
   mocks.taxReadiness = READY;
   mocks.activeCompanyId = 'COMPANY_GENERIC';
   mocks.tags = [];
+  mocks.bankAccounts.mockResolvedValue([]);
   mocks.stage.mockResolvedValue(STAGED);
   mocks.commit.mockResolvedValue(mutation());
   mocks.reconcile.mockResolvedValue(mutation());
@@ -379,6 +382,27 @@ describe('tax-aware manual queue', () => {
     expect(screen.queryByText('Subtotal −$10.00')).not.toBeInTheDocument();
     expect(screen.getByText(kind === 'split' ? 'Open Split to review its categories and tax codes before calculating tax.' : 'Choose an available category and tax code before calculating tax.')).toBeInTheDocument();
     expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
+  it('offers accounts with no transactions currently in the Queue', async () => {
+    mocks.list.mockResolvedValue({ transactions: [], nextCursor: null, pendingCount: 0 });
+    mocks.bankAccounts.mockResolvedValue(['Example dormant account']);
+    render(<Queue />);
+    expect(await screen.findByRole('option', { name: 'Example dormant account' })).toBeInTheDocument();
+    expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_GENERIC');
+  });
+
+  it('ignores account results from a company that is no longer selected', async () => {
+    const old = deferred<string[]>();
+    mocks.list.mockResolvedValue({ transactions: [], nextCursor: null, pendingCount: 0 });
+    mocks.bankAccounts.mockReturnValueOnce(old.promise).mockResolvedValueOnce(['Example current account']);
+    const view = render(<Queue />);
+    await waitFor(() => expect(mocks.bankAccounts).toHaveBeenCalledTimes(1));
+    mocks.activeCompanyId = 'COMPANY_OTHER';
+    view.rerender(<Queue />);
+    expect(await screen.findByRole('option', { name: 'Example current account' })).toBeInTheDocument();
+    await act(async () => old.resolve(['Example old account']));
+    expect(screen.queryByRole('option', { name: 'Example old account' })).not.toBeInTheDocument();
   });
 
   it('stages exact cents at the current revision, previews server totals, and commits that revision', async () => {

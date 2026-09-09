@@ -15,7 +15,7 @@ import type {
   TransactionLogDto,
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
-import { reports, savedReports, transactions } from '../lib/api';
+import { reports, savedReports } from '../lib/api';
 import { fmtDate, fmtDateY, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import TagPicker from '../components/TagPicker';
@@ -173,7 +173,8 @@ export default function Reports() {
     tagIds: [],
   });
   const [custom, setCustom] = useState<CustomReportDto | null>(null);
-  const [banks, setBanks] = useState<string[] | null>(null);
+  const [bankState, setBankState] = useState<{ companyId: string; names: string[] } | null>(null);
+  const banks = bankState && bankState.companyId === activeCompanyId ? bankState.names : null;
   const [saved, setSaved] = useState<SavedReportDto[]>([]);
   const [rptName, setRptName] = useState('');
 
@@ -311,23 +312,22 @@ export default function Reports() {
     };
   }, [activeCompanyId, tab, config, toast]);
 
-  // ---- bank account options: one transactions fetch, first time the custom tab opens ----
-  // Viewers can't call transactions.list — their dropdown shows 'All bank accounts' only.
+  // ---- bank account options: a scoped read for the current company ----
   useEffect(() => {
-    if (!activeCompanyId || tab !== 'custom' || banks !== null || isViewer) return;
+    if (!activeCompanyId || tab !== 'custom' || banks !== null) return;
     let cancelled = false;
-    transactions
-      .list(activeCompanyId)
-      .then((res) => {
-        if (!cancelled) setBanks([...new Set(res.transactions.map((t) => t.bankAccount))]);
+    reports
+      .bankAccounts(activeCompanyId)
+      .then((names) => {
+        if (!cancelled) setBankState({ companyId: activeCompanyId, names });
       })
       .catch(() => {
-        if (!cancelled) setBanks([]);
+        if (!cancelled) setBankState({ companyId: activeCompanyId, names: [] });
       });
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, tab, banks, isViewer]);
+  }, [activeCompanyId, tab, banks]);
 
   // ---- saved reports ----
   useEffect(() => {

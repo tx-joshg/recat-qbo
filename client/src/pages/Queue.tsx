@@ -26,6 +26,7 @@ import {
   companies as companiesApi,
   createCategorizationRequestId,
   rules as rulesApi,
+  reports as reportsApi,
   transactions as txnApi,
 } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
@@ -227,6 +228,7 @@ export default function Queue() {
   // ---- local state (mirrors the prototype's single component state) ----
   const [rows, setRows] = useState<TransactionDto[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [bankAccounts, setBankAccounts] = useState<string[]>([]);
   const [search, setSearch] = useState('');
   const [acct, setAcct] = useState('all');
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
@@ -358,6 +360,20 @@ export default function Queue() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompanyId]);
+
+  useEffect(() => {
+    setAcct('all');
+    setBankAccounts([]);
+    if (!activeCompanyId) return;
+    const companyId = activeCompanyId;
+    let cancelled = false;
+    reportsApi.bankAccounts(companyId)
+      .then((names) => {
+        if (!cancelled && activeCompanyIdRef.current === companyId) setBankAccounts(names);
+      })
+      .catch((error) => { if (!cancelled) toast(errText(error)); });
+    return () => { cancelled = true; };
+  }, [activeCompanyId, toast]);
 
   // ---- pending badge: recompute locally (pending = PENDING + ERROR rows) ----
   useEffect(() => {
@@ -519,7 +535,10 @@ export default function Queue() {
     minimumFractionDigits: 2,
   })} waiting · last synced ${relTime(activeCompany?.lastSyncedAt)}`;
 
-  const bankOpts = useMemo(() => [...new Set(rows.map((t) => t.bankAccount))], [rows]);
+  const bankOpts = useMemo(
+    () => [...new Set([...bankAccounts, ...rows.map((t) => t.bankAccount)])],
+    [bankAccounts, rows],
+  );
 
   // ---- selection ----
   const selIds = useMemo(() => Object.keys(sel).filter((k) => sel[k]), [sel]);

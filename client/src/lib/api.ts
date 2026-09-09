@@ -924,6 +924,8 @@ export const savedReports = {
 };
 
 export const reports = {
+  bankAccounts: (companyId: string) =>
+    api.get<string[]>(`/api/companies/${companyId}/reports/bank-accounts`),
   pl: (companyId: string, params: PlReportParams) =>
     api.get<StatementDto>(`/api/companies/${companyId}/reports/pl${qs({ ...params })}`),
   bs: (companyId: string, params: BsReportParams) =>

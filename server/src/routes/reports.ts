@@ -92,6 +92,19 @@ export const reportsRouter = Router({ mergeParams: true });
 reportsRouter.use(requireUser, withCompany({ allowDisconnected: true }), requireRole('viewer'));
 
 reportsRouter.get(
+  '/bank-accounts',
+  asyncHandler(async (req, res) => {
+    const company = scopedCompany(req);
+    const rows = await prisma.transaction.groupBy({
+      by: ['bankAccount'],
+      where: { companyId: company.id },
+      orderBy: { bankAccount: 'asc' },
+    });
+    res.json(rows.map((row) => row.bankAccount));
+  }),
+);
+
+reportsRouter.get(
   '/pl',
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
