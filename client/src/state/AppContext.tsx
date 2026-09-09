@@ -77,6 +77,10 @@ export interface AppContextValue {
   setPendingCount: (n: number) => void;
   refreshPendingCount: () => Promise<void>;
 
+  qboMutationRevision: number;
+  notifyQboMutation: (companyId: string, transactionIds?: string[], origin?: symbol) => void;
+  subscribeQboMutations: (listener: QboMutationListener) => () => void;
+
   theme: Theme;
   toggleTheme: () => void;
 
@@ -93,6 +97,14 @@ export interface AppContextValue {
 const THEME_KEY = 'recat.theme';
 const COMPANY_KEY = 'recat.activeCompany';
 const DENSITY_KEY = 'recat.density';
+
+export interface QboMutationEvent {
+  companyId: string;
+  transactionIds: string[];
+  /** The producing view has already applied its own result. */
+  origin?: symbol;
+}
+type QboMutationListener = (event: QboMutationEvent) => void;
 
 export type Density = 'comfortable' | 'compact';
 
@@ -112,6 +124,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [taxReadiness, setTaxReadiness] = useState<TaxReadinessDto | null>(null);
   const [taxReadinessLoading, setTaxReadinessLoading] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
+  const [qboMutationRevision, setQboMutationRevision] = useState(0);
+  const notificationCompany = useRef(activeCompanyId);
+  notificationCompany.current = session ? activeCompanyId : null;
+  const notificationsMounted = useRef(true);
+  useEffect(() => { notificationsMounted.current = true; return () => { notificationsMounted.current = false; }; }, []);
+  const mutationListeners = useRef(new Set<QboMutationListener>());
+  const subscribeQboMutations = useCallback((listener: QboMutationListener) => {
+    mutationListeners.current.add(listener);
+    return () => { mutationListeners.current.delete(listener); };
+  }, []);
+  const notifyQboMutation = useCallback((companyId: string, transactionIds: string[] = [], origin?: symbol) => {
+    if (!notificationsMounted.current || notificationCompany.current !== companyId) return;
+    setQboMutationRevision(revision => revision + 1);
+    const event = { companyId, transactionIds: [...new Set(transactionIds)], origin };
+    for (const listener of mutationListeners.current) listener(event);
+  }, []);
 
   const [theme, setTheme] = useState<Theme>(() =>
     readPreference(THEME_KEY) === 'dark' ? 'dark' : 'light',
@@ -346,6 +374,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       pendingCount,
       setPendingCount,
       refreshPendingCount,
+      qboMutationRevision,
+      notifyQboMutation,
+      subscribeQboMutations,
       theme,
       toggleTheme,
       density,
@@ -374,6 +405,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshTaxReferences,
       pendingCount,
       refreshPendingCount,
+      qboMutationRevision,
+      notifyQboMutation,
+      subscribeQboMutations,
       theme,
       toggleTheme,
       density,

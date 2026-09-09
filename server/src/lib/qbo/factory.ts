@@ -137,6 +137,7 @@ async function clientForCompany(company: Company): Promise<QboClient> {
     refreshToken: decrypt(company.refreshToken),
     expiresAt: company.tokenExpiresAt?.getTime() ?? 0,
   };
+  let persistedTokens = { accessToken: company.accessToken, refreshToken: company.refreshToken };
   return new RealQboClient({
     realmId: company.realmId,
     environment: company.env as QboEnvironment,
@@ -146,14 +147,19 @@ async function clientForCompany(company: Company): Promise<QboClient> {
     tokens,
     // Refresh tokens rotate on use — persist the new set immediately.
     onTokensRefreshed: async (t) => {
-      await prisma.company.update({
-        where: { id: company.id },
-        data: {
-          accessToken: encrypt(t.accessToken),
-          refreshToken: encrypt(t.refreshToken),
-          tokenExpiresAt: new Date(t.expiresAt),
-        },
+      const rotated = {
+        accessToken: encrypt(t.accessToken),
+        refreshToken: encrypt(t.refreshToken),
+        tokenExpiresAt: new Date(t.expiresAt),
+      };
+      const stored = await prisma.company.updateMany({
+        where: { id: company.id, disconnectedAt: null, ...persistedTokens },
+        data: rotated,
       });
+      if (stored.count !== 1) {
+        throw new QboAuthError('QuickBooks connection changed during token refresh.');
+      }
+      persistedTokens = { accessToken: rotated.accessToken, refreshToken: rotated.refreshToken };
     },
   });
 }

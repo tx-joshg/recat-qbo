@@ -329,7 +329,7 @@ describe('OpenAiCompatibleAgentModel requests', () => {
       promptVersion: AGENT_MODEL_PROMPT_VERSION,
       purpose: 'review',
       candidateDecision: decisionEnvelope().decision,
-      snapshot: { schemaVersion: 1 },
+      snapshot: { schemaVersion: 2 },
     });
     expect(messages[1]!.content).not.toContain('company-id-sentinel');
   });

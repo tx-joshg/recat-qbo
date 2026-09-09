@@ -8,6 +8,7 @@ declare global {
     interface Request {
       user?: User & { memberships: Membership[] };
       company?: Company;
+      sessionId?: string;
     }
   }
 }

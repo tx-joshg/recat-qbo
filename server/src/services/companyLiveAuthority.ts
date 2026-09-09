@@ -3,9 +3,9 @@ import { HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import type {
   QboRevocationCapability,
-  QboRevocationSource,
 } from '../lib/qbo/types.js';
 import { runSerializableTransaction } from '../lib/serializableTransaction.js';
+import { processQboTokenRevocation } from './qboTokenRevocation.js';
 
 export interface CompanySettingsPatch {
   nickname?: string;
@@ -53,19 +53,13 @@ const disconnectPause = {
   livePauseMessage: 'Live mode is paused: QuickBooks is disconnected.',
 } as const;
 
-function captureRevocationCapability(
-  source: QboRevocationSource,
-): QboRevocationCapability {
-  const snapshot = {
-    realmId: source.realmId,
-    refreshToken: source.refreshToken,
-  };
+function captureRevocationCapability(id: string | null): QboRevocationCapability {
   return async () => {
+    if (id === null) return;
     try {
-      const { revokeCapturedQboToken } = await import('../lib/qbo/factory.js');
-      await revokeCapturedQboToken(snapshot);
+      await processQboTokenRevocation(id);
     } catch {
-      // Best effort only; local token and live authority are already gone.
+      // Local authority is already gone; a failed drain remains recoverable.
     }
   };
 }
@@ -105,9 +99,9 @@ export async function updateCompanySettingsWithLiveAuthority(
 }
 
 /**
- * Captures an opaque revocation capability from the current token snapshot,
- * then disconnects QBO and invalidates requested live authority atomically.
- * The caller invokes the bounded best-effort capability only after commit.
+ * Quarantines the encrypted token snapshot, disconnects QBO, and invalidates
+ * requested live authority atomically. The opaque capability and boot recovery
+ * invoke the same bounded best-effort attempt only after commit.
  */
 export async function disconnectCompanyWithLiveAuthority(
   companyId: string,
@@ -119,7 +113,12 @@ export async function disconnectCompanyWithLiveAuthority(
     if (current === null) {
       throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
     }
-    const revoke = captureRevocationCapability(current);
+    const revocation = current.refreshToken === null
+      ? await db.qboTokenRevocation.findFirst({ where: { companyId }, select: { id: true } })
+      : await db.qboTokenRevocation.create({ data: {
+          companyId, realmId: current.realmId, encryptedRefreshToken: current.refreshToken,
+        }, select: { id: true } });
+    const revoke = captureRevocationCapability(revocation?.id ?? null);
     const updated = await db.company.update({
       where: { id: companyId },
       data: {

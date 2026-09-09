@@ -63,6 +63,7 @@ export const requireUser: RequestHandler = asyncHandler(async (req, _res, next) 
     throw new HttpError(401, 'Session expired — sign in again', 'UNAUTHENTICATED');
   }
   req.user = session.user;
+  req.sessionId = session.id;
   next();
 });
 
@@ -190,4 +191,24 @@ export const originCheck: RequestHandler = (req, _res, next) => {
     .catch(() => {
       next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
     });
+};
+
+/** Cookie-authenticated policy writes are browser-only and therefore require
+ * an explicit allowed Origin; accepting an absent header would reopen a CSRF
+ * path that the broader curl-compatible middleware intentionally permits. */
+export const requireBrowserMutationOrigin: RequestHandler = (req, _res, next) => {
+  const origin = req.headers.origin;
+  if (origin === undefined) {
+    next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
+    return;
+  }
+  let actual: string | null;
+  try { actual = new URL(origin).origin; } catch { actual = null; }
+  allowedOrigins().then((allowed) => {
+    if (actual === null || !allowed.has(actual)) {
+      next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN'));
+      return;
+    }
+    next();
+  }).catch(() => next(new HttpError(403, 'Cross-origin request rejected', 'BAD_ORIGIN')));
 };

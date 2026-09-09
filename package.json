@@ -14,12 +14,14 @@
     "login-link": "node server/dist/cli/loginLink.js",
     "probe-tax": "node server/dist/cli/probeSandboxTax.js",
     "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
-    "test": "npm run test -w server && npm run test -w client",
+    "test": "node --test scripts/package-scripts.test.mjs scripts/rule-management-import.test.mjs && npm run test -w shared && npm run test -w server && npm run test -w client",
     "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
-    "seed": "npm run seed -w server"
+    "seed": "npm run seed -w server",
+    "test:server:unit": "npm run test:unit -w server",
+    "test:server:pg": "npm run test:pg -w server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

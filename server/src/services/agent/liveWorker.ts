@@ -115,7 +115,7 @@ export type LiveRunCompletion =
       readonly mutation: DurableMutationResult;
     }
   | {
-      readonly status: 'dry_run' | 'unchanged' | 'uncertain' | 'retryable';
+      readonly status: 'dry_run' | 'unchanged' | 'uncertain' | 'retryable' | 'rejected';
       readonly errorCode: string;
       readonly result: AgentRunResult;
       readonly verification: AgentVerification;
@@ -497,8 +497,11 @@ function mutationCompletion(
     : mutation.outcome === 'UNCHANGED'
       ? 'unchanged'
       : mutation.outcome === 'UNCERTAIN'
+          || mutation.error?.code === 'OPERATION_RECONCILIATION_REQUIRED'
         ? 'uncertain'
-        : 'retryable';
+        : mutation.outcome === 'REJECTED'
+          ? 'rejected'
+          : 'retryable';
   return {
     status,
     errorCode: mutation.error?.code ?? `LIVE_${mutation.outcome}`,
@@ -847,6 +850,7 @@ export async function isClaimedLiveJobAuthorized(
     || config.liveAcceptedPolicyVersion !== LIVE_POLICY_VERSION
     || config.liveAcceptedConfigVersion !== job.configVersion
   ) return false;
+  if (job.schedulingGeneration !== config.schedulingGeneration) return false;
   const readiness = await evaluateLiveGates(job.companyId);
   const failed = readiness.gates.filter((gate) => !gate.ok);
   if (failed.length === 0) return true;
@@ -1632,6 +1636,7 @@ export async function finishProductionLiveRun(
       ? 'retry'
       : completion.status === 'uncertain'
           || completion.status === 'retryable'
+          || completion.status === 'rejected'
           || completion.status === 'failed'
         ? 'terminal'
         : 'completed';

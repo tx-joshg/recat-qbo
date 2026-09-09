@@ -2,6 +2,7 @@ import cookieParser from 'cookie-parser';
 import express, { type Express } from 'express';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { errorMiddleware } from '../lib/http.js';
 import { transactionActionsRouter } from './transactions.js';
 
@@ -21,6 +22,7 @@ const SENTINELS = {
 } as const;
 
 const mocks = vi.hoisted(() => ({
+  assertProvider: vi.fn(),
   commitTransfer: vi.fn(),
   getTransferOperation: vi.fn(),
   membershipFindUnique: vi.fn(),
@@ -33,8 +35,14 @@ const mocks = vi.hoisted(() => ({
   userFindMany: vi.fn(),
 }));
 
+vi.mock('../services/providerActionability.js', async (original) => ({
+  ...await original<typeof import('../services/providerActionability.js')>(),
+  assertTransactionProviderActionability: mocks.assertProvider,
+}));
+
 vi.mock('../lib/prisma.js', () => ({
   prisma: {
+    company: { findUnique: vi.fn(async () => ({ holdingAccountIds: [] })) },
     membership: { findUnique: mocks.membershipFindUnique },
     session: { findUnique: mocks.sessionFindUnique },
     transaction: {
@@ -148,6 +156,7 @@ function transferResult(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.assertProvider.mockReset().mockResolvedValue(undefined);
   role = 'categorizer';
   mocks.sessionFindUnique.mockResolvedValue({
     expiresAt: new Date(Date.now() + 60_000),
@@ -194,6 +203,19 @@ afterEach(() => {
 });
 
 describe('POST /api/transactions/:id/transfer', () => {
+  it.each([SOURCE_ID, COUNTERPART_ID])('requires current provider eligibility for transfer leg %s', async (blockedId) => {
+    mocks.assertProvider.mockImplementation(async (_companyId, transactionId) => {
+      if (transactionId === blockedId) throw new QboWriteSafetyError('QBO_PERIOD_CLOSED');
+    });
+    const response = await request(testApp()).post(`/api/transactions/${SOURCE_ID}/transfer`)
+      .set(sessionHeaders).send({ counterpartTxnId: COUNTERPART_ID });
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('QBO_PERIOD_CLOSED');
+    expect(mocks.assertProvider).toHaveBeenCalledWith(COMPANY_ID, blockedId);
+    expect(mocks.prepareTransfer).not.toHaveBeenCalled();
+    expect(mocks.commitTransfer).not.toHaveBeenCalled();
+  });
+
   it('keeps session and company-role authorization ahead of the shared write boundary', async () => {
     const unauthenticated = await request(testApp())
       .post(`/api/transactions/${SOURCE_ID}/transfer`)

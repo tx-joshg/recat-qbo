@@ -1,7 +1,11 @@
+import { commitMcpRuleChange, prepareMcpRuleChange, type CommitMcpRuleChangeInput, type PrepareMcpRuleChangeInput } from '../services/mcp/rules.js';
+import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod-v4';
 import {
+  getPreparedMcpCategorization,
   prepareMcpCategorization,
+  type GetPreparedMcpCategorizationInput,
   type PrepareMcpCategorizationInput,
 } from '../services/mcp/categorization.js';
 import {
@@ -18,6 +22,14 @@ import {
   prepareMcpUndo,
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
+import {
+  acknowledgeMcpTaxRefundRecorded,
+  cancelMcpTaxRefund,
+  prepareMcpTaxRefund,
+  type AcknowledgeMcpTaxRefundRecordedInput,
+  type CancelMcpTaxRefundInput,
+  type PrepareMcpTaxRefundInput,
+} from '../services/mcp/taxRefund.js';
 import {
   commitMcpTransfer,
   prepareMcpTransfer,
@@ -43,6 +55,7 @@ import {
 
 const CORE_MUTATION_TOOL_NAMES = [
   'prepare_categorization',
+  'get_prepared_categorization',
   'commit_categorization',
   'get_operation',
   'retry_operation',
@@ -50,6 +63,11 @@ const CORE_MUTATION_TOOL_NAMES = [
   'commit_undo',
   'prepare_transfer',
   'commit_transfer',
+  'prepare_tax_refund',
+  'cancel_tax_refund',
+  'acknowledge_tax_refund_recorded',
+  'prepare_rule_change',
+  'commit_rule_change',
 ] as const;
 
 export const MUTATION_TOOL_NAMES = [
@@ -64,6 +82,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: PrepareMcpCategorizationInput,
   ): ReturnType<typeof prepareMcpCategorization>;
+  getPreparedCategorization(
+    principal: McpPrincipal,
+    input: GetPreparedMcpCategorizationInput,
+  ): ReturnType<typeof getPreparedMcpCategorization>;
   commitCategorization(
     principal: McpPrincipal,
     input: CommitMcpCategorizationInput,
@@ -92,12 +114,33 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: { operationId: string; idempotencyKey?: string },
   ): ReturnType<typeof commitMcpTransfer>;
+  prepareTaxRefund(
+    principal: McpPrincipal,
+    input: PrepareMcpTaxRefundInput,
+  ): ReturnType<typeof prepareMcpTaxRefund>;
+  cancelTaxRefund(
+    principal: McpPrincipal,
+    input: CancelMcpTaxRefundInput,
+  ): ReturnType<typeof cancelMcpTaxRefund>;
+  acknowledgeTaxRefundRecorded(
+    principal: McpPrincipal,
+    input: AcknowledgeMcpTaxRefundRecordedInput,
+  ): ReturnType<typeof acknowledgeMcpTaxRefundRecorded>;
+  prepareRuleChange(
+    principal: McpPrincipal,
+    input: PrepareMcpRuleChangeInput,
+  ): ReturnType<typeof prepareMcpRuleChange>;
+  commitRuleChange(
+    principal: McpPrincipal,
+    input: CommitMcpRuleChangeInput,
+  ): ReturnType<typeof commitMcpRuleChange>;
 }
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   ...mcpAttachmentOperations,
   ...mcpReceiptOperations,
   prepareCategorization: prepareMcpCategorization,
+  getPreparedCategorization: getPreparedMcpCategorization,
   commitCategorization: commitMcpCategorization,
   getOperation: getMcpOperation,
   retryOperation: retryMcpOperation,
@@ -105,6 +148,11 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   commitUndo: commitMcpUndo,
   prepareTransfer: prepareMcpTransfer,
   commitTransfer: commitMcpTransfer,
+  prepareTaxRefund: prepareMcpTaxRefund,
+  cancelTaxRefund: cancelMcpTaxRefund,
+  acknowledgeTaxRefundRecorded: acknowledgeMcpTaxRefundRecorded,
+  prepareRuleChange: prepareMcpRuleChange,
+  commitRuleChange: commitMcpRuleChange,
 });
 
 interface McpMutationToolDefinition {
@@ -157,15 +205,71 @@ const proposalLine = z.strictObject({
   tagIds: uniqueTagIds,
 });
 const proposal = z.strictObject({
+  taxDisposition: z.enum(['set', 'preserve_current']).optional(),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(proposalLine).min(1).max(MAX_LINES),
   tagIds: uniqueTagIds,
 }).superRefine((value, context) => {
+  if (value.taxDisposition === 'preserve_current') {
+    if (value.lines.length !== 1) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current requires exactly one line.',
+        path: ['lines'],
+      });
+    }
+    if (value.tagIds.length !== 0) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Preserve-current cannot change transaction tags.',
+        path: ['tagIds'],
+      });
+    }
+    for (const [index, line] of value.lines.entries()) {
+      if (line.taxCodeQboId == null) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current requires an explicit source tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (line.memo !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line memos.',
+          path: ['lines', index, 'memo'],
+        });
+      }
+      if (line.tagIds.length !== 0) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Preserve-current cannot change line tags.',
+          path: ['lines', index, 'tagIds'],
+        });
+      }
+    }
+    return;
+  }
+
+  const explicitNon = value.taxCalculation === 'NotApplicable'
+    && value.lines.some((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE);
   for (const [index, line] of value.lines.entries()) {
-    if (
-      value.taxCalculation === 'NotApplicable'
-      && line.taxCodeQboId != null
-    ) {
+    if (value.taxCalculation === 'NotApplicable' && line.taxCodeQboId != null) {
+      if (line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'NotApplicable lines can select only the literal NON tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (explicitNon && line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Explicit NON requires the literal NON tax code on every line.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+    } else if (explicitNon) {
       context.addIssue({
         code: 'custom',
         message: 'NotApplicable lines cannot select a tax code.',
@@ -192,6 +296,11 @@ const prepareCategorizationInput = z.strictObject({
   idempotencyKey,
   proposal,
 });
+const getPreparedCategorizationInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  idempotencyKey,
+});
 const operationWithOptionalIdempotencyInput = z.strictObject({
   operationId: uuid,
   idempotencyKey: idempotencyKey.optional(),
@@ -210,6 +319,107 @@ const prepareTransferInput = z.strictObject({
   idempotencyKey: idempotencyKey.optional(),
 });
 
+const prepareTaxRefundInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey,
+  taxAgencyQboId: qboReference,
+  filedReturnRef: qboReference,
+  filingEvidenceSha256: z.string().regex(SHA256),
+  suspenseAccountQboId: qboReference,
+  bankAccountQboId: qboReference,
+  refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+  principalCents: safeInteger.refine((value) => value > 0),
+  interestCents: safeInteger.refine((value) => value >= 0).optional(),
+  interestAccountQboId: qboReference.optional(),
+}).superRefine((value, context) => {
+  const interestCents = value.interestCents ?? 0;
+  if ((interestCents > 0) !== (value.interestAccountQboId !== undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['interestAccountQboId'],
+      message: 'An interest account is required exactly when CRA interest is present.',
+    });
+  }
+});
+const cancelTaxRefundInput = z.strictObject({
+  operationId: uuid,
+  confirmNoQuickBooksAction: z.literal(true),
+});
+const acknowledgeTaxRefundRecordedInput = z.strictObject({
+  operationId: uuid,
+  confirmQuickBooksActionPerformed: z.literal(true),
+});
+
+const ruleMutation = z.enum([
+  'create', 'update', 'review', 'enable', 'disable',
+  'activate_candidate', 'dismiss_candidate',
+]);
+
+const taxCalculation = z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']);
+
+const ruleChangeProposal = z.strictObject({
+  matchText: z.string().trim().min(1).max(200).optional(),
+  direction: z.enum(['Purchase', 'Deposit']).optional(),
+  categoryQboId: qboReference.optional(),
+  taxCalculation: taxCalculation.optional(),
+  taxCodeQboId: qboReference.nullable().optional(),
+  tagIds: uniqueTagIds.optional(),
+  autoPost: z.boolean().optional(),
+  sourceCaseId: uuid.nullable().optional(),
+  reviewReason: z.string().trim().min(1).max(500).optional(),
+});
+
+const prepareRuleChangeInput = z.strictObject({
+  companyId: uuid,
+  mutation: ruleMutation,
+  ruleId: uuid.optional(),
+  candidateId: uuid.optional(),
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey,
+  retryOfId: uuid.optional(),
+  proposal: ruleChangeProposal.optional(),
+}).superRefine((value, context) => {
+  const hasRule = value.ruleId !== undefined;
+  const hasCandidate = value.candidateId !== undefined;
+  const ruleMutationRequiresRule = ['update', 'review', 'enable', 'disable']
+    .includes(value.mutation);
+  const candidateMutation = ['activate_candidate', 'dismiss_candidate']
+    .includes(value.mutation);
+  if (hasRule !== ruleMutationRequiresRule || hasCandidate !== candidateMutation) {
+    context.addIssue({ code: 'custom', message: 'Mutation target does not match action.' });
+  }
+  if (value.mutation === 'create') {
+    const proposal = value.proposal;
+    if (
+      proposal?.matchText === undefined
+      || proposal.direction === undefined
+      || proposal.categoryQboId === undefined
+      || proposal.taxCalculation === undefined
+      || proposal.tagIds === undefined
+      || proposal.autoPost !== false
+    ) context.addIssue({ code: 'custom', path: ['proposal'], message: 'Create proposal is incomplete.' });
+  }
+  if (value.mutation === 'update' && Object.keys(value.proposal ?? {}).length === 0) {
+    context.addIssue({ code: 'custom', path: ['proposal'], message: 'Update proposal is empty.' });
+  }
+  if (
+    value.proposal?.taxCalculation === 'NotApplicable'
+    && value.proposal.taxCodeQboId != null
+  ) context.addIssue({ code: 'custom', path: ['proposal', 'taxCodeQboId'], message: 'NotApplicable cannot select tax.' });
+  if (
+    (value.proposal?.taxCalculation === 'TaxInclusive'
+      || value.proposal?.taxCalculation === 'TaxExcluded')
+    && value.proposal.taxCodeQboId == null
+  ) context.addIssue({ code: 'custom', path: ['proposal', 'taxCodeQboId'], message: 'Tax code is required.' });
+});
+
+const commitRuleChangeInput = z.strictObject({
+  operationId: uuid,
+  idempotencyKey,
+});
+
 const warnings = z.array(
   z.string().max(MAX_WARNING_LENGTH),
 ).max(MAX_WARNINGS);
@@ -218,6 +428,8 @@ const previewLine = z.strictObject({
   subtotalCents: safeInteger,
   taxCents: safeInteger,
   totalCents: safeInteger,
+  categoryQboId: qboReference,
+  taxCodeQboId: qboReference.nullable(),
 });
 const preparedCategorizationOutput = z.strictObject({
   operationId: uuid,
@@ -227,6 +439,7 @@ const preparedCategorizationOutput = z.strictObject({
   preview: z.strictObject({
     transactionId: uuid,
     revision: z.number().int().min(1).max(MAX_REVISION),
+    taxDisposition: z.enum(['set', 'preserve_current']),
     taxCalculation: z.enum([
       'TaxInclusive',
       'TaxExcluded',
@@ -252,6 +465,7 @@ const operationResult = z.strictObject({
     'UNCHANGED',
     'DRY_RUN',
     'RETRYABLE',
+    'REJECTED',
   ]),
   status: z.enum([
     'PENDING',
@@ -271,7 +485,7 @@ const attachmentOperationResult = z.strictObject({
 });
 const operationOutput = z.strictObject({
   operationId: uuid,
-  kind: z.enum(['categorization', 'transfer', 'undo', 'attachment']),
+  kind: z.enum(['categorization', 'transfer', 'undo', 'tax_refund', 'attachment']),
   companyId: uuid.optional(),
   transactionId: uuid.optional(),
   sourceRevision: revision.optional(),
@@ -281,6 +495,7 @@ const operationOutput = z.strictObject({
     'prepared',
     'committed',
     'retryable',
+    'rejected',
     'reconciliation_required',
     'expired',
     'cancelled',
@@ -291,6 +506,7 @@ const operationOutput = z.strictObject({
     'write_committing',
     'write_uncertain',
     'write_retryable',
+    'write_rejected',
     'write_unchanged',
     'verified',
     'dry_run',
@@ -422,7 +638,7 @@ const preparedUndoOutput = z.strictObject({
   expiresAt: z.iso.datetime(),
   preview: z.strictObject({
     action: z.literal('restore_purchase_categorization'),
-    resultingStatus: z.literal('REVERTED'),
+    resultingStatus: z.literal('PENDING'),
     direction: z.enum(['purchase', 'refund']),
     totalCents: safeInteger,
     totalTaxCents: safeInteger.nullable(),
@@ -441,6 +657,154 @@ const preparedTransferOutput = z.strictObject({
     legCount: z.literal(2),
     preparationDigest: z.string().regex(SHA256),
   }),
+});
+
+const preparedTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  expiresAt: z.iso.datetime(),
+  capability: z.literal('manual_required'),
+  preview: z.strictObject({
+    action: z.literal('record_gst_hst_refund'),
+    operatorPath: z.literal('Sales Tax > Filed > Record refund'),
+    sourceDepositQboId: qboReference,
+    taxAgencyQboId: qboReference,
+    filedReturnRef: qboReference,
+    filingEvidenceSha256: z.string().regex(SHA256),
+    suspenseAccountQboId: qboReference,
+    bankAccountQboId: qboReference,
+    refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+    principalCents: safeInteger,
+    interestCents: safeInteger,
+    interestAccountQboId: qboReference.nullable(),
+    totalBankCreditCents: safeInteger,
+    existingDepositTreatment: z.literal('replace_or_match_before_verification'),
+  }),
+  warnings,
+});
+const cancelledTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('cancelled'),
+  cancelledAt: z.iso.datetime(),
+});
+const acknowledgedTaxRefundRecordedOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('reconciliation_required'),
+  manualRecordedAt: z.iso.datetime(),
+});
+
+const ruleActionOutput = z.strictObject({
+  categoryQboId: qboReference,
+  taxCalculation,
+  taxCodeQboId: qboReference.nullable(),
+  tagIds: uniqueTagIds,
+  memo: z.string().max(MAX_MEMO_LENGTH).nullable().optional(),
+});
+
+const ruleConditionOutput = z.strictObject({
+  matchField: z.literal('payee'),
+  matchText: z.string().min(1).max(200),
+});
+
+const ruleSampleOutput = z.strictObject({
+  transactionId: uuid,
+  payee: z.string().min(1).max(500),
+  date: z.iso.datetime(),
+  amountCents: safeInteger,
+  status: z.enum(['PENDING', 'POSTED', 'DRY_RUN']),
+});
+
+const ruleConflictOutput = z.strictObject({
+  id: z.string().min(1).max(128),
+  companyId: uuid,
+  sourceId: z.string().min(1).max(128),
+  kind: z.enum(['case', 'candidate', 'rule', 'jurisdiction', 'tax']),
+  reason: z.string().min(1).max(500),
+  action: ruleActionOutput.nullable(),
+  actionSummary: z.strictObject({
+    categoryName: z.string().min(1).max(500),
+    taxCalculation,
+    taxCodeName: z.string().min(1).max(500).nullable(),
+    tagNames: z.array(z.string().min(1).max(500)).max(MAX_TAGS),
+  }).nullable(),
+  evidenceCount: z.number().int().min(0).max(10_000),
+});
+
+const rulePreviewOutput = z.strictObject({
+  operationId: uuid,
+  companyId: uuid,
+  ruleId: uuid.nullable(),
+  candidateId: uuid.nullable(),
+  mutation: ruleMutation,
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  currentRevision: revision,
+  proposedRevision: z.number().int().min(1).max(MAX_REVISION),
+  condition: ruleConditionOutput,
+  direction: z.enum(['Purchase', 'Deposit']).nullable(),
+  action: ruleActionOutput.nullable(),
+  categoryName: z.string().min(1).max(500),
+  taxCodeName: z.string().min(1).max(500).nullable(),
+  autoPost: z.boolean(),
+  affectedPendingCount: z.number().int().min(0).max(MAX_REVISION),
+  affectedProcessedCount: z.number().int().min(0).max(MAX_REVISION),
+  sampleTransactions: z.array(ruleSampleOutput).max(20),
+  conflicts: z.array(ruleConflictOutput).max(20),
+  warnings,
+  expiresAt: z.iso.datetime(),
+  preparationDigest: z.string().regex(SHA256),
+});
+
+const canonicalRuleRevisionOutput = z.strictObject({
+  id: z.string().min(1).max(128),
+  ruleId: uuid,
+  companyId: uuid,
+  revision,
+  state: z.enum(['enabled', 'disabled']),
+  condition: ruleConditionOutput,
+  direction: z.enum(['Purchase', 'Deposit']).nullable(),
+  action: z.strictObject({
+    version: z.literal(2),
+    direction: z.enum(['Purchase', 'Deposit']),
+    category: z.string().min(1).max(500),
+    categoryQboId: qboReference,
+    taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+    taxCodeQboId: qboReference.nullable(),
+    tagIds: z.array(uuid).max(50),
+  }).nullable(),
+  taxCodeName: z.string().min(1).max(500).nullable(),
+  autoPost: z.boolean(),
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  sourceCaseId: uuid.nullable(),
+  sourceCandidateId: uuid.nullable(),
+  changedBy: z.string().min(1).max(128).nullable(),
+  createdAt: z.iso.datetime(),
+  repairReason: z.string().min(1).max(500).nullable(),
+  affectedJournalEntryCount: z.number().int().nonnegative().nullable(),
+});
+
+const ruleMutationOutput = z.strictObject({
+  ok: z.boolean(),
+  operationId: uuid,
+  companyId: uuid,
+  mutation: ruleMutation,
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  status: z.enum(['PREPARED', 'COMMITTED', 'REPLAYED', 'REJECTED']),
+  ruleId: uuid.nullable(),
+  revision: revision.nullable(),
+  rule: canonicalRuleRevisionOutput.nullable(),
+  candidate: z.strictObject({
+    candidateId: uuid,
+    state: z.enum(['dismissed', 'activated']),
+    ruleId: uuid.nullable(),
+  }).nullable(),
+  preview: rulePreviewOutput.nullable(),
+  error: z.strictObject({
+    code: z.enum([
+      'INVALID_INPUT', 'FORBIDDEN', 'NOT_FOUND', 'COMPANY_UNAVAILABLE',
+      'UNKNOWN_JURISDICTION', 'SEMANTIC_UNAVAILABLE', 'CONFLICT',
+      'STALE_REVISION', 'INTERNAL',
+    ]),
+    message: z.string().min(1).max(500),
+  }).nullable(),
 });
 
 const prepareCategorizationAnnotations: ToolAnnotations = Object.freeze({
@@ -485,6 +849,18 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.prepareCategorization(
         principal,
         input as PrepareMcpCategorizationInput,
+      ),
+  },
+  {
+    name: 'get_prepared_categorization',
+    description: 'Recover an exact owned prepared categorization after a transport response was lost.',
+    inputSchema: getPreparedCategorizationInput,
+    outputSchema: preparedCategorizationOutput,
+    annotations: getOperationAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.getPreparedCategorization(
+        principal,
+        input as GetPreparedMcpCategorizationInput,
       ),
   },
   {
@@ -558,6 +934,75 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
         principal,
         input as { operationId: string; idempotencyKey?: string },
       ),
+  },
+  {
+    name: 'prepare_tax_refund',
+    description: 'Prepare a reviewed Canadian GST/HST refund. Returns the exact manual QuickBooks Tax Centre action when the public API cannot post it; it never recategorizes the source Deposit.',
+    inputSchema: prepareTaxRefundInput,
+    outputSchema: preparedTaxRefundOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareTaxRefund(
+        principal,
+        input as PrepareMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'cancel_tax_refund',
+    description: 'Cancel an unposted GST/HST refund preparation so corrected inputs can be prepared. Requires confirmation that no QuickBooks Tax Centre action occurred.',
+    inputSchema: cancelTaxRefundInput,
+    outputSchema: cancelledTaxRefundOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.cancelTaxRefund(
+        principal,
+        input as CancelMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'acknowledge_tax_refund_recorded',
+    description: 'Record that the manual QuickBooks Tax Centre refund action was performed. The operation remains reconciliation-required until exact readback is available.',
+    inputSchema: acknowledgeTaxRefundRecordedInput,
+    outputSchema: acknowledgedTaxRefundRecordedOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.acknowledgeTaxRefundRecorded(
+        principal,
+        input as AcknowledgeMcpTaxRefundRecordedInput,
+      ),
+  },
+  {
+    name: 'prepare_rule_change',
+    description: 'Validate and prepare a company-scoped rule lifecycle change.',
+    inputSchema: prepareRuleChangeInput,
+    outputSchema: ruleMutationOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareRuleChange(principal, input as PrepareMcpRuleChangeInput),
+  },
+  {
+    name: 'commit_rule_change',
+    description: 'Commit an owned prepared rule lifecycle change.',
+    inputSchema: commitRuleChangeInput,
+    outputSchema: ruleMutationOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.commitRuleChange(principal, input as CommitMcpRuleChangeInput),
   },
   ...attachmentToolDefinitions.map((definition) => ({
     ...definition,

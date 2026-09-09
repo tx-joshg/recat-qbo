@@ -21,13 +21,20 @@ type TagReference = { id: string; name: string };
 
 interface ApplicableRule {
   id: string;
+  ruleRevision: number;
   priority: number;
   matchField: 'payee';
   matchText: string;
-  categoryQboId: string;
-  taxCalculation: TaxCalculation;
-  taxCodeQboId: string | null;
-  tagIds: string[];
+  action: {
+    version: 2;
+    direction: 'Purchase' | 'Deposit';
+    category: string;
+    categoryQboId: string;
+    taxCalculation: TaxCalculation;
+    taxCodeQboId: string | null;
+    tagIds: string[];
+  };
+  autoPost: boolean;
 }
 
 interface SimilarLine {
@@ -81,7 +88,7 @@ export interface AgentSnapshotSource {
 }
 
 export interface AgentTransactionSnapshot {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly transaction: DeepReadonly<{ id: string; revision: number }>;
   readonly date: string;
   readonly signedAmountCents: number;
@@ -106,7 +113,7 @@ export class AgentSnapshotError extends Error {
 }
 
 export function buildAgentSnapshot(source: AgentSnapshotSource): AgentTransactionSnapshot {
-  return deepFreeze({ schemaVersion: 1 as const, ...normalizeSource(source) });
+  return deepFreeze({ schemaVersion: 2 as const, ...normalizeSource(source) });
 }
 
 export function serializeAgentSnapshot(snapshot: AgentTransactionSnapshot, maxBytes: number): string {
@@ -125,8 +132,8 @@ const sourceKeys = snapshotKeys.filter((key) => key !== 'schemaVersion');
 function validateSnapshot(snapshot: unknown): AgentTransactionSnapshot {
   const record = recordOf(snapshot);
   exactKeys(record, snapshotKeys);
-  if (record.schemaVersion !== 1) invalid();
-  const normalized = deepFreeze({ schemaVersion: 1 as const, ...normalizeSource(without(record, 'schemaVersion')) });
+  if (record.schemaVersion !== 2) invalid();
+  const normalized = deepFreeze({ schemaVersion: 2 as const, ...normalizeSource(without(record, 'schemaVersion')) });
   if (canonicalJson(record) !== canonicalJson(normalized)) invalid();
   return normalized;
 }
@@ -142,7 +149,7 @@ function normalizeSource(source: unknown): Omit<AgentTransactionSnapshot, 'schem
   const candidateCategories = boundedTop(record.candidateCategories, categoryReference, compareCategory);
   const tax = readiness(record.tax);
   const tags = boundedTop(record.tags, tagReference, compareTag);
-  const rules = boundedTop(record.rules, rule, compareRule);
+  const rules = boundedPreserved(record.rules, rule);
   const similarVerifiedTransactions = boundedTop(record.similarVerifiedTransactions, similarTransaction, compareSimilar);
   const normalized = {
     transaction: { id: uuid(transaction.id), revision: nonnegativeInteger(transaction.revision) },
@@ -198,11 +205,25 @@ function tagReference(value: unknown): TagReference {
 
 function rule(value: unknown): ApplicableRule {
   const record = recordOf(value);
-  exactKeys(record, ['id', 'priority', 'matchField', 'matchText', 'categoryQboId', 'taxCalculation', 'taxCodeQboId', 'tagIds']);
+  exactKeys(record, ['id', 'ruleRevision', 'priority', 'matchField', 'matchText', 'action', 'autoPost']);
+  const action = recordOf(record.action);
+  exactKeys(action, ['version', 'direction', 'category', 'categoryQboId', 'taxCalculation', 'taxCodeQboId', 'tagIds']);
+  if (action.version !== 2 || (action.direction !== 'Purchase' && action.direction !== 'Deposit')) invalid();
+  if (typeof record.autoPost !== 'boolean') invalid();
   return {
-    id: uuid(record.id), priority: boundedInteger(record.priority, 0, 1_000_000), matchField: matchField(record.matchField),
-    matchText: freeText(record.matchText, 160), categoryQboId: providerReference(record.categoryQboId),
-    taxCalculation: taxCalculation(record.taxCalculation), taxCodeQboId: nullableProviderReference(record.taxCodeQboId), tagIds: boundedIds(record.tagIds),
+    id: uuid(record.id), ruleRevision: boundedInteger(record.ruleRevision, 1, 2_147_483_647),
+    priority: boundedInteger(record.priority, 0, 1_000_000), matchField: matchField(record.matchField),
+    matchText: freeText(record.matchText, 160),
+    action: {
+      version: 2,
+      direction: action.direction,
+      category: freeText(action.category, 160),
+      categoryQboId: providerReference(action.categoryQboId),
+      taxCalculation: taxCalculation(action.taxCalculation),
+      taxCodeQboId: nullableProviderReference(action.taxCodeQboId),
+      tagIds: boundedIds(action.tagIds),
+    },
+    autoPost: record.autoPost,
   };
 }
 
@@ -238,9 +259,9 @@ function validateRetainedRelationships(value: {
   };
   const validateTags = (ids: string[]): void => { if (ids.some((id) => !tags.has(id))) invalid(); };
   for (const entry of value.rules) {
-    if (!categories.has(entry.categoryQboId)) invalid();
-    validateTax(entry.taxCalculation, entry.taxCodeQboId);
-    validateTags(entry.tagIds);
+    if (!categories.has(entry.action.categoryQboId)) invalid();
+    validateTax(entry.action.taxCalculation, entry.action.taxCodeQboId);
+    validateTags(entry.action.tagIds);
   }
   for (const transaction of value.similarVerifiedTransactions) {
     if (transaction.signedAmountCents === 0 || transaction.lines.length === 0) invalid();
@@ -262,6 +283,13 @@ function boundedTop<T extends { id?: string; qboId?: string; transactionId?: str
   const entries = value.map(normalize);
   unique(entries.map((entry) => entry.id ?? entry.qboId ?? entry.transactionId));
   return entries.sort(compare).slice(0, MAX_RETAINED_ITEMS);
+}
+
+function boundedPreserved<T extends { id?: string; qboId?: string; transactionId?: string }>(value: unknown, normalize: (entry: unknown) => T): T[] {
+  if (!Array.isArray(value) || value.length > MAX_SOURCE_COLLECTION_ITEMS) invalid();
+  const entries = value.map(normalize);
+  unique(entries.map((entry) => entry.id ?? entry.qboId ?? entry.transactionId));
+  return entries.slice(0, MAX_RETAINED_ITEMS);
 }
 
 function boundedLines(value: unknown): SimilarLine[] {
@@ -287,7 +315,6 @@ function unique(values: Array<string | undefined>): void { if (values.some((valu
 function compareCategory(left: CategoryReference, right: CategoryReference): number { return compareText(left.name, right.name) || compareText(left.qboId, right.qboId); }
 function compareTax(left: TaxReference, right: TaxReference): number { return compareText(left.label, right.label) || compareText(left.qboId, right.qboId); }
 function compareTag(left: TagReference, right: TagReference): number { return compareText(left.name, right.name) || compareText(left.id, right.id); }
-function compareRule(left: ApplicableRule, right: ApplicableRule): number { return left.priority - right.priority || compareText(left.matchText, right.matchText) || compareText(left.id, right.id); }
 function compareLine(left: SimilarLine, right: SimilarLine): number { return compareText(left.categoryQboId, right.categoryQboId) || compareNumber(left.signedGrossCents, right.signedGrossCents) || compareText(left.taxCodeQboId ?? '', right.taxCodeQboId ?? '') || compareText(left.memo ?? '', right.memo ?? '') || compareText(left.tagIds.join(','), right.tagIds.join(',')); }
 function compareSimilar(left: SimilarVerifiedTransaction, right: SimilarVerifiedTransaction): number { return compareText(right.verifiedAt, left.verifiedAt) || compareText(right.date, left.date) || compareText(left.transactionId, right.transactionId); }
 function compareText(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0; }

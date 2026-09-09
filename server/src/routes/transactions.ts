@@ -1,3 +1,4 @@
+import { QboRateLimitError } from '../lib/qbo/types.js';
 // Transaction routes — two routers:
 //   companyTransactionsRouter  → /api/companies/:companyId/transactions (queue list)
 //   transferCandidatesRouter   → /api/companies/:companyId/transfer-candidates
@@ -11,8 +12,10 @@ import { Prisma } from '@prisma/client';
 import type { User } from '@prisma/client';
 import {
   MAX_EXPECTED_TRANSACTION_REVISION,
+  type ProviderActionabilityDisposition,
   type CategorizationMutationResult,
   type CommitCategorizationBody,
+  type ManualStageCategorizationBody,
   type ReconcileCategorizationBody,
   type StageCategorizationBody,
   type TransactionDto,
@@ -24,7 +27,7 @@ import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { getTaxReadiness } from '../services/tax/reference.js';
-import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
+import { suggestForMany } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import {
   filterTransactionDtos,
@@ -33,9 +36,20 @@ import {
   transactionReadInclude,
   type TransactionReadRow,
 } from '../services/companyReads.js';
+import {
+  PROVIDER_ACTIONABILITY_DISPOSITIONS,
+  assertTransactionProviderActionability,
+  effectiveProviderActionabilityCounts,
+  providerDispositionIsBlocked,
+} from '../services/providerActionability.js';
+import {
+  MAX_ACTIONABILITY_REFRESH_LIMIT,
+  refreshProviderActionability,
+} from '../services/providerActionabilityRefresh.js';
 
 export { transactionDtos } from '../services/companyReads.js';
 import { stageCategorization } from '../services/categorization.js';
+import { stageRuleSuggestion } from '../services/ruleSuggestionApplication.js';
 import {
   isLiveReconciliationOwnedRequest,
   loadLiveReconciliationRequest,
@@ -115,6 +129,7 @@ const txnStatusSchema = z.enum(['PENDING', 'POSTING', 'POSTED', 'DRY_RUN', 'ERRO
 
 const listQuery = z.object({
   status: txnStatusSchema.optional(),
+  providerDisposition: z.enum(PROVIDER_ACTIONABILITY_DISPOSITIONS as [ProviderActionabilityDisposition, ...ProviderActionabilityDisposition[]]).optional(),
   search: z.string().optional(),
   account: z.string().optional(),
   cursor: z.string().optional(),
@@ -122,6 +137,11 @@ const listQuery = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true' || v === '1'),
+});
+
+const actionabilityRefreshQuery = z.object({
+  cursor: z.string().min(1).max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_ACTIONABILITY_REFRESH_LIMIT).optional(),
 });
 
 export const companyTransactionsRouter = Router({ mergeParams: true });
@@ -133,20 +153,85 @@ companyTransactionsRouter.get(
     const company = req.company;
     if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
     const query = validate(listQuery)(req.query);
+    const supportsActionability = Boolean(
+      (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
+    );
 
-    // Queue badge: everything still waiting for a human (pending or errored).
-    const pendingCount = await prisma.transaction.count({
-      where: { companyId: company.id, status: { in: ['PENDING', 'ERROR'] } },
-    });
+    // Queue badge: pending local work belongs to the one queue unless QBO is
+    // already known to lock it. UNKNOWN remains visible and every actual write
+    // still performs a fresh provider check.
+    const pendingWhere: Prisma.TransactionWhereInput = {
+      companyId: company.id,
+      status: { in: ['PENDING', 'ERROR'] as TxnStatus[] },
+    };
+    const providerCounts = supportsActionability
+      ? effectiveProviderActionabilityCounts(
+          await prisma.transaction.findMany({
+            where: pendingWhere,
+            select: {
+              id: true,
+              companyId: true,
+              revision: true,
+              qboSyncToken: true,
+              qboType: true,
+              qboId: true,
+              date: true,
+              providerActionability: true,
+            },
+          }),
+        )
+      : null;
+    const totalPending = providerCounts?.total
+      ?? await prisma.transaction.count({ where: pendingWhere });
+    const actionableCount = providerCounts?.actionable ?? totalPending;
+    const blockedCount = providerCounts?.blocked ?? 0;
+    const pendingCount = supportsActionability
+      ? Math.max(0, totalPending - blockedCount)
+      : totalPending;
     if (query.countOnly) {
-      res.json({ transactions: [], nextCursor: null, pendingCount });
+      res.json({
+        transactions: [],
+        nextCursor: null,
+        pendingCount,
+        ...(supportsActionability
+          ? {
+              actionableCount,
+              blockedCount,
+              unknownCount: providerCounts?.unknown ?? 0,
+            }
+          : {}),
+      });
       return;
     }
 
-    // The queue shows posted/dry-run/error rows too; only SUPERSEDED is hidden.
+    // Default reads power the interactive Queue and therefore return only
+    // pending/error work plus in-flight posts so a refresh cannot hide an
+    // operation before its terminal outcome. Explicit status reads remain
+    // available to other surfaces and diagnostics, except SUPERSEDED which is
+    // never interactive.
     // Prototype order: date ascending as entered.
+    const queueWhere: Prisma.TransactionWhereInput = query.status === undefined
+      ? {
+          companyId: company.id,
+          OR: [
+            { status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+            {
+              status: 'POSTED',
+              qboMutationAttempts: {
+                some: {
+                  operation: 'restore',
+                  status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] },
+                },
+              },
+            },
+          ],
+        }
+      : {
+          companyId: company.id,
+          status: query.status === 'SUPERSEDED' ? { in: [] } : query.status,
+        };
     const rows = await prisma.transaction.findMany({
-      where: { companyId: company.id, status: { not: 'SUPERSEDED' } },
+      where: queueWhere,
       include: transactionReadInclude,
       orderBy: { date: 'asc' },
     });
@@ -162,8 +247,63 @@ companyTransactionsRouter.get(
     } else {
       dtos = filterTransactionDtos(dtos, query);
     }
+    if (query.status === undefined) {
+      dtos = dtos.filter((dto) =>
+        dto.status === 'PENDING'
+        || dto.status === 'ERROR'
+        || dto.status === 'POSTING'
+        || (dto.status === 'POSTED' && dto.activeCategorizationAttempt?.operation === 'restore'),
+      );
+    }
+    if (
+      supportsActionability
+      && query.status === undefined
+      && query.providerDisposition === undefined
+    ) {
+      dtos = dtos.filter((dto) => !providerDispositionIsBlocked(
+        dto.providerActionability?.disposition ?? 'UNKNOWN',
+      ));
+    }
+    res.json({
+      transactions: dtos,
+      nextCursor: null,
+      pendingCount,
+      ...(supportsActionability
+        ? {
+            actionableCount,
+            blockedCount,
+            unknownCount: providerCounts?.unknown ?? 0,
+          }
+        : {}),
+    });
+  }),
+);
 
-    res.json({ transactions: dtos, nextCursor: null, pendingCount });
+/**
+ * Refresh one bounded page of provider safety observations. This is a
+ * read-only QBO operation; callers resume with nextCursor until complete.
+ */
+companyTransactionsRouter.post(
+  '/actionability/refresh',
+  asyncHandler(async (req, res) => {
+    const company = req.company;
+    if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    const user = requestUser(req);
+    const query = validate(actionabilityRefreshQuery)(req.query);
+    try {
+      const result = await refreshProviderActionability(user.id, company.id, query);
+      res.json(result);
+    } catch (error) {
+      if (error instanceof QboRateLimitError) {
+        res.set('Retry-After', String(error.retryAfterSeconds));
+        throw new HttpError(
+          429,
+          'QuickBooks is temporarily rate limited. Retry this status check.',
+          'RATE_LIMITED',
+        );
+      }
+      throw error;
+    }
   }),
 );
 
@@ -206,6 +346,13 @@ transferCandidatesRouter.get(
       const first = byId.get(idA);
       const second = byId.get(idB);
       if (!first || !second) continue;
+      const hasProviderIndex = first.providerActionability !== undefined
+        || second.providerActionability !== undefined;
+      if (
+        hasProviderIndex
+        && (first.providerActionability?.disposition !== 'WRITABLE'
+          || second.providerActionability?.disposition !== 'WRITABLE')
+      ) continue;
       // Money-out leg first, for a stable presentation.
       const [a, b] = first.amount < 0 ? [first, second] : [second, first];
       pairs.push({ a, b });
@@ -251,7 +398,7 @@ const requestIdSchema = z.string().uuid();
 const uniqueTagIdsSchema = z.array(z.string().uuid()).max(50)
   .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.');
 
-const stageCategorizationLineSchema: z.ZodType<StageCategorizationBody['lines'][number]> = z.object({
+const stageCategorizationLineSchema: z.ZodType<ManualStageCategorizationBody['lines'][number]> = z.object({
   grossCents: z.number().refine(Number.isSafeInteger, 'Line cents must be a safe integer.'),
   categoryQboId: qboReferenceSchema,
   taxCodeQboId: qboReferenceSchema.nullable(),
@@ -259,7 +406,7 @@ const stageCategorizationLineSchema: z.ZodType<StageCategorizationBody['lines'][
   tagIds: uniqueTagIdsSchema,
 }).strict();
 
-const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.object({
+const manualStageCategorizationBodySchema = z.object({
   expectedRevision: expectedRevisionSchema,
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(stageCategorizationLineSchema).min(1).max(20),
@@ -282,6 +429,48 @@ const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.obje
     }
   }
 });
+
+const ruleActionV2Schema = z.object({
+  version: z.literal(2),
+  direction: z.enum(['Purchase', 'Deposit']),
+  category: z.string().trim().min(1).max(500),
+  categoryQboId: qboReferenceSchema,
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+  taxCodeQboId: qboReferenceSchema.nullable(),
+  tagIds: uniqueTagIdsSchema,
+}).strict().superRefine((action, context) => {
+  if (action.taxCalculation === 'NotApplicable' && action.taxCodeQboId !== null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'NotApplicable rules cannot use a tax code.',
+      path: ['taxCodeQboId'],
+    });
+  }
+  if (action.taxCalculation !== 'NotApplicable' && action.taxCodeQboId === null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Taxed rules require a tax code.',
+      path: ['taxCodeQboId'],
+    });
+  }
+});
+
+const ruleSuggestionStageBodySchema = z.object({
+  expectedRevision: expectedRevisionSchema,
+  ruleSuggestion: z.object({
+    source: z.literal('rule'),
+    version: z.literal(2),
+    ruleId: z.string().trim().min(1).max(128),
+    ruleRevision: z.number().int().min(1).max(MAX_EXPECTED_TRANSACTION_REVISION),
+    action: ruleActionV2Schema,
+    autoPost: z.boolean(),
+  }).strict(),
+}).strict();
+
+const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.union([
+  ruleSuggestionStageBodySchema,
+  manualStageCategorizationBodySchema,
+]);
 
 const commitCategorizationBodySchema: z.ZodType<CommitCategorizationBody> = z.object({
   expectedRevision: expectedRevisionSchema,
@@ -432,6 +621,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   ATTEMPT_CORRUPT: { status: 500, message: 'Mutation state could not be verified.' },
   ATTEMPT_NOT_FOUND: { status: 404, message: 'Mutation attempt not found.' },
   COMPANY_DISCONNECTED: { status: 409, message: 'This company is disconnected from QuickBooks.' },
+  DB_COMMIT_FAILED: {
+    status: 409,
+    message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+  },
   ENTITY_BUSY: { status: 409, message: 'Another write is already in progress.' },
   FORBIDDEN: { status: 403, message: 'You do not have permission to do that.' },
   INVALID_ACCOUNT: { status: 400, message: 'One or more category accounts are unavailable for this company.' },
@@ -466,9 +659,16 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
     message: 'This live mutation is no longer bound to the current transaction state.',
   },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
+  RULE_SUGGESTION_BUSY: { status: 409, message: 'Rule state is changing. Retry this suggestion.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
+  STALE_RULE_SUGGESTION: {
+    status: 409,
+    message: 'This rule suggestion changed. Reload before continuing.',
+  },
+  SUPERSEDED: { status: 409, message: 'This transaction was already categorized in QuickBooks.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
   TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
+  UNDO_WINDOW_EXPIRED: { status: 409, message: 'The 30-day undo window is unavailable for this transaction.' },
   TAX_AWARE_STAGING_REQUIRED: {
     status: 409,
     message: 'Tax-ready transactions must use staged categorization.',
@@ -518,6 +718,14 @@ function throwMappedServiceError(error: unknown): never {
   throw error;
 }
 
+async function assertProviderWritable(companyId: string, transactionId: string): Promise<void> {
+  try {
+    await assertTransactionProviderActionability(companyId, transactionId);
+  } catch (error) {
+    throwMappedServiceError(error);
+  }
+}
+
 const SAFE_OUTCOME_ERRORS: Partial<Record<
   DurableMutationResult['outcome'],
   { code: string; message: string }
@@ -534,6 +742,15 @@ const SAFE_OUTCOME_ERRORS: Partial<Record<
     code: 'QBO_WRITE_UNCERTAIN',
     message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
   },
+  REJECTED: {
+    code: 'QBO_WRITE_REJECTED',
+    message: 'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.',
+  },
+};
+
+const OPERATION_RECONCILIATION_REQUIRED_ERROR = {
+  code: 'OPERATION_RECONCILIATION_REQUIRED',
+  message: 'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.',
 };
 
 function sendMutationResult(
@@ -554,10 +771,16 @@ function sendMutationResult(
     status: result.status,
     outcome: result.outcome,
   };
-  const safeError = SAFE_OUTCOME_ERRORS[result.outcome];
+  const reconciliationRequired = result.error?.code
+    === OPERATION_RECONCILIATION_REQUIRED_ERROR.code;
+  const safeError = reconciliationRequired
+    ? OPERATION_RECONCILIATION_REQUIRED_ERROR
+    : SAFE_OUTCOME_ERRORS[result.outcome];
   if (!result.ok && safeError) safe.error = safeError;
-  const status = result.outcome === 'IN_PROGRESS' ? 202
+  const status = reconciliationRequired ? 409
+    : result.outcome === 'IN_PROGRESS' ? 202
     : result.outcome === 'UNCERTAIN' || result.outcome === 'RETRYABLE' ? 409
+      : result.outcome === 'REJECTED' ? 422
       : 200;
   res.status(status).json(safe);
 }
@@ -585,13 +808,6 @@ async function resolveCategoryQboId(
   return acct?.qboId ?? null;
 }
 
-async function loadRuleLikes(companyId: string): Promise<RuleLike[]> {
-  return prisma.rule.findMany({
-    where: { companyId },
-    select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
-  });
-}
-
 export const transactionActionsRouter = Router();
 transactionActionsRouter.use(requireUser);
 
@@ -603,16 +819,25 @@ transactionActionsRouter.post(
     await assertCategorizationRouteAccess(requestUser(req), scope.companyId);
     await assertCompanyConnected(scope.companyId);
     try {
-      const staged = await stageCategorization({
-        transactionId: scope.transactionId,
-        companyId: scope.companyId,
-        expectedRevision: body.expectedRevision,
-        proposal: {
-          taxCalculation: body.taxCalculation,
-          lines: body.lines,
-          tagIds: body.tagIds,
-        },
-      });
+      // Staging is Recat-local. The commit path performs a fresh QBO safety
+      // check immediately before any provider write.
+      const staged = 'ruleSuggestion' in body
+        ? await stageRuleSuggestion({
+            transactionId: scope.transactionId,
+            companyId: scope.companyId,
+            expectedRevision: body.expectedRevision,
+            suggestion: body.ruleSuggestion,
+          })
+        : await stageCategorization({
+            transactionId: scope.transactionId,
+            companyId: scope.companyId,
+            expectedRevision: body.expectedRevision,
+            proposal: {
+              taxCalculation: body.taxCalculation,
+              lines: body.lines,
+              tagIds: body.tagIds,
+            },
+          });
       res.json(boundedStageCategorizationResponse(staged, scope.transactionId));
     } catch (error) {
       throwMappedServiceError(error);
@@ -634,6 +859,7 @@ transactionActionsRouter.post(
         expectedRevision: body.expectedRevision,
         requestId: body.requestId,
         actor: actorFor(user),
+        captureManualApproval: true,
       });
       sendMutationResult(res, result, {
         transactionId: scope.transactionId,
@@ -741,9 +967,10 @@ transactionActionsRouter.post(
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
     const companyId = txn.companyId;
+    // Draft categorization is Recat-local and remains available while a
+    // cached provider observation is missing or stale.
     const amount = Number(txn.amount);
     const data: Prisma.TransactionUpdateInput = {};
-    let stagedCategory: string | null = null;
 
     if (body.splits && body.splits.length > 0) {
       const splitCheck = validateSplits(amount, body.splits);
@@ -782,7 +1009,6 @@ transactionActionsRouter.post(
           data.category = null;
           data.categoryQboId = null;
         } else {
-          stagedCategory = body.category;
           data.category = body.category;
           data.categoryQboId = await resolveCategoryQboId(companyId, body.category, body.categoryQboId);
           data.splitLines = { deleteMany: {} }; // single category replaces any staged splits
@@ -803,22 +1029,8 @@ transactionActionsRouter.post(
       }
     }
 
-    // Prototype behavior: accepting a rule's suggested category also applies
-    // the rule's tags (merged into whatever is already staged).
-    if (stagedCategory !== null) {
-      const rules = await loadRuleLikes(companyId);
-      const match = ruleSuggestion(txn.payee, rules);
-      if (match?.ruleId !== undefined && match.category === stagedCategory) {
-        const ruleTags = await prisma.ruleTag.findMany({ where: { ruleId: match.ruleId } });
-        for (const rt of ruleTags) {
-          await prisma.txnTag.upsert({
-            where: { txnId_tagId: { txnId: id, tagId: rt.tagId } },
-            create: { txnId: id, tagId: rt.tagId },
-            update: {},
-          });
-        }
-      }
-    }
+    // Manual edits apply only explicit user choices. Complete rule actions
+    // (including tags and tax) require revision-verified rule suggestion staging.
 
     res.json(await dtoById(id));
   }),
@@ -835,6 +1047,8 @@ transactionActionsRouter.post(
     const txn = await loadTxn(id); // 404 before the write-back service's plain Errors
     await assertCategorizerFor(user, txn.companyId);
 
+    // postTransaction fetches current QBO state and enforces write safety at
+    // the write boundary; a cached actionability observation is not a gate.
     let result;
     try {
       result = await postTransaction(id, actorFor(user));
@@ -860,8 +1074,13 @@ transactionActionsRouter.post(
       dto.category !== null &&
       (dto.splits === null || dto.splits.length === 0)
     ) {
-      const rules = await loadRuleLikes(dto.companyId);
-      rulePromptEligible = ruleSuggestion(dto.payee, rules) === null;
+      const [suggestion] = await suggestForMany(dto.companyId, [{
+        payee: dto.payee,
+        memo: dto.memo,
+        amount: dto.amount,
+        qboType: dto.qboType,
+      }]);
+      rulePromptEligible = suggestion?.source !== 'rule';
     }
 
     res.status(202).json({ ...dto, rulePromptEligible });
@@ -876,12 +1095,18 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    let result;
     try {
-      await undoPost(id, actorFor(user));
+      result = await undoPost(id, actorFor(user));
     } catch (err) {
       const mapped = mappedServiceHttpError(err);
       if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
+    }
+    if (!result.ok) {
+      const mapped = mappedServiceHttpError(result.error);
+      if (mapped) throw mapped;
+      throw new HttpError(409, 'The QuickBooks undo could not be verified.', 'UNDO_FAILED');
     }
     res.json(await dtoById(id));
   }),
@@ -895,6 +1120,8 @@ transactionActionsRouter.post(
     const txn = await loadTxn(id);
     await assertCategorizerFor(requestUser(req), txn.companyId);
     try {
+      // retryError refreshes the provider snapshot but only changes Recat
+      // state; a cached actionability observation is not a gate.
       await retryError(id);
     } catch (err) {
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'RETRY_FAILED');
@@ -912,6 +1139,8 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    await assertProviderWritable(txn.companyId, id);
+    await assertProviderWritable(txn.companyId, counterpartTxnId);
     try {
       await recordTransfer(id, counterpartTxnId, actorFor(user));
     } catch (err) {

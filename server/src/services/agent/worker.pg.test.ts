@@ -20,6 +20,7 @@ import {
   type ShadowWorkerDb,
   type ShadowWorkerDeps,
 } from './worker.js';
+import { appendRuleRevision } from '../ruleRevisionHistory.js';
 import { acquireAgentJobSuiteLock } from '../../test/postgresSuiteLock.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -95,6 +96,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         holdingAccountIds: ['holding'],
         dryRun: true,
         taxSupportStatus: 'needs_setup',
+        ruleRuntimeMode: 'canonical',
       },
     });
     await firstClient.agentCompanyConfig.create({
@@ -138,19 +140,22 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         active: true,
       }],
     });
-    await firstClient.rule.create({
+    const rule = await firstClient.rule.create({
       data: {
         id: RULE_ID,
         companyId: company.id,
         priority: 1,
         matchField: 'payee',
         matchText: 'Generic',
+        direction: 'Purchase', canonicalVersion: 2, revision: 1,
         category: 'Generic expense',
         categoryQboId: 'expense-a',
         taxCalculation: 'NotApplicable',
         taxCodeQboId: null,
       },
+      include: { ruleTags: true },
     });
+    await appendRuleRevision(firstClient, rule, null);
     const verifiedHistory = await firstClient.transaction.create({
       data: {
         companyId: company.id,
@@ -608,6 +613,23 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
     } finally {
       await cleanup(fixture);
     }
+  });
+
+  it('rejects a superseded scheduling intent after run start without inference', async () => {
+    const fixture = await seed();
+    try {
+      const decision = model('decision-model');
+      await runClaimedShadowJob(fixture.job, deps(decision, model('review-model'), {
+        afterStarted: async () => {
+          await secondClient.agentCompanyConfig.update({
+            where: { companyId: fixture.companyId }, data: { schedulingGeneration: { increment: 1 } },
+          });
+        },
+      }));
+      expect(decision.nextTurn).not.toHaveBeenCalled();
+      await expect(firstClient.agentRun.findFirstOrThrow({ where: { jobId: fixture.job.id } }))
+        .resolves.toMatchObject({ status: 'failed', errorCode: 'AGENT_SUPERSEDED' });
+    } finally { await cleanup(fixture); }
   });
 
   it('revalidates after the started run and records stale without inference', async () => {

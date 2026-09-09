@@ -490,7 +490,7 @@ export default function AutopilotCard({
           limit: updated.dailyLiveWriteLimit,
         },
       });
-      toast('Shadow autopilot settings saved');
+      toast('Autopilot settings saved');
     } catch (error) {
       if (generationRef.current === generation) toast(errorMessage(error));
     } finally {
@@ -517,7 +517,7 @@ export default function AutopilotCard({
               earliestDueAt: null,
             },
           });
-      toast(`${result.cancelled} queued shadow job${result.cancelled === 1 ? '' : 's'} cancelled`);
+      toast(`${result.cancelled} queued Autopilot job${result.cancelled === 1 ? '' : 's'} cancelled`);
     } catch (error) {
       if (generationRef.current === generation) toast(errorMessage(error));
     } finally {
@@ -668,7 +668,7 @@ export default function AutopilotCard({
   if (loadingError) {
     return (
       <div style={cardStyle}>
-        <div style={{ fontSize: 15, fontWeight: 600 }}>Shadow autopilot</div>
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Autopilot</div>
         <div role="alert" style={{ color: 'var(--erT)', marginTop: 6, fontSize: 13 }}>
           {loadingError}
         </div>
@@ -678,7 +678,7 @@ export default function AutopilotCard({
   if (state === null || readiness === null) {
     return (
       <div style={cardStyle} aria-busy="true">
-        <div style={{ fontSize: 15, fontWeight: 600 }}>Shadow autopilot</div>
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Autopilot</div>
         <div style={{ color: 'var(--mut)', marginTop: 6, fontSize: 13 }}>Loading operations…</div>
       </div>
     );
@@ -698,7 +698,7 @@ export default function AutopilotCard({
       >
         <div style={{ flex: '1 1 360px' }}>
           <div id="autopilot-title" style={{ fontSize: 15, fontWeight: 600 }}>
-            Shadow autopilot
+            Autopilot
           </div>
           <div style={{ fontSize: 13.5, color: 'var(--mut)', marginTop: 3, lineHeight: 1.5 }}>
             Evaluates pending transactions in the background for inspection only. Shadow results
@@ -726,7 +726,7 @@ export default function AutopilotCard({
           color: 'var(--mut)',
         }}
       >
-        <span>{settings.mode === 'shadow' ? 'Shadow enabled' : 'Shadow off'}</span>
+        <span>{settings.mode === 'shadow' ? 'Autopilot enabled' : 'Autopilot off'}</span>
         <span>{queue.queued} queued</span>
         <span>{queue.running} running</span>
         <span>{queue.retrying} retrying</span>
@@ -911,7 +911,7 @@ export default function AutopilotCard({
             }}
           >
             <button className="btn-ghost" type="submit" disabled={saving}>
-              {saving ? 'Saving…' : 'Save shadow settings'}
+              {saving ? 'Saving…' : 'Save Autopilot settings'}
             </button>
             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
               <span style={{ fontSize: 11.5, color: 'var(--fnt)' }}>
@@ -930,7 +930,7 @@ export default function AutopilotCard({
         </form>
       ) : (
         <div style={{ marginTop: 14, color: 'var(--fnt)', fontSize: 12.5 }}>
-          Company administrators manage shadow scheduling and queue cancellation.
+          Company administrators manage Autopilot scheduling and queue cancellation.
         </div>
       )}
 
@@ -938,7 +938,7 @@ export default function AutopilotCard({
         <div style={{ fontSize: 13.5, fontWeight: 600 }}>Recent safe run summaries</div>
         {runs.length === 0 ? (
           <div style={{ fontSize: 12.5, color: 'var(--mut)', marginTop: 7 }}>
-            No shadow runs yet.
+            No Autopilot runs yet.
           </div>
         ) : (
           <LiveRunHistory
@@ -967,7 +967,7 @@ export function AutopilotQueueStatus({
   const [runs, setRuns] = useState<AutopilotRunDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [expanded, setExpanded] = useState(surface === 'audit');
+  const [expanded, setExpanded] = useState(false);
   const [capNonce, setCapNonce] = useState(0);
   const detailsId = useId();
   const generationRef = useRef(0);
@@ -1021,7 +1021,7 @@ export function AutopilotQueueStatus({
       setRuns([]);
       setNextCursor(null);
       setLoadingOlder(false);
-      setExpanded(surface === 'audit');
+      setExpanded(false);
     }
     Promise.all([
       autopilot.get(companyId),
@@ -1080,7 +1080,7 @@ export function AutopilotQueueStatus({
         type="button"
         aria-expanded={expanded}
         aria-controls={detailsId}
-        aria-label={`${expanded ? 'Hide' : 'Show'} Shadow Autopilot details`}
+        aria-label={`${expanded ? 'Hide' : 'Show'} Autopilot details`}
         onClick={() => setExpanded((current) => !current)}
         style={{
           appearance: 'none',
@@ -1109,7 +1109,7 @@ export function AutopilotQueueStatus({
               ▸
             </span>
             <div>
-              <div style={{ fontSize: 13.5, fontWeight: 600 }}>Shadow autopilot</div>
+              <div style={{ fontSize: 13.5, fontWeight: 600 }}>Autopilot</div>
               <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 2 }}>
                 {state.queue.queued} queued · {state.queue.running} running ·{' '}
                 {state.queue.retrying} retrying
@@ -1145,7 +1145,7 @@ export function AutopilotQueueStatus({
       >
         <LiveReadiness readiness={readiness} compact />
         {runs.length === 0 ? (
-          <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>No shadow runs yet.</div>
+          <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>No Autopilot runs yet.</div>
         ) : (
           <LiveRunHistory runs={runs} label="Recent autopilot runs" />
         )}

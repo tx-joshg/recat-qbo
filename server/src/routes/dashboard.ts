@@ -11,6 +11,7 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { reportReadFailure } from '../services/reportReadFailure.js';
 import { dashboardData } from '../services/reports.js';
 
 const widgetSchema = z.object({
@@ -28,7 +29,11 @@ dashboardRouter.get(
   asyncHandler(async (req, res) => {
     const company: Company | undefined = req.company;
     if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
-    res.json(await dashboardData(company.id));
+    try {
+      res.json(await dashboardData(company.id));
+    } catch (error) {
+      throw reportReadFailure(error, 'dashboard');
+    }
   }),
 );
 
