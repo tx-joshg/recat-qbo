@@ -25,6 +25,7 @@ export type SafeToolErrorCode =
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
+  | 'RESPONSE_TOO_LARGE'
   | 'COMPANY_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
   | 'QBO_PERIOD_CLOSED'
@@ -36,6 +37,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   FORBIDDEN: 'This token does not have access to the requested data. Check its company role and try again.',
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
+  RESPONSE_TOO_LARGE: 'The response exceeds the size limit. For list tools, request fewer items with limit. For single records, use the web app. For mutations, inspect the operation status before retrying.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
   QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
@@ -228,7 +230,11 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
 
 function safeCode(error: unknown): SafeToolErrorCode {
   if (error instanceof QboRateLimitError) return 'RATE_LIMITED';
-  if (error instanceof McpSchemaBoundsError) return 'INVALID_INPUT';
+  if (error instanceof McpSchemaBoundsError) {
+    if (error.code === 'OUTPUT_BYTES') return 'RESPONSE_TOO_LARGE';
+    if (error.code === 'OUTPUT_SERIALIZATION') return 'COMPANY_UNAVAILABLE';
+    return 'INVALID_INPUT';
+  }
   if (error instanceof QboWriteSafetyError) return error.code;
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;

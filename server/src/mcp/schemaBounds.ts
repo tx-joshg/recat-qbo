@@ -2,6 +2,7 @@ import { z } from 'zod-v4';
 
 export interface McpSchemaBounds {
   readonly maxInputBytes: number;
+  readonly maxOutputBytes: number;
   readonly maxInputDepth: number;
   readonly maxInputKeys: number;
   readonly maxSchemaBytes: number;
@@ -13,6 +14,7 @@ export interface McpSchemaBounds {
 
 export const MCP_SCHEMA_BOUNDS: McpSchemaBounds = Object.freeze({
   maxInputBytes: 64 * 1024,
+  maxOutputBytes: 256 * 1024,
   maxInputDepth: 16,
   maxInputKeys: 512,
   maxSchemaBytes: 128 * 1024,
@@ -32,6 +34,8 @@ export type McpSchemaBoundsErrorCode =
   | 'INPUT_DEPTH'
   | 'INPUT_KEYS'
   | 'INPUT_SERIALIZATION'
+  | 'OUTPUT_BYTES'
+  | 'OUTPUT_SERIALIZATION'
   | 'SCHEMA_BYTES'
   | 'SCHEMA_DEPTH'
   | 'SCHEMA_KEYS'
@@ -67,12 +71,25 @@ interface WalkResult {
 
 function serializedByteLength(
   value: unknown,
-  errorCode: 'INPUT_SERIALIZATION' | 'SCHEMA_SERIALIZATION',
+  errorCode: 'INPUT_SERIALIZATION' | 'OUTPUT_SERIALIZATION' | 'SCHEMA_SERIALIZATION',
 ): number {
   try {
     return Buffer.byteLength(JSON.stringify(value) ?? 'null', 'utf8');
   } catch {
     throw new McpSchemaBoundsError(errorCode, 'Value must be JSON serializable');
+  }
+}
+
+export function assertBoundedMcpOutput(
+  output: unknown,
+  bounds: McpSchemaBounds = MCP_SCHEMA_BOUNDS,
+): void {
+  const outputBytes = serializedByteLength(output, 'OUTPUT_SERIALIZATION');
+  if (outputBytes > bounds.maxOutputBytes) {
+    throw new McpSchemaBoundsError(
+      'OUTPUT_BYTES',
+      `Maximum MCP output size is ${bounds.maxOutputBytes} bytes`,
+    );
   }
 }
 

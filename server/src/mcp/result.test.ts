@@ -13,8 +13,26 @@ import { WritebackLifecycleError } from '../services/writeback.js';
 import { AttachmentError } from '../services/attachments/types.js';
 import { ReceiptError } from '../services/receipts/types.js';
 import { safeToolFailure, toolSuccess } from './result.js';
+import { McpSchemaBoundsError } from './schemaBounds.js';
 
 describe('MCP tool results', () => {
+  it('gives bounded-output failures a safe actionable response', () => {
+    const result = safeToolFailure(new McpSchemaBoundsError('OUTPUT_BYTES', 'PRIVATE_SIZE_SENTINEL'), 'request-size');
+    expect(result.structuredContent).toMatchObject({ error: {
+      code: 'RESPONSE_TOO_LARGE',
+      message: expect.stringContaining('limit'),
+    } });
+    expect(JSON.stringify(result)).toContain('operation status');
+    expect(JSON.stringify(result)).toContain('web app');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_SIZE_SENTINEL');
+  });
+
+  it('does not blame tool arguments for an unserializable server response', () => {
+    const result = safeToolFailure(new McpSchemaBoundsError('OUTPUT_SERIALIZATION', 'PRIVATE_SERIALIZATION_SENTINEL'), 'request-size');
+    expect(result.structuredContent).toMatchObject({ error: { code: 'COMPANY_UNAVAILABLE' } });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_SERIALIZATION_SENTINEL');
+  });
+
   it('maps attachment failures without exposing private detail', () => {
     const forbidden = safeToolFailure(
       new AttachmentError(

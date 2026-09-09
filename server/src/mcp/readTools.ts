@@ -40,6 +40,7 @@ import {
 } from './result.js';
 import {
   MCP_AUTHORED_SCHEMA_BOUNDS,
+  assertBoundedMcpOutput,
   toBoundedJsonSchema,
 } from './schemaBounds.js';
 import { extractMcpTraceContext, type McpTraceContext } from './trace.js';
@@ -458,9 +459,13 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
             const operationValue = await operation(input);
             const parsed = outputSchema.safeParse(operationValue);
             if (!parsed.success) throw new InvalidMcpToolOutputError();
+            // toolSuccess mirrors structured output into a text block.
+            // Bound the complete wire representation before recording success.
+            assertBoundedMcpOutput(toolSuccess(asJson(parsed.data)));
             return parsed.data;
           },
         );
+        // Keep the raw callback value for observability counts and transfer-token redaction.
         return toolSuccess(asJson(value));
       } catch (error) {
         if (error instanceof InvalidMcpToolOutputError) {
