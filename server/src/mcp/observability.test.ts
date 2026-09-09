@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { QboDepositPreparationError } from '../lib/qbo/depositTax.js';
+import { McpSchemaBoundsError } from './schemaBounds.js';
 import {
   SpanKind,
   SpanStatusCode,
@@ -47,6 +49,90 @@ describe('MCP observability', () => {
       async () => { throw new Error('SECRET_SENTINEL'); },
     )).rejects.toThrow('SECRET_SENTINEL');
     expect(JSON.stringify(log.mock.calls)).not.toContain('SECRET_SENTINEL');
+  });
+
+  async function logFailure(error: unknown) {
+    const log = vi.fn();
+    await expect(observeMcpToolCall(
+      { requestId: 'request-example', traceId: 'a'.repeat(32), tokenPrefix: 'rct_SAFE', method: 'tools/call', tool: 'commit_categorization' },
+      log,
+      async () => { throw error; },
+    )).rejects.toBe(error);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(log.mock.calls)).not.toContain('PRIVATE_PROVIDER_DETAIL');
+    return log.mock.calls[0]![0];
+  }
+
+  it('logs a known internal error identity without its provider message', async () => {
+    const error = new QboDepositPreparationError('QBO_DEPOSIT_UNSUPPORTED', 'PRIVATE_PROVIDER_DETAIL');
+    expect(await logFailure(error)).toMatchObject({
+      errorClass: 'QboDepositPreparationError', errorCode: 'QBO_DEPOSIT_UNSUPPORTED', outcome: 'error', count: 0,
+    });
+  });
+
+  it('retains a documented schema-bound failure code', async () => {
+    const error = new McpSchemaBoundsError('INPUT_BYTES', 'PRIVATE_PROVIDER_DETAIL');
+    expect(await logFailure(error)).toMatchObject({
+      errorClass: 'McpSchemaBoundsError', errorCode: 'INPUT_BYTES',
+    });
+  });
+
+  it.each([
+    ['McpSchemaBoundsError', 'OUTPUT_BYTES'],
+    ['McpSchemaBoundsError', 'OUTPUT_SERIALIZATION'],
+    ['HttpError', 'RESPONSE_TOO_LARGE'],
+    ['QboRateLimitError', 'QBO_RATE_LIMITED'],
+  ])('retains the public sibling identity %s/%s', async (name, code) => {
+    // These sibling features can land independently; avoid coupling this test
+    // to their constructors while enforcing the shared diagnostics contract.
+    const error = Object.assign(new Error('PRIVATE_PROVIDER_DETAIL'), { name, code });
+    expect(await logFailure(error)).toMatchObject({ errorClass: name, errorCode: code });
+  });
+
+  it('keeps a standard error class while omitting an unknown provider-controlled code', async () => {
+    const error = Object.assign(new TypeError('PRIVATE_PROVIDER_DETAIL'), { code: 'SYNTHETIC_ACCOUNT_123' });
+    const event = await logFailure(error);
+    expect(event.errorClass).toBe('TypeError');
+    expect(event).not.toHaveProperty('errorCode');
+    expect(JSON.stringify(event)).not.toContain('SYNTHETIC_ACCOUNT_123');
+  });
+
+  it('rejects arbitrary class names and uppercase codes even when they match identifier syntax', async () => {
+    const error = Object.assign(new Error('PRIVATE_PROVIDER_DETAIL'), {
+      name: 'SyntheticCustomerAlias', code: 'SYNTHETIC_ACCOUNT_123',
+    });
+    const event = await logFailure(error);
+    expect(event.errorClass).toBe('UnknownError');
+    expect(event).not.toHaveProperty('errorCode');
+    expect(JSON.stringify(event)).not.toMatch(/SyntheticCustomerAlias|SYNTHETIC_ACCOUNT_123/);
+  });
+
+  it.each([null, undefined, 'PRIVATE_PROVIDER_DETAIL', 42, { name: 'Error', code: 'QBO_DEPOSIT_UNSUPPORTED' }])(
+    'uses a safe fallback for a non-Error thrown value %#', async (error) => {
+      const event = await logFailure(error);
+      expect(event.errorClass).toBe('UnknownError');
+      expect(event).not.toHaveProperty('errorCode');
+    },
+  );
+
+  it.each(['name', 'code'])('preserves the original failure when its %s getter throws', async (key) => {
+    const error = new Error('PRIVATE_PROVIDER_DETAIL');
+    Object.defineProperty(error, key, { get() { throw new Error('PRIVATE_GETTER_DETAIL'); } });
+    const event = await logFailure(error);
+    expect(event.errorClass).toBe('UnknownError');
+    expect(event).not.toHaveProperty('errorCode');
+    expect(JSON.stringify(event)).not.toContain('PRIVATE_GETTER_DETAIL');
+  });
+
+  it('reads provider-controlled identity properties only once', async () => {
+    const error = new Error('PRIVATE_PROVIDER_DETAIL');
+    const name = vi.fn().mockReturnValueOnce('TypeError').mockReturnValue('SyntheticCustomerAlias');
+    const code = vi.fn().mockReturnValueOnce('QBO_TIMEOUT').mockReturnValue('SYNTHETIC_ACCOUNT_123');
+    Object.defineProperties(error, { name: { get: name }, code: { get: code } });
+    const event = await logFailure(error);
+    expect(event).toMatchObject({ errorClass: 'TypeError', errorCode: 'QBO_TIMEOUT' });
+    expect(name).toHaveBeenCalledTimes(1);
+    expect(code).toHaveBeenCalledTimes(1);
   });
 
   it('creates a server span and propagates only parsed trace context to application reads', async () => {
