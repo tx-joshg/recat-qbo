@@ -115,10 +115,8 @@ describe('SplitEditor tax fields', () => {
     const firstMemo = screen.getByLabelText('Memo for split line 1');
     await user.clear(firstMemo);
     await user.type(firstMemo, 'Updated generic memo');
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      'TAX_CODE_STANDARD',
-    );
+    await user.click(screen.getByRole('combobox', { name: 'Purchase tax for split line 2' }));
+    await user.click(screen.getByRole('option', { name: 'Standard purchase tax · 5%' }));
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(
@@ -214,10 +212,8 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      '',
-    );
+    await user.click(screen.getByRole('combobox', { name: 'Purchase tax for split line 2' }));
+    await user.click(screen.getByRole('option', { name: 'No tax' }));
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).not.toHaveBeenCalled();
@@ -251,10 +247,12 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    expect(screen.getByLabelText('Sales tax for split line 1')).toHaveTextContent('Standard sales tax');
+    expect(screen.getByRole('combobox', { name: 'Sales tax for split line 1' })).toHaveTextContent('No tax');
     expect(screen.queryByLabelText('Purchase tax for split line 1')).not.toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 1'), 'SALES_TAX_CODE');
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 2'), 'SALES_TAX_CODE');
+    await user.click(screen.getByRole('combobox', { name: 'Sales tax for split line 1' }));
+    await user.click(screen.getByRole('option', { name: 'Standard sales tax · 5%' }));
+    await user.click(screen.getByRole('combobox', { name: 'Sales tax for split line 2' }));
+    await user.click(screen.getByRole('option', { name: 'Standard sales tax · 5%' }));
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(
