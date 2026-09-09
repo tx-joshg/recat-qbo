@@ -1105,6 +1105,8 @@ export interface DashboardWidget {
 }
 
 export interface DashboardDataDto {
+  source: 'demo' | 'quickbooks' | 'local_fallback';
+  retrievedAt: string;
   months: string[];
   rev: number[];
   exp: number[];
@@ -1138,6 +1140,7 @@ export interface CompanyPatchBody {
 export interface ApiError {
   error: string;
   code?: string;
+  requestId?: string;
 }
 
 // QuickBooks localizes these: a British company returns "Uncategorised".

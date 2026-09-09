@@ -750,7 +750,9 @@ export async function customReport(companyId: string, cfg: SavedReportConfig): P
  * months). Section totals are read from QBO's own summary rows; the expense
  * side is derived as income − net income so it survives any section layout.
  */
-async function qboDashboard(companyId: string): Promise<Omit<DashboardDataDto, 'pendingCount' | 'pendingTotal'>> {
+async function qboDashboard(
+  companyId: string,
+): Promise<Omit<DashboardDataDto, 'pendingCount' | 'pendingTotal' | 'source' | 'retrievedAt'>> {
   const now = new Date();
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1));
   const stmt = await qboStatement(companyId, 'pl', {
@@ -800,6 +802,7 @@ async function qboDashboard(companyId: string): Promise<Omit<DashboardDataDto, '
 }
 
 export async function dashboardData(companyId: string): Promise<DashboardDataDto> {
+  const retrievedAt = new Date().toISOString();
   const pend = await prisma.transaction.findMany({
     where: { companyId, status: { in: ['PENDING', 'ERROR'] } },
     select: { amount: true },
@@ -810,6 +813,8 @@ export async function dashboardData(companyId: string): Promise<DashboardDataDto
   const demo = await demoJson<DemoFin>(`demo:fin:${companyId}`);
   if (demo) {
     return {
+      source: 'demo',
+      retrievedAt,
       months: demo.months,
       rev: demo.rev.map((v) => v * 1000),
       exp: demo.exp.map((v) => v * 1000),
@@ -823,7 +828,7 @@ export async function dashboardData(companyId: string): Promise<DashboardDataDto
   // Real mode: QBO's own month-summarized P&L — drift-free, and populated even
   // before Recat has processed anything (fresh connections carry full history).
   try {
-    return { ...(await qboDashboard(companyId)), pendingCount, pendingTotal };
+    return { source: 'quickbooks', retrievedAt, ...(await qboDashboard(companyId)), pendingCount, pendingTotal };
   } catch {
     // QBO unreachable — fall back to what Recat has posted locally.
   }
@@ -884,6 +889,8 @@ export async function dashboardData(companyId: string): Promise<DashboardDataDto
     .map(([name, amount]) => ({ name, amount }));
 
   return {
+    source: 'local_fallback',
+    retrievedAt,
     months: monthKeys.map((k) => M_NAMES[k.m]!),
     rev,
     exp,

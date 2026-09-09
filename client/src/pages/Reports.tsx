@@ -15,11 +15,12 @@ import type {
   TransactionLogDto,
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
-import { reports, savedReports } from '../lib/api';
+import { ApiError, reports, savedReports, transactions } from '../lib/api';
 import { fmtDate, fmtDateY, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import TagPicker from '../components/TagPicker';
 import { Select, type ControlOption } from '../components/SelectCombobox';
+import { ReadFailureCard } from '../components/ReadFailureCard';
 
 type RptTab = 'pl' | 'bs' | 'custom' | 'txns';
 type LogRange = '30d' | '90d' | 'ytd' | '12m' | 'all' | 'custom';
@@ -140,6 +141,9 @@ export default function Reports() {
   const [basis, setBasis] = useState<Basis>('cash');
 
   const [stmt, setStmt] = useState<StatementDto | null>(null);
+  const [statementState, setStatementState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [statementError, setStatementError] = useState<ApiError | null>(null);
+  const [statementRetry, setStatementRetry] = useState(0);
   // Row drill-down — at most one statement row expanded at a time.
   const [drill, setDrill] = useState<{ account: string; loading: boolean; rows: StatementDrilldownRow[] } | null>(null);
 
@@ -162,16 +166,26 @@ export default function Reports() {
   const [logStart, setLogStart] = useState(''); // custom range, YYYY-MM-DD
   const [logEnd, setLogEnd] = useState('');
   const [log, setLog] = useState<TransactionLogDto | null>(null);
-  const [logLoading, setLogLoading] = useState(false);
+  const [logState, setLogState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [logError, setLogError] = useState<ApiError | null>(null);
+  const [logRetry, setLogRetry] = useState(0);
   const [logFilter, setLogFilter] = useState('');
   const [logTagPicker, setLogTagPicker] = useState<string | null>(null); // open picker's qboKey
 
   const plCmpShown = plCols === 'total' && plPeriod !== 'ytd';
+  const statementName = tab === 'pl' ? 'Profit & Loss' : 'Balance Sheet';
+  const statementContext = tab === 'pl'
+    ? `${plPeriod === 'ytd' ? `Year to date ${CUR_YEAR}` : `${M_NAMES[Number(plPeriod)]} ${CUR_YEAR}`} · ${basis === 'cash' ? 'Cash' : 'Accrual'} basis`
+    : `As of ${M_NAMES[bsMonth]} ${CUR_YEAR} · ${basis === 'cash' ? 'Cash' : 'Accrual'} basis`;
 
   // ---- statement fetch (refires on every control change) ----
   useEffect(() => {
     if (!activeCompanyId || (tab !== 'pl' && tab !== 'bs')) return;
     let cancelled = false;
+    setStmt(null);
+    setDrill(null);
+    setStatementError(null);
+    setStatementState('loading');
     const req =
       tab === 'pl'
         ? reports.pl(activeCompanyId, {
@@ -190,15 +204,19 @@ export default function Reports() {
         if (!cancelled) {
           setStmt(s);
           setDrill(null); // a new statement collapses any open drill-down
+          setStatementState('ready');
         }
       })
-      .catch(() => {
-        if (!cancelled) toast('Could not load the report');
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setStatementError(error instanceof ApiError ? error : null);
+          setStatementState('error');
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, tab, plPeriod, plCols, plCmp, bsMonth, bsCmp, basis, toast]);
+  }, [activeCompanyId, tab, plPeriod, plCols, plCmp, bsMonth, bsCmp, basis, statementRetry]);
 
   // ---- transaction log fetch ----
   const isYmd = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -210,7 +228,12 @@ export default function Reports() {
     let endStr: string;
     if (logRange === 'custom') {
       // Wait until both dates are typed in full.
-      if (!isYmd(logStart) || !isYmd(logEnd) || logStart > logEnd) return;
+      if (!isYmd(logStart) || !isYmd(logEnd) || logStart > logEnd) {
+        setLog(null);
+        setLogError(null);
+        setLogState('idle');
+        return;
+      }
       startStr = logStart;
       endStr = logEnd;
     } else {
@@ -228,22 +251,27 @@ export default function Reports() {
       endStr = ymd(end);
     }
     let cancelled = false;
-    setLogLoading(true);
+    setLog(null);
+    setLogError(null);
+    setLogState('loading');
     reports
       .transactionLog(activeCompanyId, { start: startStr, end: endStr })
       .then((r) => {
-        if (!cancelled) setLog(r);
+        if (!cancelled) {
+          setLog(r);
+          setLogState('ready');
+        }
       })
-      .catch(() => {
-        if (!cancelled) toast('Could not load the transaction log');
-      })
-      .finally(() => {
-        if (!cancelled) setLogLoading(false);
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setLogError(error instanceof ApiError ? error : null);
+          setLogState('error');
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, tab, logRange, logStart, logEnd, toast]);
+  }, [activeCompanyId, tab, logRange, logStart, logEnd, logRetry]);
 
   // ---- transaction log tag editing (optimistic; tags never touch QBO) ----
   const toggleLogTag = (qboKey: string, tagId: string) => {
@@ -531,11 +559,22 @@ export default function Reports() {
             overflowX: 'auto',
           }}
         >
-          {logLoading && !log ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '24px 0' }}>
+          {logState === 'idle' && logRange === 'custom' ? (
+            <div role="status" style={{ padding: '24px 0', color: 'var(--fnt)' }}>
+              Choose a valid start and end date to load the transaction log.
+            </div>
+          ) : logState === 'loading' ? (
+            <div aria-busy="true" aria-label="Loading transaction log" style={{ display: 'flex', justifyContent: 'center', padding: '24px 0' }}>
               <Spinner />
             </div>
-          ) : log ? (
+          ) : logState === 'error' ? (
+            <ReadFailureCard
+              title="Transaction log could not load"
+              context={logRange === 'custom' ? `${logStart} to ${logEnd}` : `Selected period: ${logRange}`}
+              error={logError}
+              onRetry={() => setLogRetry((value) => value + 1)}
+            />
+          ) : logState === 'ready' && log ? (
             (() => {
               const needle = logFilter.trim().toLowerCase();
               const tagName = (id: string) => tags.find((tg) => tg.id === id)?.name ?? '';
@@ -748,7 +787,20 @@ export default function Reports() {
       )}
 
       {/* statement card */}
-      {(tab === 'pl' || tab === 'bs') && stmt && (
+      {(tab === 'pl' || tab === 'bs') && statementState === 'loading' && (
+        <div aria-busy="true" aria-label={`Loading ${statementName}`} style={{ display: 'flex', justifyContent: 'center', padding: '48px 0' }}>
+          <Spinner />
+        </div>
+      )}
+      {(tab === 'pl' || tab === 'bs') && statementState === 'error' && (
+        <ReadFailureCard
+          title={`${statementName} could not load`}
+          context={statementContext}
+          error={statementError}
+          onRetry={() => setStatementRetry((value) => value + 1)}
+        />
+      )}
+      {(tab === 'pl' || tab === 'bs') && statementState === 'ready' && stmt && (
         <div
           style={{
             border: '1px solid var(--bd2)',

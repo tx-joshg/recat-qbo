@@ -56,6 +56,14 @@ vi.mock('../components/TagPicker', () => ({ default: () => null }));
 
 import Reports from './Reports';
 
+async function choose(user: ReturnType<typeof userEvent.setup>, label: string, option: string) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  await user.click(await screen.findByRole('option', { name: option }));
+  await act(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+}
+
+
+
 function statement(overrides: Partial<StatementDto> = {}): StatementDto {
   return {
     title: 'Profit & Loss',
@@ -69,7 +77,7 @@ function statement(overrides: Partial<StatementDto> = {}): StatementDto {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   mocks.companyId = 'COMPANY_GENERIC';
   mocks.role = 'viewer';
   mocks.listTransactions.mockResolvedValue({ transactions: [], nextCursor: null });
@@ -90,9 +98,8 @@ describe('Report bank account filters', () => {
     mocks.bankAccounts.mockResolvedValue(['Example archived account']);
     const user = userEvent.setup();
     render(<Reports />);
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Report' }), 'custom');
-    const option = await screen.findByRole('option', { name: 'Example archived account' });
-    await user.selectOptions(option.parentElement!, 'Example archived account');
+    await choose(user, 'Report', 'Custom & tags');
+    await choose(user, 'Bank account', 'Example archived account');
     await waitFor(() => expect(mocks.custom).toHaveBeenLastCalledWith('COMPANY_GENERIC', expect.objectContaining({ account: 'Example archived account' })));
     expect(mocks.listTransactions).not.toHaveBeenCalled();
   });
@@ -103,10 +110,12 @@ describe('Report bank account filters', () => {
       .mockResolvedValueOnce(['Example current account']);
     const user = userEvent.setup();
     const view = render(<Reports />);
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Report' }), 'custom');
+    await choose(user, 'Report', 'Custom & tags');
     await waitFor(() => expect(mocks.bankAccounts).toHaveBeenCalledTimes(1));
     mocks.companyId = 'COMPANY_OTHER';
     view.rerender(<Reports />);
+    await waitFor(() => expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_OTHER'));
+    await user.click(screen.getByRole('combobox', { name: 'Bank account' }));
     expect(await screen.findByRole('option', { name: 'Example current account' })).toBeInTheDocument();
     await act(async () => resolveOld(['Example old account']));
     expect(screen.queryByRole('option', { name: 'Example old account' })).not.toBeInTheDocument();
