@@ -77,7 +77,7 @@ const preparedUndo = {
   expiresAt: '2026-07-29T20:15:00.000Z',
   preview: {
     action: 'restore_purchase_categorization' as const,
-    resultingStatus: 'REVERTED' as const,
+    resultingStatus: 'PENDING' as const,
     direction: 'purchase' as const,
     totalCents: -1_050,
     totalTaxCents: -50,
@@ -123,6 +123,7 @@ function mutations(
 ): McpMutationOperations {
   return {
     prepareCategorization: vi.fn().mockResolvedValue(preparedCategorization),
+    getPreparedCategorization: vi.fn().mockResolvedValue(preparedCategorization),
     commitCategorization: vi.fn().mockResolvedValue(operation),
     getOperation: vi.fn().mockResolvedValue(operation),
     retryOperation: vi.fn().mockResolvedValue(operation),
@@ -175,6 +176,28 @@ function handler(
 }
 
 describe('Recat MCP mutation tools', () => {
+  it('routes exact prepared-categorization recovery to its owner-scoped operation', async () => {
+    const operations = mutations();
+    const server = handler(operations);
+    const input = {
+      companyId,
+      transactionId,
+      idempotencyKey: 'prepare-one',
+    };
+
+    const response = await legacy(server, 'tools/call', {
+      name: 'get_prepared_categorization',
+      arguments: input,
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.getPreparedCategorization).toHaveBeenCalledWith(principal, input);
+  });
+
+  it('exposes read-only prepared-categorization recovery', () => {
+    expect(MUTATION_TOOL_NAMES).toContain('get_prepared_categorization');
+  });
+
   it('publishes recursively strict bounded input and output schemas', async () => {
     const body = await legacy(handler(mutations()), 'tools/list', {});
     const tools = body.result.tools as Array<Record<string, any>>;
@@ -227,12 +250,12 @@ describe('Recat MCP mutation tools', () => {
       prepare.outputSchema.properties.preview.properties.lines.maxItems,
     ).toBe(20);
 
-    const operationSchema = mutationTools[1]!.outputSchema;
+    const operationSchema = mutationTools.find((tool) => tool.name === 'commit_categorization')!.outputSchema;
     expect(operationSchema.properties.actions.additionalProperties).toBe(false);
     expect(operationSchema.properties.result.anyOf).toHaveLength(2);
     expect(operationSchema.properties.error.anyOf).toHaveLength(2);
 
-    const undoSchema = mutationTools[4]!.outputSchema;
+    const undoSchema = mutationTools.find((tool) => tool.name === 'prepare_undo')!.outputSchema;
     expect(undoSchema.properties.preview.additionalProperties).toBe(false);
     expect(
       undoSchema.properties.preview.properties.restorationDigest.pattern,

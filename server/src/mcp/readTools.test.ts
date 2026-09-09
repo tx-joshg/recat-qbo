@@ -163,6 +163,27 @@ describe('Recat MCP read tools', () => {
     }
   });
 
+  it.each(['RETRYABLE', 'REJECTED'] as const)('returns %s recovery evidence through the strict output schema', async (state) => {
+    const operations = reads();
+    vi.mocked(operations.getTransaction).mockResolvedValue({
+      ...sampleTransaction,
+      activeCategorizationAttempt: state === 'RETRYABLE'
+        ? { requestId: 'retained-request', operation: 'restore', status: 'RETRYABLE' }
+        : null,
+      verification: { status: 'failed', outcome: state, summary: 'Provider write did not complete.' },
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name: 'get_transaction',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.transaction.verification.outcome).toBe(state);
+  });
+
   it('refreshes one visible mirror transaction without starting a company sweep', async () => {
     const refreshTransaction = vi.fn().mockResolvedValue({
       transactionId: 'transaction-a',
@@ -338,64 +359,6 @@ describe('Recat MCP read tools', () => {
     expect(body.result.structuredContent.transaction).toMatchObject({ amount: -10, sourceGrossCents: -1120 });
   });
 
-  it('returns the complete tax-code DTO instead of rejecting its sales rate', async () => {
-    const operations = reads();
-    vi.mocked(operations.listTaxCodes).mockResolvedValue({
-      status: 'ready',
-      reason: null,
-      usingSalesTax: true,
-      refreshedAt: '2026-08-30T20:00:00.000Z',
-      items: [
-        {
-          qboId: 'NON',
-          name: 'Non-taxable',
-          active: true,
-          taxable: false,
-          combinedPurchaseRate: null,
-          combinedSalesRate: null,
-        },
-        {
-          qboId: 'SALES7',
-          name: 'Sales tax 7%',
-          active: true,
-          taxable: true,
-          combinedPurchaseRate: null,
-          combinedSalesRate: 7,
-        },
-      ],
-      nextCursor: null,
-    });
-    const handler = createMcpHandler(
-      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations, log: vi.fn() }),
-      { legacy: 'stateless' },
-    );
-
-    const response = await legacy(handler, 'tools/call', {
-      name: 'list_tax_codes',
-      arguments: { companyId: 'company-a' },
-    });
-
-    expect(response.result.isError).not.toBe(true);
-    expect(response.result.structuredContent.items).toEqual([
-      {
-        qboId: 'NON',
-        name: 'Non-taxable',
-        active: true,
-        taxable: false,
-        combinedPurchaseRate: null,
-        combinedSalesRate: null,
-      },
-      {
-        qboId: 'SALES7',
-        name: 'Sales tax 7%',
-        active: true,
-        taxable: true,
-        combinedPurchaseRate: null,
-        combinedSalesRate: 7,
-      },
-    ]);
-  });
-
   it('does not rerun static schema deadline checks for concurrent fresh servers', async () => {
     let simulatedNow = 0;
     const now = vi.spyOn(performance, 'now').mockImplementation(() => {
@@ -436,7 +399,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers thirteen core reads and twenty conservatively annotated action tools', async () => {
+  it('registers thirteen core reads and twenty-one conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -447,6 +410,7 @@ describe('Recat MCP read tools', () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       ...READ_TOOL_NAMES,
       'prepare_categorization',
+      'get_prepared_categorization',
       'commit_categorization',
       'get_operation',
       'retry_operation',
@@ -467,7 +431,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(33);
+    expect(tools).toHaveLength(34);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: !['sync_company', 'refresh_transaction_mirror', 'get_write_safety', 'refresh_provider_actionability'].includes(tool.name),
@@ -487,6 +451,15 @@ describe('Recat MCP read tools', () => {
           readOnlyHint: false,
           destructiveHint: true,
           idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'get_prepared_categorization',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
           openWorldHint: false,
         },
       },

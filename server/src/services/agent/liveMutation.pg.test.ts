@@ -202,8 +202,14 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         revision: staged ? 1 : 0,
         taxCalculation: staged ? 'NotApplicable' : null,
         rawData: {
+          Id: `purchase-${suffix}`, SyncToken: '7', TotalAmt: 10,
+          TxnDate: '2026-07-29', GlobalTaxCalculation: 'NotApplicable',
           CurrencyRef: { value: 'XTS' },
           AccountRef: { value: 'source-generic' },
+          Line: [{
+            Id: 'line-holding', Amount: 10, DetailType: 'AccountBasedExpenseLineDetail',
+            AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding-generic' } },
+          }],
         },
         ...(staged
           ? {

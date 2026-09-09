@@ -248,6 +248,234 @@ beforeEach(() => {
 });
 
 describe('tax-aware categorization action routes', () => {
+  it('does not return success when a legacy undo result is unverified', async () => {
+    mocks.undoPost.mockResolvedValue({
+      id: TRANSACTION_ID,
+      ok: false,
+      status: 'ERROR',
+      error: {
+        code: 'DB_COMMIT_FAILED',
+        message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/undo`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+      code: 'DB_COMMIT_FAILED',
+    });
+  });
+
+  it('keeps one Queue with legacy cleared/reconciled rows and omits terminal rows', async () => {
+    const checkedAt = new Date();
+    const providerRow = (
+      id: string,
+      disposition: string,
+      status = 'PENDING',
+      qboId = id,
+    ) => ({
+      ...transactionRow,
+      id,
+      qboId,
+      status,
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 1,
+        qboSyncToken: '7',
+        qboType: 'Purchase',
+        qboId,
+        txnDate: transactionRow.date,
+      },
+    });
+    mocks.transactionFindMany.mockResolvedValue([
+      providerRow('WRITABLE_TXN', 'WRITABLE'),
+      providerRow('BLOCKED_TXN', 'BLOCKED_RECONCILED'),
+      providerRow('UNKNOWN_TXN', 'WRITABLE', 'PENDING', 'mismatched-binding'),
+      providerRow('POSTED_TXN', 'WRITABLE', 'POSTED'),
+      {
+        ...providerRow('POSTED_RESTORE_TXN', 'WRITABLE', 'POSTED'),
+        qboMutationAttempts: [{
+          requestId: REQUEST_ID,
+          operation: 'restore',
+          status: 'PREPARED',
+        }],
+      },
+      {
+        ...providerRow('POSTED_RETRYABLE_RESTORE_TXN', 'WRITABLE', 'POSTED'),
+        qboMutationAttempts: [{
+          requestId: '00000000-0000-4000-8000-000000000099',
+          operation: 'restore',
+          status: 'RETRYABLE',
+        }],
+      },
+    ]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
+      'BLOCKED_TXN',
+      'UNKNOWN_TXN',
+      'POSTED_RESTORE_TXN',
+      'POSTED_RETRYABLE_RESTORE_TXN',
+      'WRITABLE_TXN',
+    ]);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        companyId: COMPANY_ID,
+        OR: [
+          { status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+          {
+            status: 'POSTED',
+            qboMutationAttempts: {
+              some: {
+                operation: 'restore',
+                status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] },
+              },
+            },
+          },
+        ],
+      },
+    }));
+  });
+
+  it('requires reconciliation when a provider rejection could not be persisted', async () => {
+    mocks.commitStagedCategorization.mockResolvedValue({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'IN_PROGRESS',
+      error: {
+        code: 'OPERATION_RECONCILIATION_REQUIRED',
+        message: 'private database detail',
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'IN_PROGRESS',
+      error: {
+        code: 'OPERATION_RECONCILIATION_REQUIRED',
+        message: 'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.',
+      },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/private|database detail/i);
+  });
+
+  it('returns a bounded 422 response for a provider-rejected write', async () => {
+    mocks.commitStagedCategorization.mockResolvedValue({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'REJECTED',
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'private provider validation detail',
+        rawPayload: { token: 'secret' },
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(422);
+    expect(response.body).toEqual({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'REJECTED',
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.',
+      },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/payload|token|secret|private provider/i);
+  });
+
+  it('loads only the latest attempt so a terminal retry successor suppresses stale RETRYABLE state', async () => {
+    mocks.transactionFindMany.mockResolvedValue([{
+      ...transactionRow,
+      status: 'POSTED',
+      qboMutationAttempts: [{
+        requestId: '00000000-0000-4000-8000-000000000098',
+        operation: 'restore',
+        status: 'VERIFIED',
+      }],
+    }]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body.transactions).toEqual([]);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      include: expect.objectContaining({
+        qboMutationAttempts: {
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: 1,
+          select: {
+            requestId: true,
+            operation: true,
+            status: true,
+          },
+        },
+      }),
+    }));
+  });
+
+  it('exposes a bounded RETRYABLE restore summary for a new-request retry', async () => {
+    const [dto] = await transactionDtos(
+      COMPANY_ID,
+      [{
+        ...transactionRow,
+        status: 'POSTED',
+        qboMutationAttempts: [{
+          requestId: REQUEST_ID,
+          operation: 'restore',
+          status: 'RETRYABLE',
+          requestHash: 'INTERNAL_HASH',
+          requestPayload: { internal: 'payload' },
+          beforeSnapshot: { internal: 'before' },
+          errorMessage: 'internal error detail',
+        }],
+      } as never],
+      new Map(),
+    );
+
+    expect(dto?.activeCategorizationAttempt).toEqual({
+      requestId: REQUEST_ID,
+      operation: 'restore',
+      status: 'RETRYABLE',
+    });
+    expect(JSON.stringify(dto?.activeCategorizationAttempt)).not.toMatch(
+      /hash|payload|snapshot|error|internal/i,
+    );
+  });
+
   it('keeps explicit SUPERSEDED queue reads empty', async () => {
     mocks.transactionFindMany.mockResolvedValue([]);
 
@@ -258,7 +486,7 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(200);
     expect(response.body.transactions).toEqual([]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { companyId: COMPANY_ID, status: { not: 'SUPERSEDED' } },
+      where: { companyId: COMPANY_ID, status: { in: [] } },
     }));
   });
 
@@ -369,7 +597,7 @@ describe('tax-aware categorization action routes', () => {
     },
   );
 
-  it('loads at most the latest reconcilable attempt with an allowlisted relation select', async () => {
+  it('loads the latest attempt with an allowlisted relation select', async () => {
     mocks.transactionFindMany.mockResolvedValue([{
       ...transactionRow,
       qboMutationAttempts: [],
@@ -383,8 +611,7 @@ describe('tax-aware categorization action routes', () => {
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
       include: expect.objectContaining({
         qboMutationAttempts: {
-          where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           take: 1,
           select: {
             requestId: true,
@@ -1155,6 +1382,14 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(404);
     expect(response.body).toMatchObject({ code: 'ATTEMPT_NOT_FOUND' });
     expect(mocks.reconcileMutationAttempt).not.toHaveBeenCalled();
+  });
+
+  it('returns a safe conflict response for an expired new undo window', async () => {
+    mocks.undoCategorization.mockRejectedValueOnce({ name: 'WritebackLifecycleError', code: 'UNDO_WINDOW_EXPIRED', message: 'synthetic internal detail' });
+    const response = await request(testApp()).post(`/api/transactions/${TRANSACTION_ID}/categorization/undo`).set(sessionHeaders).send({ requestId: UNDO_REQUEST_ID });
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ code: 'UNDO_WINDOW_EXPIRED', error: 'The 30-day undo window is unavailable for this transaction.' });
+    expect(JSON.stringify(response.body)).not.toContain('synthetic internal detail');
   });
 
   it('uses a strict Recat UUID for undo and forwards only scoped service input', async () => {

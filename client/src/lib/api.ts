@@ -116,6 +116,7 @@ const MUTATION_OUTCOMES: readonly CategorizationMutationResult['outcome'][] = [
   'UNCHANGED',
   'DRY_RUN',
   'RETRYABLE',
+  'REJECTED',
 ];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_MUTATION_ERROR_CODE_LENGTH = 120;

@@ -10,9 +10,9 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
-  bankAccounts: vi.fn(),
   refreshProviderStatus: vi.fn(),
-  role: undefined as 'admin' | 'viewer' | undefined,
+  role: 'categorizer' as 'categorizer' | 'admin' | 'viewer',
+  bankAccounts: vi.fn(),
   categorize: vi.fn(),
   stage: vi.fn(),
   commit: vi.fn(),
@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   legacyUndo: vi.fn(),
   retry: vi.fn(),
   bulkPost: vi.fn(),
+  transfer: vi.fn(),
   sync: vi.fn(),
   rulesCreate: vi.fn(),
   navigate: vi.fn(),
@@ -31,6 +32,10 @@ const mocks = vi.hoisted(() => ({
   refreshCompanies: vi.fn(),
   requestId: vi.fn(),
   activeCompanyId: 'COMPANY_GENERIC',
+  qboMutationRevision: 0,
+  mutationListeners: new Set<(event: { companyId: string; transactionIds: string[]; origin?: symbol }) => void>(),
+  notifyQboMutation: vi.fn(),
+  subscribeQboMutations: vi.fn(),
   taxReadiness: null as TaxReadinessDto | null,
   tags: [] as Array<{ id: string; companyId: string; name: string; color: string }>,
 }));
@@ -50,6 +55,9 @@ vi.mock('../state/AppContext', () => ({
       lastSyncedAt: null,
     },
     activeCompanyId: mocks.activeCompanyId,
+    qboMutationRevision: mocks.qboMutationRevision,
+    notifyQboMutation: mocks.notifyQboMutation,
+    subscribeQboMutations: mocks.subscribeQboMutations,
     accounts: [
       {
         id: 'ACCOUNT_GENERIC',
@@ -123,13 +131,12 @@ vi.mock('../lib/api', () => {
       post: mocks.legacyPost,
       undo: mocks.legacyUndo,
       retry: mocks.retry,
-      transfer: vi.fn(),
+      transfer: mocks.transfer,
       bulkPost: mocks.bulkPost,
     },
   };
 });
 
-vi.mock('./settings/AutopilotCard', () => ({ AutopilotQueueStatus: () => null }));
 
 import Queue from './Queue';
 import { ApiError } from '../lib/api';
@@ -293,9 +300,13 @@ async function renderQueue(row: TransactionDto | TransactionDto[] = transaction(
 }
 
 beforeEach(() => {
+  mocks.qboMutationRevision = 0;
   vi.clearAllMocks();
   mocks.list.mockReset();
-  mocks.role = undefined;
+  mocks.mutationListeners.clear();
+  mocks.subscribeQboMutations.mockImplementation(listener => { mocks.mutationListeners.add(listener); return () => mocks.mutationListeners.delete(listener); });
+  mocks.notifyQboMutation.mockImplementation((companyId, transactionIds = [], origin) => { for (const listener of mocks.mutationListeners) listener({ companyId, transactionIds, origin }); });
+  mocks.role = 'categorizer';
   mocks.refreshProviderStatus.mockResolvedValue({companyId: 'COMPANY_GENERIC', processed: 0, persisted: 0, failed: 0, nextCursor: null, partial: false, complete: true, items: []});
   Element.prototype.scrollIntoView = vi.fn();
   window.confirm = vi.fn(() => true);
@@ -310,6 +321,7 @@ beforeEach(() => {
   mocks.taxReadiness = READY;
   mocks.activeCompanyId = 'COMPANY_GENERIC';
   mocks.tags = [];
+  mocks.transfer.mockResolvedValue([]);
   mocks.bankAccounts.mockResolvedValue([]);
   mocks.stage.mockResolvedValue(STAGED);
   mocks.commit.mockResolvedValue(mutation());
@@ -331,6 +343,16 @@ beforeEach(() => {
 });
 
 describe('tax-aware manual queue', () => {
+  it('refreshes transaction rows when another view reports a company mutation', async () => {
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction()], nextCursor: null, pendingCount: 1 });
+    const view = render(<Queue />);
+    await screen.findByText('Generic supplier');
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ payee: 'Refreshed supplier', revision: 8 })], nextCursor: null, pendingCount: 1 });
+    act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+    expect(await screen.findByText('Refreshed supplier')).toBeInTheDocument();
+    expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+  });
+
   it('blocks Queue posting and navigation shortcuts while the split dialog owns focus', async () => {
     const user = userEvent.setup();
     await renderQueue([transaction(), transaction({
@@ -1033,11 +1055,12 @@ describe('tax-aware manual queue', () => {
         expect(await screen.findByText(/verify in quickbooks/i)).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /^reconcile$/i })).toBeEnabled();
       } else if (operation === 'restore') {
-        expect(await screen.findByText(/posted.*verified/i)).toBeInTheDocument();
-        expect(screen.getByRole('button', { name: /^undo$/i })).toBeEnabled();
+        expect(await screen.findByText('Undo not sent')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Retry undo' })).toBeEnabled();
         expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
       } else {
-        await waitForPostEnabled();
+        expect(await screen.findByRole('button', { name: 'Restage categorization' })).toBeEnabled();
+        expect(screen.queryByRole('button', { name: /^post$/i })).not.toBeInTheDocument();
         expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
       }
       expect(screen.queryByText(/write status unresolved/i)).not.toBeInTheDocument();
@@ -1575,6 +1598,30 @@ describe('tax-aware manual queue', () => {
     );
   });
 
+  it('discards an in-flight preview after saving a newer split draft', async () => {
+    const first = deferred<StagedCategorization>();
+    const second = deferred<StagedCategorization>();
+    mocks.stage.mockReset().mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole('button', { name: 'Split' }));
+    await user.type(screen.getByLabelText('Memo for split line 1'), 'Updated allocation');
+    await user.click(screen.getAllByRole('button', { name: /Remove split line/ })[1]!);
+    await user.click(screen.getByRole('button', { name: 'Save split' }));
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+    await act(async () => first.resolve(STAGED));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    expect(mocks.stage).toHaveBeenLastCalledWith('TRANSACTION_GENERIC', expect.objectContaining({
+      expectedRevision: 5,
+      lines: [expect.objectContaining({ grossCents: -1050, memo: 'Updated allocation' })],
+    }));
+    await act(async () => second.resolve({ ...STAGED, revision: 6 }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^post$/i })).toBeEnabled());
+    expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
   it('automatically restages saved split tags', async () => {
     const tagId = '00000000-0000-4000-8000-000000000070';
     mocks.tags = [{
@@ -1730,7 +1777,7 @@ describe('tax-aware manual queue', () => {
   it('restages after an immutable active conflict resumes with a retryable outcome', async () => {
     const first = deferred<StagedCategorization>();
     mocks.stage.mockReset().mockImplementationOnce(() => first.promise).mockResolvedValueOnce({ ...STAGED, revision: 8 });
-    mocks.commit.mockResolvedValue(mutation({ ok: false, status: 'PENDING', outcome: 'RETRYABLE' }));
+    mocks.commit.mockResolvedValue(mutation({ requestId: '00000000-0000-4000-8000-000000000909', ok: false, status: 'PENDING', outcome: 'RETRYABLE' }));
     const user = userEvent.setup();
     await renderQueue();
     await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
@@ -1896,6 +1943,66 @@ describe('tax-aware manual queue', () => {
 
 });
 
+it('refreshes Queue rows and its count after read-only status checks without staging or posting', async () => {
+  mocks.role = 'admin';
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  const stagesBeforeRefresh = mocks.stage.mock.calls.length;
+  mocks.list.mockResolvedValue({ transactions: [], nextCursor: null });
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+  await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+  expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
+  expect(mocks.stage).toHaveBeenCalledTimes(stagesBeforeRefresh);expect(mocks.commit).not.toHaveBeenCalled();expect(mocks.legacyPost).not.toHaveBeenCalled();
+});
+it('adopts fresh Queue rows at the same revision after a status refresh', async () => {
+  mocks.role = 'admin';
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  mocks.list.mockResolvedValue({
+    transactions: [transaction({ payee: 'Updated generic supplier', revision: 5 })],
+    nextCursor: null,
+  });
+
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+
+  expect(await screen.findByText('Updated generic supplier')).toBeInTheDocument();
+  expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+});
+
+it('keeps a newer locally staged revision when an in-flight status reload returns older rows', async () => {
+  mocks.role = 'admin';
+  const pending = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  mocks.stage.mockResolvedValue({ ...STAGED, revision: 6, taxCalculation: 'TaxExcluded' });
+  mocks.list.mockReturnValueOnce(pending.promise);
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+  await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+
+  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+  await screen.findByText(/subtotal.*10\.00/i);
+  await act(async () => pending.resolve({
+    transactions: [transaction({ payee: 'Older generic supplier', revision: 5 })],
+    nextCursor: null,
+  }));
+
+  expect(screen.getByText('Generic supplier')).toBeInTheDocument();
+  expect(screen.queryByText('Older generic supplier')).not.toBeInTheDocument();
+  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax inclusive');
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(3));
+  expect(mocks.stage.mock.calls[2]?.[1]).toMatchObject({ expectedRevision: 6 });
+});
+
+it('does not offer the provider status refresh to viewers', async () => {
+  mocks.role = 'viewer';
+  await renderQueue();
+  expect(screen.queryByRole('button', { name: 'Check QuickBooks status' })).not.toBeInTheDocument();
+});
+
 async function waitForPostEnabled() { const post = screen.getByRole("button", { name: /^post$/i }); await waitFor(() => expect(post).toBeEnabled()); return post; }
 
 async function chooseControl(
@@ -1933,6 +2040,365 @@ async function expectInFlightChangeRestages(
   expect(mocks.stage.mock.calls[1]?.[1]).toMatchObject({ expectedRevision: 5 });
   expect(await screen.findByText(/subtotal/i)).toBeInTheDocument();
 }
+
+
+describe('durable Queue recovery outcomes', () => {
+  it('shows terminal rejection and requires a changed draft before another post', async () => {
+    mocks.commit.mockResolvedValue(mutation({ ok: false, status: 'PENDING', outcome: 'REJECTED', error: { code: 'QBO_WRITE_REJECTED', message: 'QuickBooks rejected this write.' } }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitFor(() => expect(screen.getByRole('button', { name: /^post$/i })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    expect(await screen.findByText('Rejected by QuickBooks — change categorization')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^post$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry verification/i })).not.toBeInTheDocument();
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('button', { name: /^post$/i })).toBeEnabled();
+    expect(mocks.commit).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows rejected Undo without presenting it as verified or retryable', async () => {
+    mocks.undoCategorization.mockResolvedValue(mutation({ ok: false, status: 'POSTED', outcome: 'REJECTED' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status: 'POSTED' }));
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+    expect(await screen.findByText('Undo rejected by QuickBooks — categorization remains posted')).toBeInTheDocument();
+    expect(screen.queryByText('Reverted ✓')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry|reconcile/i })).not.toBeInTheDocument();
+    expect(mocks.retryCategorization).not.toHaveBeenCalled();
+  });
+
+  it.each(['recategorize', 'restore'] as const)('retries retained RETRYABLE %s with a new confirmed request and no reconciliation', async (operation) => {
+    const requestId = '00000000-0000-4000-8000-000000000701';
+    const status = operation === 'restore' ? 'POSTED' : 'PENDING';
+    mocks.reconcile.mockRejectedValue(new ApiError(409, 'Recorded retry requires a new request.', 'RECONCILE_NOT_ALLOWED'));
+    mocks.stage.mockResolvedValue({ ...STAGED, revision: 9 });
+    mocks.undoCategorization.mockResolvedValue(mutation({ status: 'PENDING' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status, activeCategorizationAttempt: { requestId, operation, status: 'RETRYABLE' } }));
+    expect(mocks.stage).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Check retry status' })).not.toBeInTheDocument();
+    expect(mocks.reconcile).not.toHaveBeenCalled();
+    expect(mocks.requestId).not.toHaveBeenCalled();
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
+    if (operation === 'recategorize') {
+      await user.click(await screen.findByRole('button', { name: 'Restage categorization' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: /^post$/i })).toBeEnabled());
+      await user.click(screen.getByRole('button', { name: /^post$/i }));
+      expect(window.confirm).toHaveBeenCalled();
+      await waitFor(() => expect(mocks.commit).toHaveBeenCalledWith('TRANSACTION_GENERIC', 9, '00000000-0000-4000-8000-000000000101'));
+    } else {
+      mocks.list.mockResolvedValue({ transactions: [transaction({ revision: 8 })], nextCursor: null });
+      await user.click(await screen.findByRole('button', { name: 'Retry undo' }));
+      expect(window.confirm).toHaveBeenCalled();
+      await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalledWith('TRANSACTION_GENERIC', '00000000-0000-4000-8000-000000000101'));
+    }
+    expect(mocks.retryCategorization).not.toHaveBeenCalled();
+    expect(mocks.requestId).toHaveBeenCalledTimes(1);
+    expect(mocks.reconcile).not.toHaveBeenCalled();
+  });
+
+  it('does not send a new Undo when retry confirmation is cancelled', async () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    const requestId = '00000000-0000-4000-8000-000000000701';
+    mocks.reconcile.mockResolvedValue(mutation({ requestId, ok: false, status: 'POSTED', outcome: 'RETRYABLE' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status: 'POSTED', activeCategorizationAttempt: { requestId, operation: 'restore', status: 'RETRYABLE' } }));
+    await user.click(await screen.findByRole('button', { name: 'Retry undo' }));
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
+    expect(mocks.requestId).not.toHaveBeenCalled();
+    expect(mocks.stage).not.toHaveBeenCalled();
+  });
+
+  it('reloads the authoritative pending revision after verified Undo before staging again', async () => {
+    mocks.undoCategorization.mockResolvedValue(mutation({ status: 'PENDING' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status: 'POSTED' }));
+    mocks.list.mockResolvedValue({ transactions: [transaction({ revision: 8 })], nextCursor: null });
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith('TRANSACTION_GENERIC', expect.objectContaining({ expectedRevision: 8 })));
+    expect(mocks.toast).toHaveBeenCalledWith('Undo verified in QuickBooks. Transaction returned to Queue.');
+    expect(screen.queryByText('Reverted ✓')).not.toBeInTheDocument();
+    expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
+  it('keeps verified Undo distinct from a failed Queue refresh and retries only the read', async () => {
+    mocks.undoCategorization.mockResolvedValue(mutation({ status: 'PENDING' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status: 'POSTED' }));
+    mocks.list.mockRejectedValueOnce(new Error('Unavailable'));
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+    expect(await screen.findByText('Undo verified — refresh Queue before editing')).toBeInTheDocument();
+    expect(mocks.stage).not.toHaveBeenCalled();
+    mocks.list.mockResolvedValue({ transactions: [transaction({ revision: 8 })], nextCursor: null });
+    await user.click(screen.getByRole('button', { name: 'Refresh Queue' }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith('TRANSACTION_GENERIC', expect.objectContaining({ expectedRevision: 8 })));
+    expect(mocks.undoCategorization).toHaveBeenCalledTimes(1);
+    expect(mocks.retryCategorization).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('Queue fresh write safety recovery', () => {
+  it.each(['recategorize', 'restore'] as const)('loads a persisted PREPARED %s after a fresh safety outage', async operation => {
+    const requestId = '00000000-0000-4000-8000-000000000101';
+    const error = new ApiError(503, 'QuickBooks write safety is temporarily unavailable.', 'QBO_WRITE_SAFETY_UNAVAILABLE');
+    const send = operation === 'restore' ? mocks.undoCategorization : mocks.commit;
+    send.mockRejectedValue(error);
+    const user = userEvent.setup();
+    const status = operation === 'restore' ? 'POSTED' : 'PENDING';
+    await renderQueue(transaction({ status }));
+    if (operation === 'recategorize') await waitForPostEnabled();
+    mocks.list.mockResolvedValue({ transactions: [transaction({ status, revision: 6, activeCategorizationAttempt: { requestId, operation, status: 'PREPARED' } })], nextCursor: null });
+    await user.click(screen.getByRole('button', { name: operation === 'restore' ? /^undo$/i : /^post$/i }));
+    expect(await screen.findByRole('button', { name: operation === 'restore' ? 'Resume undo' : 'Resume post' })).toBeEnabled();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(mocks.reconcile).not.toHaveBeenCalled();
+  });
+
+  it.each(['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED', 'SUPERSEDED'])('removes a transaction after fresh provider rejection %s', async code => {
+    mocks.commit.mockRejectedValue(new ApiError(409, 'The transaction is no longer writable.', code));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(await waitForPostEnabled());
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
+    expect(mocks.commit).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a failed write response from the company the user has left', async () => {
+    const pending = deferred<CategorizationMutationResult>();
+    mocks.commit.mockReturnValueOnce(pending.promise);
+    const user = userEvent.setup();
+    const view = await renderQueue();
+    await user.click(await waitForPostEnabled());
+    mocks.activeCompanyId = 'COMPANY_OTHER';
+    mocks.list.mockResolvedValue({ transactions: [transaction({ id: 'TRANSACTION_OTHER', companyId: 'COMPANY_OTHER', payee: 'Other company supplier', category: null, categoryQboId: null })], nextCursor: null });
+    view.rerender(<Queue />);
+    await screen.findByText('Other company supplier');
+    await act(async () => pending.reject(new ApiError(409, 'Old company error', 'SUPERSEDED')));
+    expect(mocks.toast).not.toHaveBeenCalledWith('Old company error');
+    expect(screen.getByText('Other company supplier')).toBeInTheDocument();
+  });
+});
+
+
+describe('Queue mutation guard parity', () => {
+  it.each([false, true])('checks both transfer legs before sending (counterpart active: %s)', async active => {
+    const user = userEvent.setup();
+    await renderQueue([
+      transaction({ category: null, categoryQboId: null, transferCandidateId: 'TRANSACTION_MATE', bankAccount: 'Bank A' }),
+      deposit({ id: 'TRANSACTION_MATE', category: null, categoryQboId: null, bankAccount: 'Bank B', activeCategorizationAttempt: active ? { requestId: '00000000-0000-4000-8000-000000000701', operation: 'recategorize', status: 'PREPARED' } : null }),
+    ]);
+    await user.click(screen.getByRole('link', { name: 'record as transfer' }));
+    if (active) expect(mocks.transfer).not.toHaveBeenCalled();
+    else await waitFor(() => expect(mocks.transfer).toHaveBeenCalledWith('TRANSACTION_GENERIC', 'TRANSACTION_MATE'));
+  });
+
+  it('describes a dry run as unsent rather than a verified QuickBooks write', async () => {
+    mocks.commit.mockResolvedValue(mutation({ status: 'DRY_RUN', outcome: 'DRY_RUN' }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(await waitForPostEnabled());
+    expect(await screen.findByText('Dry run — nothing sent')).toBeInTheDocument();
+    expect(mocks.toast).toHaveBeenCalledWith('Dry run — payload logged, nothing sent to QuickBooks.');
+    expect(screen.queryByText(/posted.*verified/i)).not.toBeInTheDocument();
+  });
+});
+
+
+it('does not automatically stage a viewer transaction', async () => {
+  mocks.role = 'viewer';
+  await renderQueue();
+  await act(async () => { await Promise.resolve(); });
+  expect(mocks.stage).not.toHaveBeenCalled();
+  expect(mocks.commit).not.toHaveBeenCalled();
+});
+
+
+describe('targeted Queue mutation hydration', () => {
+  it('resets the affected coordinator from the authoritative revision and preserves another local draft', async () => {
+    const user = userEvent.setup();
+    mocks.stage.mockImplementation(async (id, body) => ({ ...STAGED, transactionId: id, revision: body.expectedRevision + 1 }));
+    await renderQueue([transaction(), transaction({ id: 'OTHER', payee: 'Other supplier', category: 'Alternate expense', categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE' })]);
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByText('Other supplier'));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+    const pending = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+    mocks.list.mockReturnValueOnce(pending.promise);
+    act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+    expect(await screen.findByText('Refreshing transaction…')).toBeInTheDocument();
+    await act(async () => pending.resolve({ transactions: [transaction({ revision: 9, category: null, categoryQboId: null, taxCodeQboId: null, taxCalculation: null }), transaction({ id: 'OTHER', payee: 'Other supplier', category: 'Generic expense' })], nextCursor: null }));
+    await user.click(screen.getByText('Generic supplier'));
+    expect(mocks.stage).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('combobox', { name: /Category for Other supplier/ })).toHaveTextContent('Alternate expense');
+    await user.click(screen.getByRole('combobox', { name: /Category for Generic supplier/ }));
+    await user.click(screen.getByRole('option', { name: /Generic expense/ }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenLastCalledWith('TRANSACTION_GENERIC', expect.objectContaining({ expectedRevision: 9 })));
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the affected row blocked after a failed read and retries only that read', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+    await waitForPostEnabled();
+    mocks.list.mockRejectedValueOnce(new Error('Unavailable'));
+    act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+    expect(await screen.findByText('Transaction changed — refresh before editing')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: /Category for Generic supplier/ })).toBeDisabled();
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 8, category: null, categoryQboId: null })], nextCursor: null });
+    await user.click(screen.getByRole('button', { name: 'Refresh transaction' }));
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /Category for Generic supplier/ })).toBeEnabled());
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+  });
+
+  it('announces a valid durable result without refetching or clearing its own ready draft', async () => {
+    const user = userEvent.setup(); await renderQueue(); await waitForPostEnabled();
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    await waitFor(() => expect(mocks.notifyQboMutation).toHaveBeenCalledWith('COMPANY_GENERIC', ['TRANSACTION_GENERIC'], expect.any(Symbol)));
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    expect(mocks.stage).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('legacy Queue mutation producers', () => {
+  it.each(['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED', 'SUPERSEDED'])('removes legacy rows rejected with %s', async code => {
+    mocks.taxReadiness = null;
+    mocks.legacyPost.mockRejectedValue(new ApiError(409, 'No longer writable.', code));
+    const user = userEvent.setup(); await renderQueue(transaction({ taxCalculation: null, taxCodeQboId: null }));
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    expect(mocks.notifyQboMutation).toHaveBeenCalledWith('COMPANY_GENERIC', ['TRANSACTION_GENERIC'], expect.any(Symbol));
+  });
+  it('reports a legacy dry run truthfully and emits without refetching', async () => {
+    mocks.taxReadiness = null; mocks.legacyPost.mockResolvedValue(transaction({ status: 'DRY_RUN', taxCalculation: null }));
+    const user = userEvent.setup(); await renderQueue(transaction({ taxCalculation: null, taxCodeQboId: null }));
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith('Dry run — payload logged, nothing sent to QuickBooks.'));
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+  });
+  it('does not apply a late legacy response or toast after a company switch', async () => {
+    mocks.taxReadiness = null; const pending = deferred<TransactionDto>(); mocks.legacyPost.mockReturnValue(pending.promise);
+    const user = userEvent.setup(); const view = await renderQueue(transaction({ taxCalculation: null, taxCodeQboId: null }));
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    mocks.activeCompanyId = 'OTHER_COMPANY'; mocks.list.mockResolvedValue({ transactions: [transaction({ companyId: 'OTHER_COMPANY', payee: 'New company supplier' })], nextCursor: null });
+    view.rerender(<Queue />); await screen.findByText('New company supplier');
+    await act(async () => pending.resolve(transaction({ status: 'DRY_RUN', payee: 'Old response' })));
+    expect(screen.queryByText('Old response')).not.toBeInTheDocument(); expect(mocks.toast).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('targeted mutation response fencing', () => {
+  it('ignores an older overlapping notification response and late reads after unmount', async () => {
+    const view = await renderQueue(); await waitForPostEnabled();
+    const first = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+    const second = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+    mocks.list.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    act(() => { mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']); mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']); });
+    await act(async () => second.resolve({ transactions: [transaction({ revision: 12, payee: 'Latest supplier', category: null, categoryQboId: null })], nextCursor: null }));
+    await screen.findByText('Latest supplier');
+    await act(async () => first.resolve({ transactions: [transaction({ revision: 8, payee: 'Old supplier' })], nextCursor: null }));
+    expect(screen.queryByText('Old supplier')).not.toBeInTheDocument();
+    const last = deferred<{ transactions: TransactionDto[]; nextCursor: null }>(); mocks.list.mockReturnValueOnce(last.promise);
+    act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC'])); view.unmount();
+    await act(async () => last.reject(new Error('Unavailable'))); expect(mocks.toast).not.toHaveBeenCalled();
+    expect(mocks.mutationListeners.size).toBe(0);
+  });
+
+  it('does not let a disposed coordinator reload overwrite externally refreshed state', async () => {
+    const stage = deferred<StagedCategorization>(); mocks.stage.mockReturnValueOnce(stage.promise);
+    await renderQueue(); await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(1));
+    const oldReload = deferred<{ transactions: TransactionDto[]; nextCursor: null }>(); mocks.list.mockReturnValueOnce(oldReload.promise);
+    await act(async () => stage.reject(new ApiError(409, 'Changed', 'STALE_REVISION')));
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+    mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 12, payee: 'Authoritative supplier', category: null, categoryQboId: null })], nextCursor: null });
+    act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+    await screen.findByText('Authoritative supplier');
+    await act(async () => oldReload.resolve({ transactions: [transaction({ revision: 7, payee: 'Stale conflict supplier', category: 'Alternate expense', categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE' })], nextCursor: null }));
+    expect(screen.queryByText('Stale conflict supplier')).not.toBeInTheDocument();
+    expect(screen.getByText('Authoritative supplier')).toBeInTheDocument(); expect(mocks.stage).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+it('excludes an externally refreshing selected row from bulk posting', async () => {
+  mocks.taxReadiness = null; const user = userEvent.setup(); await renderQueue(transaction({ taxCalculation: null, taxCodeQboId: null }));
+  await user.click(screen.getAllByRole('checkbox')[1]!);
+  const pending = deferred<{ transactions: TransactionDto[]; nextCursor: null }>(); mocks.list.mockReturnValueOnce(pending.promise);
+  act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+  expect(await screen.findByText('Refreshing transaction…')).toBeInTheDocument();
+  const post = screen.queryByRole('button', { name: /post 1 transaction/i });
+  if (post) await user.click(post);
+  expect(mocks.bulkPost).not.toHaveBeenCalled();
+  await act(async () => pending.resolve({ transactions: [], nextCursor: null }));
+});
+
+
+it.each(['requestId', 'transactionId'] as const)('rejects a success payload with a mismatched %s without notifying or patching status', async field => {
+  const user = userEvent.setup(); mocks.commit.mockResolvedValue(mutation({ [field]: 'different-result' }));
+  await renderQueue(); await waitForPostEnabled(); await user.click(screen.getByRole('button', { name: /^post$/i }));
+  expect(await screen.findByText('Write status unresolved — reload required')).toBeInTheDocument();
+  expect(screen.queryByText('Posted — verified ✓')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /^undo$/i })).not.toBeInTheDocument();
+  expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+});
+
+
+it('adds an externally undone transaction that was absent from Queue while preserving visible drafts', async () => {
+  await renderQueue(transaction({ id: 'OTHER', payee: 'Visible supplier', category: 'Alternate expense', categoryQboId: 'EXPENSE_ACCOUNT_ALTERNATE' }));
+  mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 9, category: null, categoryQboId: null }), transaction({ id: 'OTHER', payee: 'Visible supplier', category: 'Generic expense' })], nextCursor: null });
+  act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+  expect(await screen.findByText('Generic supplier')).toBeInTheDocument();
+  expect(screen.getByRole('combobox', { name: 'Category for Visible supplier' })).toHaveTextContent('Alternate expense');
+});
+
+
+it('hides a closed-period row while retaining recent posted feedback', async () => {
+  mocks.list.mockResolvedValue({ transactions: [transaction({ payee: 'Closed supplier', bankAccount: 'Closed account', providerActionability: { disposition: 'BLOCKED_PERIOD_CLOSED', checkedAt: null, revision: 4, qboSyncToken: '1', qboType: 'Purchase', qboId: 'PURCHASE_GENERIC', txnDate: '2026-07-28', bankAccountQboId: null, bookCloseDate: '2026-08-01', cleared: null, reconciled: null, unavailableCode: null, unavailableReason: null } }), transaction({ id: 'POSTED', payee: 'Posted supplier', status: 'POSTED' })], nextCursor: null });
+  render(<Queue />); await screen.findByText('Posted supplier');
+  expect(screen.queryByText('Closed supplier')).not.toBeInTheDocument();
+  expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
+  expect(screen.getByText(/0 transactions.*0.00 waiting/)).toBeInTheDocument();
+  const user = userEvent.setup(); await user.click(screen.getByRole('combobox', { name: 'Account filter' }));
+  expect(screen.queryByRole('option', { name: 'Closed account' })).not.toBeInTheDocument();
+  await user.keyboard('{Escape}');
+  await user.type(screen.getByPlaceholderText(/Search anything/), 'Posted');
+  expect(screen.getByText('Posted supplier')).toBeInTheDocument();
+  expect(mocks.stage).not.toHaveBeenCalled();
+});
+
+
+it('keeps newer notification hydration when the older initial load finishes last', async () => {
+  const initial = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+  mocks.list.mockReturnValueOnce(initial.promise); render(<Queue />);
+  mocks.list.mockResolvedValueOnce({ transactions: [transaction({ revision: 9, payee: 'Freshly undone supplier', category: null, categoryQboId: null })], nextCursor: null });
+  act(() => mocks.notifyQboMutation('COMPANY_GENERIC', ['TRANSACTION_GENERIC']));
+  await screen.findByText('Freshly undone supplier');
+  await act(async () => initial.resolve({ transactions: [transaction({ status: 'POSTED', payee: 'Old initial supplier' })], nextCursor: null }));
+  expect(screen.queryByText('Old initial supplier')).not.toBeInTheDocument();
+  expect(screen.getByText('Freshly undone supplier')).toBeInTheDocument();
+  expect(mocks.stage).not.toHaveBeenCalled();
+});
+
+it('offers a read-only recovery when a legacy post response mismatches its transaction', async () => {
+  mocks.taxReadiness = null; mocks.legacyPost.mockResolvedValue(transaction({ id: 'WRONG', status: 'POSTED' }));
+  const user = userEvent.setup(); await renderQueue(transaction({ taxCalculation: null, taxCodeQboId: null }));
+  await user.click(screen.getByRole('button', { name: /^post$/i }));
+  expect(await screen.findByText('Transaction changed — refresh before editing')).toBeInTheDocument();
+  mocks.list.mockResolvedValueOnce({ transactions: [], nextCursor: null });
+  await user.click(screen.getByRole('button', { name: 'Refresh transaction' }));
+  await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+  expect(mocks.legacyPost).toHaveBeenCalledTimes(1); expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+});
+
 
 describe('Queue tax layout', () => {
   it('keeps tax controls and server totals ordered and allows wrapping instead of clipping', async () => {
@@ -2050,62 +2516,3 @@ function mockMobileMedia() {
       })),
     });
 }
-it('refreshes Queue rows and its count after read-only status checks without staging or posting', async () => {
-  mocks.role = 'admin';
-  const user = userEvent.setup();
-  await renderQueue();
-  await waitForPostEnabled();
-  const stagesBeforeRefresh = mocks.stage.mock.calls.length;
-  mocks.list.mockResolvedValue({ transactions: [], nextCursor: null });
-  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
-  await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
-  expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
-  expect(mocks.stage).toHaveBeenCalledTimes(stagesBeforeRefresh);expect(mocks.commit).not.toHaveBeenCalled();expect(mocks.legacyPost).not.toHaveBeenCalled();
-});
-it('adopts fresh Queue rows at the same revision after a status refresh', async () => {
-  mocks.role = 'admin';
-  const user = userEvent.setup();
-  await renderQueue();
-  await waitForPostEnabled();
-  mocks.list.mockResolvedValue({
-    transactions: [transaction({ payee: 'Updated generic supplier', revision: 5 })],
-    nextCursor: null,
-  });
-
-  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
-
-  expect(await screen.findByText('Updated generic supplier')).toBeInTheDocument();
-  expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
-});
-
-it('keeps a newer locally staged revision when an in-flight status reload returns older rows', async () => {
-  mocks.role = 'admin';
-  const pending = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
-  const user = userEvent.setup();
-  await renderQueue();
-  await waitForPostEnabled();
-  mocks.stage.mockResolvedValue({ ...STAGED, revision: 6, taxCalculation: 'TaxExcluded' });
-  mocks.list.mockReturnValueOnce(pending.promise);
-  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
-  await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
-
-  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
-  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
-  await screen.findByText(/subtotal.*10\.00/i);
-  await act(async () => pending.resolve({
-    transactions: [transaction({ payee: 'Older generic supplier', revision: 5 })],
-    nextCursor: null,
-  }));
-
-  expect(screen.getByText('Generic supplier')).toBeInTheDocument();
-  expect(screen.queryByText('Older generic supplier')).not.toBeInTheDocument();
-  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax inclusive');
-  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(3));
-  expect(mocks.stage.mock.calls[2]?.[1]).toMatchObject({ expectedRevision: 6 });
-});
-
-it('does not offer the provider status refresh to viewers', async () => {
-  mocks.role = 'viewer';
-  await renderQueue();
-  expect(screen.queryByRole('button', { name: 'Check QuickBooks status' })).not.toBeInTheDocument();
-});

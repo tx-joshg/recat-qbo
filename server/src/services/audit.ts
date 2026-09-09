@@ -4,7 +4,10 @@
 // There is intentionally no update or delete API for this table.
 
 import type { AuditEntry, Prisma, PrismaClient } from '@prisma/client';
-import type { AuditAction, AuditEntryDto } from '@recat/shared';
+import { AUDIT_UNDO_WINDOW_MS, type AuditAction, type AuditEntryDto } from '@recat/shared';
+import { legacyStagingRequired } from './legacyWriteLifecycle.js';
+import { deriveCachedTaxCodeRates } from './tax/cache.js';
+import { ACTIVE_ATTEMPT_STATUSES } from './writeback.js';
 import { prisma } from '../lib/prisma.js';
 
 /** Either the root client or an interactive-transaction client. */
@@ -15,7 +18,8 @@ export type MutationAuditOutcome =
   | 'VERIFIED'
   | 'UNCERTAIN'
   | 'UNCHANGED'
-  | 'RETRYABLE';
+  | 'RETRYABLE'
+  | 'REJECTED';
 
 export interface MutationAuditInput {
   requestId: string;
@@ -211,8 +215,215 @@ function toAuditDto(row: AuditEntry): AuditEntryDto {
     before: row.before,
     after: row.after,
   };
-  if (row.payload !== null) dto.payload = row.payload;
+  if (row.txnId !== null) dto.transactionId = row.txnId;
   return dto;
+}
+
+interface AuditUndoTransactionState {
+  id: string;
+  status: string;
+  postedAt: Date | null;
+  legacyUndoAllowed: boolean;
+  hasActiveAttempt?: boolean;
+}
+
+interface LatestUndoableAuditState {
+  id: string;
+  txnId: string | null;
+  payload: unknown;
+}
+
+interface AuditTaxCodeCandidateState {
+  id: string;
+  qboType: string;
+  status: string;
+  postedAt: Date | null;
+  hasActiveAttempt?: boolean;
+}
+
+function isVerifiedCategorizationPayload(payload: unknown): boolean {
+  if (typeof payload !== 'object' || payload === null) return false;
+  const record = payload as Record<string, unknown>;
+  if (record.outcome !== 'VERIFIED') return false;
+  const references = record.references;
+  return typeof references === 'object'
+    && references !== null
+    && (references as Record<string, unknown>).operation === 'recategorize';
+}
+
+function auditUndoCandidateKind(
+  entry: AuditEntryDto,
+  txn: Pick<AuditUndoTransactionState, 'status' | 'postedAt' | 'hasActiveAttempt'> | undefined,
+  latest: LatestUndoableAuditState | undefined,
+  now: Date,
+): 'categorization' | 'legacy' | null {
+  if (txn?.hasActiveAttempt === true) return null;
+  const postedAt = txn?.postedAt?.getTime();
+  const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
+  const postedWrite = txn?.status === 'POSTED'
+    && (entry.action === 'posted' || entry.action === 'auto-posted');
+  const dryRun = txn?.status === 'DRY_RUN' && entry.action === 'dry-run';
+  const postedWriteOutsideUndoWindow = postedWrite
+    && (elapsed < 0 || elapsed > AUDIT_UNDO_WINDOW_MS);
+  if (
+    (!postedWrite && !dryRun)
+    || latest?.id !== entry.id
+    || postedWriteOutsideUndoWindow
+  ) {
+    return null;
+  }
+  return postedWrite && isVerifiedCategorizationPayload(latest.payload)
+    ? 'categorization'
+    : 'legacy';
+}
+
+function latestUndoableByTransactionId(
+  rows: LatestUndoableAuditState[],
+): Map<string, LatestUndoableAuditState> {
+  const latest = new Map<string, LatestUndoableAuditState>();
+  for (const row of rows) {
+    if (row.txnId === null || latest.has(row.txnId)) continue;
+    latest.set(row.txnId, row);
+  }
+  return latest;
+}
+
+export function auditPageNeedsSalesTaxCodes(
+  entries: AuditEntryDto[],
+  transactions: AuditTaxCodeCandidateState[],
+  latestUndoableEntries: LatestUndoableAuditState[],
+  now = new Date(),
+): boolean {
+  const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
+  const latestByTransactionId = latestUndoableByTransactionId(latestUndoableEntries);
+
+  return entries.some((entry) => {
+    const transactionId = entry.transactionId;
+    if (transactionId === undefined) return false;
+    const txn = transactionById.get(transactionId);
+    const latest = latestByTransactionId.get(transactionId);
+    return txn?.qboType === 'Deposit'
+      && txn.status === 'POSTED'
+      && auditUndoCandidateKind(entry, txn, latest, now) === 'legacy';
+  });
+}
+
+export function decorateAuditEntriesWithUndo(
+  entries: AuditEntryDto[],
+  transactions: AuditUndoTransactionState[],
+  latestUndoableEntries: LatestUndoableAuditState[],
+  now = new Date(),
+): AuditEntryDto[] {
+  const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
+  const latestByTransactionId = latestUndoableByTransactionId(latestUndoableEntries);
+
+  return entries.map((entry) => {
+    const transactionId = entry.transactionId;
+    if (transactionId === undefined) return entry;
+    const withTransaction = { ...entry, transactionId };
+    const txn = transactionById.get(transactionId);
+    const latest = latestByTransactionId.get(transactionId);
+    const kind = auditUndoCandidateKind(entry, txn, latest, now);
+    if (kind === null) return withTransaction;
+    if (txn?.status === 'POSTED' && kind === 'legacy' && txn.legacyUndoAllowed !== true) {
+      return withTransaction;
+    }
+    return {
+      ...withTransaction,
+      undo: { kind },
+    };
+  });
+}
+
+async function decoratePageWithUndo(
+  companyId: string,
+  entries: AuditEntryDto[],
+): Promise<AuditEntryDto[]> {
+  const transactionIds = [...new Set(
+    entries.flatMap((entry) => entry.transactionId === undefined ? [] : [entry.transactionId]),
+  )];
+  if (transactionIds.length === 0) return entries;
+  const [transactions, postedEntries] = await Promise.all([
+    prisma.transaction.findMany({
+      where: { companyId, id: { in: transactionIds } },
+      select: {
+        id: true,
+        status: true,
+        postedAt: true,
+        qboType: true,
+        taxCalculation: true,
+        taxCodeQboId: true,
+        splitLines: { select: { taxCodeQboId: true } },
+        qboMutationAttempts: {
+          where: { status: { in: ACTIVE_ATTEMPT_STATUSES } },
+          select: { id: true },
+          take: 1,
+        },
+        _count: { select: { qboMutationAttempts: true } },
+        company: {
+          select: {
+            taxSupportStatus: true,
+            taxUsingSalesTax: true,
+            taxSupportReason: true,
+          },
+        },
+      },
+    }),
+    prisma.auditEntry.findMany({
+      where: {
+        companyId,
+        txnId: { in: transactionIds },
+        action: { in: ['posted', 'auto-posted', 'dry-run'] },
+      },
+      select: { id: true, txnId: true, payload: true },
+      orderBy: [{ at: 'desc' }, { id: 'desc' }],
+    }),
+  ]);
+  const transactionsWithAttemptState = transactions.map((txn) => ({
+    ...txn,
+    hasActiveAttempt: txn.qboMutationAttempts.length > 0,
+  }));
+  const needsSalesTaxCodes = auditPageNeedsSalesTaxCodes(
+    entries,
+    transactionsWithAttemptState,
+    postedEntries,
+  );
+  const cachedSalesTaxCodes = needsSalesTaxCodes
+    ? await Promise.all([
+        prisma.qboTaxCode.findMany({
+          where: { companyId },
+          select: {
+            active: true,
+            taxable: true,
+            purchaseTaxRateList: true,
+            salesTaxRateList: true,
+          },
+        }),
+        prisma.qboTaxRate.findMany({
+          where: { companyId, active: true, rateValue: { not: null } },
+          select: { qboId: true, active: true, rateValue: true },
+        }),
+      ]).then(([codes, rates]) => deriveCachedTaxCodeRates(codes, rates))
+    : [];
+  return decorateAuditEntriesWithUndo(
+    entries,
+    transactionsWithAttemptState.map((txn) => ({
+      id: txn.id,
+      status: txn.status,
+      postedAt: txn.postedAt,
+      hasActiveAttempt: txn.hasActiveAttempt,
+      legacyUndoAllowed: !legacyStagingRequired({
+        qboType: txn.qboType,
+        taxCalculation: txn.taxCalculation,
+        taxCodeQboId: txn.taxCodeQboId,
+        splitTaxCodeQboIds: txn.splitLines.map((line) => line.taxCodeQboId),
+        hasDurableAttempt: txn._count.qboMutationAttempts > 0,
+        company: txn.company,
+        cachedSalesTaxCodes,
+      }),
+    })),
+    postedEntries,
+  );
 }
 
 /** Does the entry match the free-text search across when/who/payee/amount/action/before/after? */
@@ -254,7 +465,7 @@ export async function listAudit(companyId: string, opts: ListAuditOptions = {}):
     const entries = matched.slice(start, start + limit);
     const last = entries[entries.length - 1];
     const nextCursor = last !== undefined && matched.length > start + limit ? last.id : null;
-    return { entries, nextCursor };
+    return { entries: await decoratePageWithUndo(companyId, entries), nextCursor };
   }
 
   const rows = await prisma.auditEntry.findMany({
@@ -267,7 +478,7 @@ export async function listAudit(companyId: string, opts: ListAuditOptions = {}):
   const entries = rows.slice(0, limit).map(toAuditDto);
   const last = entries[entries.length - 1];
   const nextCursor = hasMore && last !== undefined ? last.id : null;
-  return { entries, nextCursor };
+  return { entries: await decoratePageWithUndo(companyId, entries), nextCursor };
 }
 
 // ---- CSV export ----

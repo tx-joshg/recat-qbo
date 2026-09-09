@@ -88,7 +88,7 @@ export interface TransactionListInput extends PageInput {
 }
 
 export type VerificationReadStatus = 'verified' | 'dry-run' | 'failed' | 'uncertain' | 'unknown';
-export type VerificationReadOutcome = 'VERIFIED' | 'DRY_RUN' | 'RETRYABLE' | 'UNCERTAIN' | 'UNCHANGED';
+export type VerificationReadOutcome = 'VERIFIED' | 'DRY_RUN' | 'RETRYABLE' | 'UNCERTAIN' | 'UNCHANGED' | 'REJECTED';
 
 export interface VerificationReadSummary {
   status: VerificationReadStatus;
@@ -453,11 +453,11 @@ function transactionDto(
     typeof attempt.requestId === 'string' &&
     UUID_PATTERN.test(attempt.requestId) &&
     (operation === 'recategorize' || operation === 'restore') &&
-    (attemptStatus === 'PREPARED' || attemptStatus === 'COMMITTING' || attemptStatus === 'UNCERTAIN')
+    (attemptStatus === 'PREPARED' || attemptStatus === 'RETRYABLE' || attemptStatus === 'COMMITTING' || attemptStatus === 'UNCERTAIN')
       ? {
           requestId: attempt.requestId,
           operation: operation as 'recategorize' | 'restore',
-          status: attemptStatus as 'PREPARED' | 'COMMITTING' | 'UNCERTAIN',
+          status: attemptStatus as 'PREPARED' | 'RETRYABLE' | 'COMMITTING' | 'UNCERTAIN',
         }
       : null;
   const sourceGrossCents = provenSourceGross(row, holdingAccountIds);
@@ -527,8 +527,9 @@ export const transactionReadInclude = {
     orderBy: { idx: 'asc' },
   },
   qboMutationAttempts: {
-    where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
-    orderBy: { createdAt: 'desc' },
+    // Select the newest attempt before checking its state, so an old retry
+    // cannot resurface after a terminal successor.
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: 1,
     select: { requestId: true, operation: true, status: true },
   },
@@ -715,6 +716,8 @@ function verificationSummary(attempt: Row | undefined): VerificationReadSummary 
       return { status: 'dry-run', outcome: 'DRY_RUN', summary: 'Dry run only; nothing was sent.' };
     case 'RETRYABLE':
       return { status: 'failed', outcome: 'RETRYABLE', summary: 'Write did not complete.' };
+    case 'REJECTED':
+      return { status: 'failed', outcome: 'REJECTED', summary: 'QuickBooks rejected the prepared write.' };
     case 'UNCERTAIN':
       return { status: 'uncertain', outcome: 'UNCERTAIN', summary: 'QuickBooks write could not be verified.' };
     default:

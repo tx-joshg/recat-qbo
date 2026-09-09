@@ -218,7 +218,8 @@ export type CategorizationMutationOutcome =
   | 'IN_PROGRESS'
   | 'UNCHANGED'
   | 'DRY_RUN'
-  | 'RETRYABLE';
+  | 'RETRYABLE'
+  | 'REJECTED';
 
 export interface CategorizationMutationResult {
   transactionId: string;
@@ -232,7 +233,7 @@ export interface CategorizationMutationResult {
 export interface ActiveCategorizationAttemptDto {
   requestId: string;
   operation: 'recategorize' | 'restore';
-  status: 'PREPARED' | 'COMMITTING' | 'UNCERTAIN';
+  status: 'PREPARED' | 'RETRYABLE' | 'COMMITTING' | 'UNCERTAIN';
 }
 
 export type QboDiagnosticCode =
@@ -262,7 +263,8 @@ export type AgentRunStatus =
   | 'dry_run'
   | 'unchanged'
   | 'uncertain'
-  | 'retryable';
+  | 'retryable'
+  | 'rejected';
 
 export type AutopilotRunOutcome =
   | 'shadow_proposed'
@@ -988,7 +990,12 @@ export interface SavedReportDto {
   config: SavedReportConfig;
 }
 
+/** Age limit for new QuickBooks undo requests. Dry-run resets do not write. */
+export const AUDIT_UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
 export interface AuditEntryDto {
+  transactionId?: string;
+  undo?: { kind: 'categorization' | 'legacy' };
   id: string;
   companyId: string;
   at: string;

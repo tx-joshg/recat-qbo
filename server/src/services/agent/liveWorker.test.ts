@@ -249,6 +249,52 @@ describe('guarded live worker', () => {
     expect(homeCurrencyAuthorityWarnings(raw, 'XTS')).toEqual(expected);
   });
 
+  it('finishes a rejected provider write without scheduling another send', async () => {
+    const d = deps({
+      commit: vi.fn(async () => ({
+        transactionId: TRANSACTION_ID,
+        requestId: JOB_ID,
+        ok: false,
+        status: 'PENDING' as const,
+        outcome: 'REJECTED' as const,
+        error: {
+          code: 'QBO_WRITE_REJECTED',
+          message: 'The durable operation state could not be confirmed.',
+        },
+      })),
+    });
+
+    await runClaimedLiveJob(job(), d);
+
+    expect(d.completions).toEqual([expect.objectContaining({
+      status: 'rejected',
+      errorCode: 'QBO_WRITE_REJECTED',
+    })]);
+  });
+
+  it('pauses instead of retrying a mutation that requires reconciliation', async () => {
+    const d = deps({
+      commit: vi.fn(async () => ({
+        transactionId: TRANSACTION_ID,
+        requestId: JOB_ID,
+        ok: false,
+        status: 'PENDING' as const,
+        outcome: 'IN_PROGRESS' as const,
+        error: {
+          code: 'OPERATION_RECONCILIATION_REQUIRED',
+          message: 'The durable operation state could not be confirmed.',
+        },
+      })),
+    });
+
+    await runClaimedLiveJob(job(), d);
+
+    expect(d.completions).toEqual([expect.objectContaining({
+      status: 'uncertain',
+      errorCode: 'OPERATION_RECONCILIATION_REQUIRED',
+    })]);
+  });
+
   it('rechecks QBO and local freshness immediately before staging and never writes stale output', async () => {
     const before = freshInput();
     const after = freshInput({

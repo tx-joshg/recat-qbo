@@ -25,6 +25,8 @@ vi.mock('../state/AppContext', () => ({
       id: 'COMPANY_GENERIC', nickname: 'Generic company', holdingAccountIds: [], lastSyncedAt: null,
     },
     activeCompanyId: 'COMPANY_GENERIC',
+    notifyQboMutation: vi.fn(),
+    subscribeQboMutations: () => () => {},
     role: 'admin',
     accounts: [
       { id: 'ACCOUNT_GENERIC', qboId: 'EXPENSE_GENERIC', name: 'Generic expense', fullName: 'Expenses · Generic expense', classification: 'Expenses', active: true },
@@ -51,7 +53,6 @@ vi.mock('../lib/api', () => ({
   },
 }));
 
-vi.mock('./settings/AutopilotCard', () => ({ AutopilotQueueStatus: () => null }));
 
 import Queue from './Queue';
 

@@ -328,7 +328,7 @@ function undoFixture(status: string | null = null) {
         ) ?? null
   ));
   value.transactionStatus.value = status === 'VERIFIED'
-    ? 'REVERTED'
+    ? 'PENDING'
     : status === 'UNCERTAIN'
       ? 'ERROR'
       : 'POSTED';
@@ -389,13 +389,13 @@ function undoFixture(status: string | null = null) {
       errorCode: null,
       errorMessage: null,
     });
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: target.id,
       ok: true,
-      status: 'REVERTED' as const,
+      status: 'PENDING' as const,
       outcome: 'VERIFIED' as const,
     };
   });
@@ -407,13 +407,13 @@ function undoFixture(status: string | null = null) {
       status: 'REVERTED',
       newSyncToken: '9',
     };
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: value.operations[0]!.id,
       ok: true,
-      status: 'REVERTED',
+      status: 'PENDING',
       outcome: 'VERIFIED',
     };
   });
@@ -516,6 +516,178 @@ describe('MCP attachment operation dispatch', () => {
 });
 
 describe('MCP categorization operation execution', () => {
+  it('returns an unchanged retry child after reconciliation without creating another child', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'UNCHANGED';
+      value.attempts[1]!.verification = {
+        outcome: 'UNCHANGED',
+        status: 'PENDING',
+      };
+      value.transactionStatus.value = 'PENDING';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'PENDING',
+        outcome: 'UNCHANGED',
+      };
+    });
+
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'retryable',
+      phase: 'write_unchanged',
+      actions: { canRetry: false },
+    });
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
+  it('reads and resumes the existing retry child when called with the root id', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'VERIFIED';
+      value.attempts[1]!.responseSnapshot = {};
+      value.attempts[1]!.verification = {
+        outcome: 'VERIFIED',
+        status: 'POSTED',
+        newSyncToken: '8',
+      };
+      value.transactionStatus.value = 'POSTED';
+      value.transactionSync.value = '8';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'POSTED',
+        outcome: 'VERIFIED',
+      };
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'committed',
+      phase: 'verified',
+    });
+    expect(value.reconcile).toHaveBeenCalledOnce();
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
+  it('projects a deterministic provider rejection as terminal and non-retryable', async () => {
+    const value = fixture('REJECTED');
+    value.attempts[0]!.verification = {
+      outcome: 'REJECTED',
+      status: 'PENDING',
+    };
+    value.attempts[0]!.errorCode = 'QBO_WRITE_REJECTED';
+    value.attempts[0]!.errorMessage = 'private provider detail';
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      state: 'rejected',
+      phase: 'write_rejected',
+      result: { outcome: 'REJECTED', status: 'PENDING' },
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction.',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: false,
+      },
+    });
+    await expect(commitMcpCategorization(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    expect(value.commit).not.toHaveBeenCalled();
+    expect(value.reconcile).not.toHaveBeenCalled();
+    expect(JSON.stringify(await getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    ))).not.toContain('private provider detail');
+  });
+
   it('routes transfer status and retry through the shared paired-operation adapter', async () => {
     const f = fixture();
     f.operations[0] = operation({
@@ -1054,6 +1226,40 @@ describe('MCP categorization operation execution', () => {
 });
 
 describe('MCP undo operation execution', () => {
+  it('accepts only restore POSTED→REVERTED evidence with a PENDING queue state', async () => {
+    const verified = undoFixture('VERIFIED');
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      verified.deps,
+    )).resolves.toMatchObject({
+      kind: 'undo',
+      state: 'committed',
+      result: { outcome: 'VERIFIED', status: 'PENDING' },
+    });
+
+    verified.attempts[0]!.operation = 'recategorize';
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      verified.deps,
+    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
+
+    const dryRun = undoFixture('DRY_RUN');
+    dryRun.attempts[0]!.verification = {
+      outcome: 'DRY_RUN',
+      status: 'DRY_RUN',
+    };
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      dryRun.deps,
+    )).resolves.toMatchObject({
+      state: 'reconciliation_required',
+      phase: 'corrupt',
+    });
+  });
+
   it('projects an unattempted undo as a redacted prepared operation', async () => {
     const { deps } = undoFixture();
 
@@ -1144,7 +1350,7 @@ describe('MCP undo operation execution', () => {
         kind: 'undo',
         state: 'committed',
         phase: 'verified',
-        result: { outcome: 'VERIFIED', status: 'REVERTED' },
+        result: { outcome: 'VERIFIED', status: 'PENDING' },
       });
       expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
         requestId: 'operation-1',
@@ -1168,39 +1374,7 @@ describe('MCP undo operation execution', () => {
     },
   );
 
-  it('accepts only restore POSTED→REVERTED verified evidence for undo', async () => {
-    const verified = undoFixture('VERIFIED');
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      verified.deps,
-    )).resolves.toMatchObject({
-      kind: 'undo',
-      state: 'committed',
-      result: { outcome: 'VERIFIED', status: 'REVERTED' },
-    });
 
-    verified.attempts[0]!.operation = 'recategorize';
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      verified.deps,
-    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
-
-    const dryRun = undoFixture('DRY_RUN');
-    dryRun.attempts[0]!.verification = {
-      outcome: 'DRY_RUN',
-      status: 'DRY_RUN',
-    };
-    await expect(getMcpOperation(
-      principal,
-      { operationId: 'operation-1' },
-      dryRun.deps,
-    )).resolves.toMatchObject({
-      state: 'reconciliation_required',
-      phase: 'corrupt',
-    });
-  });
 
   it('projects persisted undo evidence as corrupt when restore or current-post hashes differ', async () => {
     const value = undoFixture('VERIFIED');

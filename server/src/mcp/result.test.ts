@@ -16,6 +16,18 @@ import { safeToolFailure, toolSuccess } from './result.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
 describe('MCP tool results', () => {
+  it.each([
+    new McpOperationExecutionError('OPERATION_CORRUPT'),
+    new McpTransferExecutionError('OPERATION_CORRUPT'),
+    new McpUndoError('OPERATION_CORRUPT'),
+  ])('requires reconciliation for a corrupt operation envelope: %s', (error) => {
+    const result = safeToolFailure(error, 'recovery-fixture');
+    expect(result.structuredContent).toMatchObject({ error: {
+      code: 'OPERATION_RECONCILIATION_REQUIRED',
+      message: 'This operation requires reconciliation before it can continue.',
+    } });
+  });
+
   it('gives bounded-output failures a safe actionable response', () => {
     const result = safeToolFailure(new McpSchemaBoundsError('OUTPUT_BYTES', 'PRIVATE_SIZE_SENTINEL'), 'request-size');
     expect(result.structuredContent).toMatchObject({ error: {
@@ -141,10 +153,10 @@ describe('MCP tool results', () => {
     [new McpOperationExecutionError('OPERATION_CANCELLED'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('RETRY_NOT_ALLOWED'), 'INVALID_INPUT'],
-    [new McpOperationExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpOperationExecutionError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [new McpTransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
     [new McpTransferExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
-    [new McpTransferExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpTransferExecutionError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [new TransferOperationError('FORBIDDEN'), 'FORBIDDEN'],
     [new TransferOperationError('TRANSACTION_NOT_FOUND'), 'NOT_FOUND'],
     [new TransferOperationError('COMPANY_DISCONNECTED'), 'QBO_DISCONNECTED'],
@@ -153,7 +165,7 @@ describe('MCP tool results', () => {
     [new TransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
     [new TransferExecutionError('OPERATION_EXPIRED'), 'INVALID_INPUT'],
     [new McpUndoError('UNDO_NOT_ALLOWED'), 'INVALID_INPUT'],
-    [new McpUndoError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpUndoError('OPERATION_CORRUPT'), 'OPERATION_RECONCILIATION_REQUIRED'],
     [
       new CategorizationError(
         'TRANSACTION_NOT_FOUND',

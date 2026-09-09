@@ -312,6 +312,23 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     };
   }
 
+  it('allows explicit restaging after RETRYABLE while retaining the old attempt unchanged', async () => {
+    const fixture = await seed();
+    try {
+      const oldAttempt = await attemptClient.qboMutationAttempt.create({
+        data: { ...attemptData(fixture, 'RETRYABLE'), operation: 'recategorize' },
+      });
+      const staged = await stageCategorization(fixture.input, realStageDeps(stageClient));
+      expect(staged.revision).toBe(1);
+      expect(await attemptClient.qboMutationAttempt.findUniqueOrThrow({ where: { id: oldAttempt.id } }))
+        .toEqual(oldAttempt);
+      expect(await attemptClient.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
+        .toMatchObject({ revision: 1, status: 'PENDING' });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
   it('stages positive Deposit sales tax with database-backed references', async () => {
     const fixture = await seedDepositSalesTax();
 

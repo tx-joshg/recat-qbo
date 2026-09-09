@@ -246,7 +246,7 @@ export async function evaluateShadowRunAgainstOutcome(
         status: true,
       },
     });
-    const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'REVERTED';
+    const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'PENDING';
     if (
       transaction === null
       || transaction.companyId !== outcome.companyId

@@ -22,6 +22,8 @@ vi.mock('../state/AppContext', () => ({
       lastSyncedAt: null,
     },
     activeCompanyId: context.companyId,
+    notifyQboMutation: vi.fn(),
+    subscribeQboMutations: () => () => {},
     role: 'admin',
     accounts: context.accounts,
     tags: context.tags,

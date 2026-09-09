@@ -44,6 +44,16 @@ export interface PrepareMcpCategorizationInput {
   proposal: CategorizationProposal;
 }
 
+/**
+ * Read-only recovery input for an exact prepare that was accepted by a
+ * transport but whose response was lost before the caller received its ID.
+ */
+export interface GetPreparedMcpCategorizationInput {
+  companyId: string;
+  transactionId: string;
+  idempotencyKey: string;
+}
+
 export interface PreparedMcpCategorizationDto {
   operationId: string;
   expiresAt: string;
@@ -77,6 +87,7 @@ export interface McpCategorizationDeps {
   stage?: StageWithWorkflow;
   categorization?: CategorizationDeps;
   authorizationStore?: McpCategorizationAuthorizationStore;
+  operationStore?: McpOperationStore;
   createOperation?: CreateOperation;
   now?: () => Date;
 }
@@ -318,6 +329,54 @@ export async function prepareMcpCategorization(
     if (isEntityBusy(caught)) throw new McpCategorizationError('ENTITY_BUSY');
     throw caught;
   }
+}
+
+/**
+ * Recover only the caller's exact durable preparation envelope. This is a
+ * read path: it neither stages a revision nor reaches QuickBooks.
+ */
+export async function getPreparedMcpCategorization(
+  principal: McpPrincipal,
+  input: GetPreparedMcpCategorizationInput,
+  dependencies: McpCategorizationDeps = {},
+): Promise<PreparedMcpCategorizationDto> {
+  const idempotencyKey = normalizeMcpOperationIdempotencyKey(input.idempotencyKey);
+  if (idempotencyKey === null) throw new McpOperationError('OPERATION_INVALID_INPUT');
+
+  const currentTime = dependencies.now ?? (() => new Date());
+  const checkedAt = currentTime();
+  if (!isValidDate(checkedAt)) throw new McpOperationError('OPERATION_INVALID_INPUT');
+
+  const authorizationStore = dependencies.authorizationStore
+    ?? prisma as unknown as McpCategorizationAuthorizationStore;
+  await assertCurrentMcpCategorizationAuthorization(
+    authorizationStore,
+    principal,
+    input.companyId,
+    checkedAt,
+  );
+
+  const operationStore = dependencies.operationStore
+    ?? prisma as unknown as McpOperationStore;
+  const operation = await operationStore.mcpOperation.findFirst({
+    where: {
+      tokenId: principal.tokenId,
+      toolName: TOOL_NAME,
+      transactionId: input.transactionId,
+      idempotencyKey,
+    },
+  });
+  if (
+    operation === null
+    || operation.tokenPrefix !== principal.tokenPrefix
+    || operation.userId !== principal.userId
+    || operation.companyId !== input.companyId
+    || operation.kind !== 'categorization'
+    || operation.cancelledAt !== null
+    || operation.retryOfId !== null
+  ) throw new McpOperationError('OPERATION_NOT_FOUND');
+
+  return toPreparedDto(operation);
 }
 
 export async function assertCurrentMcpCategorizationAuthorization(

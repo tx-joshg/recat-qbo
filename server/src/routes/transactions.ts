@@ -202,10 +202,34 @@ companyTransactionsRouter.get(
       return;
     }
 
-    // The queue shows posted/dry-run/error rows too; only SUPERSEDED is hidden.
+    // Default reads power the interactive Queue and therefore return only
+    // pending/error work plus in-flight posts so a refresh cannot hide an
+    // operation before its terminal outcome. Explicit status reads remain
+    // available to other surfaces and diagnostics, except SUPERSEDED which is
+    // never interactive.
     // Prototype order: date ascending as entered.
+    const queueWhere: Prisma.TransactionWhereInput = query.status === undefined
+      ? {
+          companyId: company.id,
+          OR: [
+            { status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+            {
+              status: 'POSTED',
+              qboMutationAttempts: {
+                some: {
+                  operation: 'restore',
+                  status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] },
+                },
+              },
+            },
+          ],
+        }
+      : {
+          companyId: company.id,
+          status: query.status === 'SUPERSEDED' ? { in: [] } : query.status,
+        };
     const rows = await prisma.transaction.findMany({
-      where: { companyId: company.id, status: { not: 'SUPERSEDED' } },
+      where: queueWhere,
       include: transactionReadInclude,
       orderBy: { date: 'asc' },
     });
@@ -320,6 +344,13 @@ transferCandidatesRouter.get(
       const first = byId.get(idA);
       const second = byId.get(idB);
       if (!first || !second) continue;
+      const hasProviderIndex = first.providerActionability !== undefined
+        || second.providerActionability !== undefined;
+      if (
+        hasProviderIndex
+        && (first.providerActionability?.disposition !== 'WRITABLE'
+          || second.providerActionability?.disposition !== 'WRITABLE')
+      ) continue;
       // Money-out leg first, for a stable presentation.
       const [a, b] = first.amount < 0 ? [first, second] : [second, first];
       pairs.push({ a, b });
@@ -546,6 +577,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   ATTEMPT_CORRUPT: { status: 500, message: 'Mutation state could not be verified.' },
   ATTEMPT_NOT_FOUND: { status: 404, message: 'Mutation attempt not found.' },
   COMPANY_DISCONNECTED: { status: 409, message: 'This company is disconnected from QuickBooks.' },
+  DB_COMMIT_FAILED: {
+    status: 409,
+    message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+  },
   ENTITY_BUSY: { status: 409, message: 'Another write is already in progress.' },
   FORBIDDEN: { status: 403, message: 'You do not have permission to do that.' },
   INVALID_ACCOUNT: { status: 400, message: 'One or more category accounts are unavailable for this company.' },
@@ -581,8 +616,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
+  SUPERSEDED: { status: 409, message: 'This transaction was already categorized in QuickBooks.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
   TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
+  UNDO_WINDOW_EXPIRED: { status: 409, message: 'The 30-day undo window is unavailable for this transaction.' },
   TAX_AWARE_STAGING_REQUIRED: {
     status: 409,
     message: 'Tax-ready transactions must use staged categorization.',
@@ -656,6 +693,15 @@ const SAFE_OUTCOME_ERRORS: Partial<Record<
     code: 'QBO_WRITE_UNCERTAIN',
     message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
   },
+  REJECTED: {
+    code: 'QBO_WRITE_REJECTED',
+    message: 'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.',
+  },
+};
+
+const OPERATION_RECONCILIATION_REQUIRED_ERROR = {
+  code: 'OPERATION_RECONCILIATION_REQUIRED',
+  message: 'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.',
 };
 
 function sendMutationResult(
@@ -676,10 +722,16 @@ function sendMutationResult(
     status: result.status,
     outcome: result.outcome,
   };
-  const safeError = SAFE_OUTCOME_ERRORS[result.outcome];
+  const reconciliationRequired = result.error?.code
+    === OPERATION_RECONCILIATION_REQUIRED_ERROR.code;
+  const safeError = reconciliationRequired
+    ? OPERATION_RECONCILIATION_REQUIRED_ERROR
+    : SAFE_OUTCOME_ERRORS[result.outcome];
   if (!result.ok && safeError) safe.error = safeError;
-  const status = result.outcome === 'IN_PROGRESS' ? 202
+  const status = reconciliationRequired ? 409
+    : result.outcome === 'IN_PROGRESS' ? 202
     : result.outcome === 'UNCERTAIN' || result.outcome === 'RETRYABLE' ? 409
+      : result.outcome === 'REJECTED' ? 422
       : 200;
   res.status(status).json(safe);
 }
@@ -1000,12 +1052,18 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    let result;
     try {
-      await undoPost(id, actorFor(user));
+      result = await undoPost(id, actorFor(user));
     } catch (err) {
       const mapped = mappedServiceHttpError(err);
       if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
+    }
+    if (!result.ok) {
+      const mapped = mappedServiceHttpError(result.error);
+      if (mapped) throw mapped;
+      throw new HttpError(409, 'The QuickBooks undo could not be verified.', 'UNDO_FAILED');
     }
     res.json(await dtoById(id));
   }),

@@ -641,6 +641,14 @@ describe('LiveRunHistory', () => {
     expect(screen.queryByText(/posted and independently verified/i)).not.toBeInTheDocument();
   });
 
+  it('shows a durable rejection as failed before write without offering reconciliation', () => {
+    render(<LiveRunHistory runs={[{ ...runs.runs[0]!, status: 'rejected', outcome: 'failed_before_write', operationId: null }]} />);
+    expect(screen.getByText('Failed before write')).toBeVisible();
+    expect(screen.getByText(/Durable state: rejected/)).toBeVisible();
+    expect(screen.queryByText(/posted and independently verified/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reconcile/i })).not.toBeInTheDocument();
+  });
+
   it('renders every safe outcome label without collapsing unchanged, mismatch, or in-progress', () => {
     const outcomes = [
       ['shadow_proposed', 'Shadow proposal'],

@@ -44,7 +44,6 @@ import TaxCodePicker, {
   usableTaxCodesForDirection,
 } from '../components/TaxCodePicker';
 import type { TaxDirection } from '../components/TaxCodePicker';
-import { AutopilotQueueStatus } from './settings/AutopilotCard';
 import AttachmentPanel from '../components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
@@ -190,7 +189,8 @@ function initialTaxState(t: TransactionDto): TaxRowState {
           kind: t.activeCategorizationAttempt.operation === 'restore' ? 'undo' : 'commit',
           requestId: t.activeCategorizationAttempt.requestId,
           attemptStatus: t.activeCategorizationAttempt.status,
-          outcome: t.activeCategorizationAttempt.status === 'UNCERTAIN' ? 'UNCERTAIN' : 'IN_PROGRESS',
+          outcome: t.activeCategorizationAttempt.status === 'UNCERTAIN' ? 'UNCERTAIN'
+            : t.activeCategorizationAttempt.status === 'RETRYABLE' ? 'RETRYABLE' : 'IN_PROGRESS',
           busy: false,
           phase: 'idle',
           resolution: 'known',
@@ -217,6 +217,8 @@ export default function Queue() {
   const {
     activeCompany,
     activeCompanyId,
+    notifyQboMutation,
+    subscribeQboMutations,
     role,
     accounts,
     tags,
@@ -248,6 +250,10 @@ export default function Queue() {
   const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
   const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({});
   const [taxRows, setTaxRows] = useState<Record<string, TaxRowState>>({});
+  const mutationOrigin = useRef(Symbol('Queue'));
+  const externalRefreshes = useRef<Record<string, object>>({});
+  const notificationVersions = useRef<Record<string, number>>({});
+  const [externalRefreshState, setExternalRefreshState] = useState<Record<string, 'loading' | 'failed'>>({});
   const stageCoordinatorsRef = useRef<Record<string, ReturnType<typeof createRowStageCoordinator>>>({});
   const [syncingCompanyId, setSyncingCompanyId] = useState<string | null>(
     () => activeCompanyId && companySyncLocks.has(activeCompanyId) ? activeCompanyId : null,
@@ -297,8 +303,10 @@ export default function Queue() {
 
   const hasActiveMutation = useCallback(
     (t: TransactionDto): boolean => {
+      if (externalRefreshes.current[t.id] || t.providerActionability?.disposition === 'BLOCKED_PERIOD_CLOSED') return true;
       const mutation = taxState(t).mutation;
       return mutation !== null && (
+        mutation.attemptStatus === 'RETRYABLE' ||
         mutation.attemptStatus === 'PREPARED' ||
         mutation.attemptStatus === 'COMMITTING' ||
         mutation.attemptStatus === 'UNCERTAIN' ||
@@ -308,12 +316,17 @@ export default function Queue() {
         mutation.resolution !== 'known'
       );
     },
-    [taxState],
+    [taxState, externalRefreshState],
   );
 
   const aliveRef = useRef(true);
   const activeCompanyIdRef = useRef(activeCompanyId);
   activeCompanyIdRef.current = activeCompanyId;
+  const companyGeneration = useRef({ id: activeCompanyId, value: 0 });
+  if (companyGeneration.current.id !== activeCompanyId) {
+    companyGeneration.current = { id: activeCompanyId, value: companyGeneration.current.value + 1 };
+    notificationVersions.current = {};
+  }
   useEffect(() => {
     aliveRef.current = true;
     return () => {
@@ -347,13 +360,30 @@ export default function Queue() {
     return all;
   }, []);
 
+  // A read started before a notification must not resurrect or replace its target.
+  const applyTransactionRead = useCallback((fresh: TransactionDto[], versions: Record<string, number>) => {
+    setRows(previous => {
+      const byId = new Map(previous.map(row => [row.id, row]));
+      const incoming = new Set(fresh.map(row => row.id));
+      const changed = (id: string) => (notificationVersions.current[id] ?? 0) !== (versions[id] ?? 0);
+      const next = fresh.flatMap(row => {
+        const local = byId.get(row.id);
+        if (changed(row.id)) return local ? [local] : [];
+        return [local && local.revision > row.revision ? local : row];
+      });
+      for (const row of previous) if (!incoming.has(row.id) && changed(row.id)) next.push(row);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     if (!activeCompanyId) return;
     let cancelled = false;
+    const versions = { ...notificationVersions.current };
     fetchAllTxns(activeCompanyId)
       .then((all) => {
         if (cancelled) return;
-        setRows(all);
+        applyTransactionRead(all, versions);
         setLoaded(true);
       })
       .catch((e) => {
@@ -364,6 +394,96 @@ export default function Queue() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompanyId]);
+
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const refreshNotifiedTransactions = useCallback(async (companyId: string, transactionIds: string[]) => {
+    if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+    const generation = companyGeneration.current.value;
+    const ids = [...new Set(transactionIds)];
+    if (!ids.length) return;
+    const token = {};
+    const revisions = new Map(rowsRef.current.map(row => [row.id, row.revision]));
+    for (const id of ids) {
+      externalRefreshes.current[id] = token;
+      notificationVersions.current[id] = (notificationVersions.current[id] ?? 0) + 1;
+      // Stop callbacks from the old draft before requesting authoritative state.
+      stageCoordinatorsRef.current[id]?.dispose();
+      delete stageCoordinatorsRef.current[id];
+    }
+    setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.map(id => [id, 'loading' as const])) }));
+    const current = () => aliveRef.current && companyGeneration.current.value === generation;
+    try {
+      const freshRows = await fetchAllTxns(companyId);
+      if (!current()) return;
+      const affected = ids.filter(id => externalRefreshes.current[id] === token);
+      const freshById = new Map(freshRows.map(row => [row.id, row]));
+      const stale = affected.filter(id => {
+        const fresh = freshById.get(id);
+        return fresh && (fresh.companyId !== companyId || fresh.revision < (revisions.get(id) ?? 0));
+      });
+      const accepted = new Set(affected.filter(id => !stale.includes(id)));
+      setRows(previous => {
+        const present = new Set(previous.map(row => row.id));
+        const next = previous.flatMap(row => {
+          if (!accepted.has(row.id)) return [row];
+          const fresh = freshById.get(row.id);
+          return fresh ? [fresh] : [];
+        });
+        for (const id of accepted) {
+          const fresh = freshById.get(id);
+          if (fresh && !present.has(id)) next.push(fresh);
+        }
+        return next;
+      });
+      setSel(previous => {
+        const next = { ...previous };
+        for (const id of accepted) if (!freshById.has(id)) delete next[id];
+        return next;
+      });
+      setTaxRows(previous => {
+        const next = { ...previous };
+        for (const id of accepted) {
+          const fresh = freshById.get(id);
+          if (fresh) next[id] = initialTaxState(fresh);
+          else delete next[id];
+        }
+        return next;
+      });
+      for (const id of accepted) delete externalRefreshes.current[id];
+      setExternalRefreshState(previous => {
+        const next = { ...previous };
+        for (const id of accepted) delete next[id];
+        for (const id of stale) next[id] = 'failed';
+        return next;
+      });
+    } catch {
+      if (!current()) return;
+      setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.filter(id => externalRefreshes.current[id] === token).map(id => [id, 'failed' as const])) }));
+    }
+  }, [fetchAllTxns]);
+
+  useEffect(() => subscribeQboMutations(event => {
+    if (event.origin !== mutationOrigin.current) void refreshNotifiedTransactions(event.companyId, event.transactionIds);
+  }), [subscribeQboMutations, refreshNotifiedTransactions]);
+
+  useEffect(() => {
+    externalRefreshes.current = {};
+    notificationVersions.current = {};
+    setExternalRefreshState({});
+  }, [activeCompanyId]);
+
+  const reloadProviderStatuses = useCallback(async (companyId: string) => {
+    const generation = companyGeneration.current.value;
+    const versions = { ...notificationVersions.current };
+    const fresh = await fetchAllTxns(companyId);
+    if (!aliveRef.current || companyGeneration.current.value !== generation) return;
+    applyTransactionRead(fresh, versions);
+  }, [fetchAllTxns, applyTransactionRead]);
+
+  const displayableRows = useMemo(() => rows.filter(row =>
+    STATE_OF[row.status] && row.providerActionability?.disposition !== 'BLOCKED_PERIOD_CLOSED',
+  ), [rows]);
 
   useEffect(() => {
     setAcct('all');
@@ -378,23 +498,12 @@ export default function Queue() {
       .catch((error) => { if (!cancelled) toast(errText(error)); });
     return () => { cancelled = true; };
   }, [activeCompanyId, toast]);
-  const reloadProviderStatuses = useCallback(async (companyId: string) => {
-    const fresh = await fetchAllTxns(companyId);
-    if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
-    setRows(previous => {
-      const byId = new Map(previous.map(row => [row.id, row]));
-      return fresh.map(row => {
-        const local = byId.get(row.id);
-        return local && local.revision > row.revision ? local : row;
-      });
-    });
-  }, [fetchAllTxns]);
 
   // ---- pending badge: recompute locally (pending = PENDING + ERROR rows) ----
   useEffect(() => {
     if (!loaded) return;
-    setPendingCount(rows.filter((r) => r.status === 'PENDING' || r.status === 'ERROR').length);
-  }, [rows, loaded, setPendingCount]);
+    setPendingCount(displayableRows.filter((r) => r.status === 'PENDING' || r.status === 'ERROR').length);
+  }, [displayableRows, loaded, setPendingCount]);
 
   // ---- row helpers ----
   const updateRow = useCallback((dto: TransactionDto) => {
@@ -497,9 +606,8 @@ export default function Queue() {
   // ---- visible(): search + account filter + 3-way sort ----
   const vis = useMemo(() => {
     const q = search.toLowerCase();
-    const list = rows.filter((t) => {
-      const state = STATE_OF[t.status];
-      if (!state) return false; // SUPERSEDED rows never render
+    const list = displayableRows.filter((t) => {
+      const state = STATE_OF[t.status]!;
       if (acct !== 'all' && t.bankAccount !== acct) return false;
       if (!q) return true;
       const hay = [
@@ -535,15 +643,15 @@ export default function Queue() {
       const vb = val(b);
       return (va < vb ? -1 : va > vb ? 1 : 0) * sortDir;
     });
-  }, [rows, search, acct, sortKey, sortDir, fullCat]);
+  }, [displayableRows, search, acct, sortKey, sortDir, fullCat]);
 
   const activeRow = vis.length ? vis[Math.min(activeIdx, vis.length - 1)] : undefined;
   const activeId = activeRow ? activeRow.id : null;
 
   // ---- header numbers ----
   const pend = useMemo(
-    () => rows.filter((t) => t.status === 'PENDING' || t.status === 'ERROR'),
-    [rows],
+    () => displayableRows.filter((t) => t.status === 'PENDING' || t.status === 'ERROR'),
+    [displayableRows],
   );
   const pendTotal = pend.reduce((a, t) => a + Math.abs(t.amount), 0);
   const subline = `${pend.length} transactions · $${pendTotal.toLocaleString('en-US', {
@@ -551,8 +659,8 @@ export default function Queue() {
   })} waiting · last synced ${relTime(activeCompany?.lastSyncedAt)}`;
 
   const bankOpts = useMemo(
-    () => [...new Set([...bankAccounts, ...rows.map((t) => t.bankAccount)])],
-    [bankAccounts, rows],
+    () => [...new Set([...bankAccounts, ...displayableRows.map((t) => t.bankAccount)])],
+    [bankAccounts, displayableRows],
   );
 
   // ---- selection ----
@@ -667,6 +775,7 @@ export default function Queue() {
 
   const requestStage = useCallback(
     (t: TransactionDto, state: TaxRowState) => {
+      if (role !== 'categorizer' && role !== 'admin') return;
       if (t.status !== 'PENDING' || state.stage.status === 'conflict' || hasActiveMutation(t) || !taxReadyFor(t)) return;
       const desired = stageBodyFor(t, state);
       if (desired === null) return;
@@ -688,7 +797,7 @@ export default function Queue() {
           reload: async () => {
             if (!companyId) return null;
             const latestRows = await fetchAllTxns(companyId);
-            if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return null;
+            if (!aliveRef.current || activeCompanyIdRef.current !== companyId || stageCoordinatorsRef.current[t.id] !== coordinator) return null;
             const latest = latestRows.find((row) => row.id === t.id) ?? null;
             const latestDesired = latest ? stageBodyFor(latest, initialTaxState(latest)) : null;
             concurrentEdit = latest !== null && latest.status === 'PENDING' && latest.activeCategorizationAttempt === null
@@ -729,11 +838,14 @@ export default function Queue() {
       }
       coordinator.update(desired);
     },
-    [hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
+    [role, hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
   );
 
   useEffect(() => {
-    if (activeRow) requestStage(activeRow, taxRows[activeRow.id] ?? initialTaxState(activeRow));
+    if (!activeRow) return;
+    const state = taxRows[activeRow.id] ?? initialTaxState(activeRow);
+    if (state.mutation?.outcome === 'RETRYABLE' || state.mutation?.outcome === 'UNCHANGED') return;
+    requestStage(activeRow, state);
   }, [requestStage, activeRow, taxRows]);
 
   useEffect(() => {
@@ -826,6 +938,38 @@ export default function Queue() {
     [catAccounts, selPend, rows, categorizeTo],
   );
 
+  const refreshAfterVerifiedUndo = useCallback(async (t: TransactionDto, mutation: TaxMutationState) => {
+    const companyId = t.companyId;
+    const current = () => aliveRef.current && activeCompanyIdRef.current === companyId;
+    if (!current()) return;
+    stageCoordinatorsRef.current[t.id]?.dispose();
+    delete stageCoordinatorsRef.current[t.id];
+    updateTaxState(t, (state) => ({ ...state, mutation: {
+      ...mutation, outcome: 'VERIFIED', busy: true, phase: 'resolving', resolution: 'resolving',
+    } }));
+    try {
+      const freshRows = await fetchAllTxns(companyId);
+      if (!current()) return;
+      const fresh = freshRows.find(row => row.id === t.id);
+      if (fresh && (fresh.companyId !== companyId || fresh.status !== 'PENDING' || fresh.revision < t.revision)) {
+        throw new Error('Queue refresh has not caught up with the verified Undo.');
+      }
+      if (fresh) {
+        patchRow(t.id, fresh);
+        setTaxRows(previous => ({ ...previous, [t.id]: initialTaxState(fresh) }));
+      } else {
+        setRows(previous => previous.filter(row => row.id !== t.id));
+        setTaxRows(previous => { const next = { ...previous }; delete next[t.id]; return next; });
+      }
+      toast(fresh ? 'Undo verified in QuickBooks. Transaction returned to Queue.' : 'Undo verified in QuickBooks.');
+    } catch {
+      if (!current()) return;
+      updateTaxState(t, state => ({ ...state, mutation: {
+        ...mutation, outcome: 'VERIFIED', busy: false, phase: 'idle', resolution: 'unresolved',
+      } }));
+    }
+  }, [fetchAllTxns, patchRow, toast, updateTaxState]);
+
   const recordTaxMutation = useCallback(
     (
       t: TransactionDto,
@@ -833,6 +977,20 @@ export default function Queue() {
       mutation: TaxMutationState,
       reconciled: boolean,
     ) => {
+      if (result.transactionId !== t.id || result.requestId !== mutation.requestId) {
+        if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
+        updateTaxState(t, state => ({ ...state, mutation: {
+          ...mutation, busy: false, phase: 'idle', resolution: 'unresolved',
+        } }));
+        return;
+      }
+      notifyQboMutation(t.companyId, [t.id], mutationOrigin.current);
+      if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
+      if (result.ok && result.outcome === 'VERIFIED' && result.status === 'PENDING' && mutation.kind === 'undo') {
+        void refreshAfterVerifiedUndo(t, mutation);
+        return;
+      }
+      if (result.outcome === 'DRY_RUN') toast('Dry run — payload logged, nothing sent to QuickBooks.');
       patchRow(t.id, {
         status: result.status,
         error: result.error ?? null,
@@ -855,7 +1013,7 @@ export default function Queue() {
         },
       }));
     },
-    [patchRow, updateTaxState],
+    [patchRow, updateTaxState, refreshAfterVerifiedUndo, notifyQboMutation, toast],
   );
 
   const recordTaxMutationFailure = useCallback(
@@ -863,7 +1021,9 @@ export default function Queue() {
       t: TransactionDto,
       error: unknown,
       mutation: TaxMutationState,
+      preservePrepared = false,
     ) => {
+      if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
       if (
         error instanceof ApiError &&
         error.mutationResult?.transactionId === t.id &&
@@ -873,6 +1033,49 @@ export default function Queue() {
         return;
       }
       if (error instanceof ApiError && error.code !== undefined) {
+        if (['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED', 'SUPERSEDED'].includes(error.code)) {
+          stageCoordinatorsRef.current[t.id]?.dispose();
+          delete stageCoordinatorsRef.current[t.id];
+          setRows(previous => previous.filter(row => row.id !== t.id));
+          setSel(previous => { const next = { ...previous }; delete next[t.id]; return next; });
+          setTaxRows(previous => { const next = { ...previous }; delete next[t.id]; return next; });
+          toast(error.message);
+          return;
+        }
+        if (preservePrepared) {
+          updateTaxState(t, state => ({ ...state, mutation: state.mutation?.requestId === mutation.requestId
+            ? { ...state.mutation, busy: false, phase: 'idle' } : state.mutation }));
+          toast(error.message);
+          return;
+        }
+        if (error.code === 'QBO_WRITE_SAFETY_UNAVAILABLE') {
+          const companyId = t.companyId;
+          const current = () => aliveRef.current && activeCompanyIdRef.current === companyId;
+          updateTaxState(t, state => ({ ...state, mutation: {
+            ...mutation, busy: true, phase: 'resolving', resolution: 'resolving',
+          } }));
+          void fetchAllTxns(companyId).then(freshRows => {
+            if (!current()) return;
+            const fresh = freshRows.find(row => row.id === t.id);
+            stageCoordinatorsRef.current[t.id]?.dispose();
+            delete stageCoordinatorsRef.current[t.id];
+            if (fresh) {
+              patchRow(t.id, fresh);
+              setTaxRows(previous => ({ ...previous, [t.id]: initialTaxState(fresh) }));
+            } else {
+              setRows(previous => previous.filter(row => row.id !== t.id));
+              setTaxRows(previous => { const next = { ...previous }; delete next[t.id]; return next; });
+            }
+            toast(error.message);
+          }).catch(() => {
+            if (!current()) return;
+            updateTaxState(t, state => ({ ...state, mutation: {
+              ...mutation, busy: false, phase: 'idle', resolution: 'unresolved',
+            } }));
+            toast('Could not load the prepared write. Reload Queue before trying again.');
+          });
+          return;
+        }
         patchRow(t.id, { status: t.status, error: t.error });
         updateTaxState(t, (state) => ({ ...state, mutation: null }));
         toast(error.message);
@@ -891,7 +1094,7 @@ export default function Queue() {
         false,
       );
     },
-    [patchRow, updateTaxState, recordTaxMutation, toast],
+    [fetchAllTxns, patchRow, updateTaxState, recordTaxMutation, toast],
   );
 
   const commitTax = useCallback(
@@ -924,7 +1127,7 @@ export default function Queue() {
       txnApi
         .commitCategorization(t.id, staged.revision, requestId)
         .then((result) => {
-          if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
+          recordTaxMutation(t, result, mutation, false);
         })
         .catch((error) => {
           if (!aliveRef.current) return;
@@ -948,10 +1151,10 @@ export default function Queue() {
       const request = retry ? txnApi.retryCategorization : txnApi.reconcileCategorization;
       request(t.id, mutation.requestId)
         .then((result) => {
-          if (aliveRef.current) recordTaxMutation(t, result, mutation, true);
+          recordTaxMutation(t, result, mutation, true);
         })
         .catch(() => {
-          if (!aliveRef.current) return;
+          if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
           updateTaxState(t, (state) => ({
             ...state,
             mutation: state.mutation
@@ -981,10 +1184,10 @@ export default function Queue() {
         : txnApi.commitCategorization(t.id, t.revision, mutation.requestId);
       request
         .then((result) => {
-          if (aliveRef.current) recordTaxMutation(t, result, resumed, false);
+          recordTaxMutation(t, result, resumed, false);
         })
         .catch((error) => {
-          if (!aliveRef.current) return;
+          if (!aliveRef.current || activeCompanyIdRef.current !== t.companyId) return;
           if (
             error instanceof ApiError &&
             error.code !== undefined &&
@@ -993,14 +1196,7 @@ export default function Queue() {
               error.mutationResult.requestId === mutation.requestId
             )
           ) {
-            updateTaxState(t, (state) => ({
-              ...state,
-              mutation:
-                state.mutation?.requestId === mutation.requestId
-                  ? { ...state.mutation, busy: false, phase: 'idle' }
-                  : state.mutation,
-            }));
-            toast(error.message);
+            recordTaxMutationFailure(t, error, resumed, true);
             return;
           }
           if (
@@ -1090,7 +1286,7 @@ export default function Queue() {
                   outcome:
                     activeAttempt.status === 'UNCERTAIN'
                       ? 'UNCERTAIN'
-                      : 'IN_PROGRESS',
+                      : activeAttempt.status === 'RETRYABLE' ? 'RETRYABLE' : 'IN_PROGRESS',
                   busy: false,
                   phase: 'idle',
                   resolution: 'known',
@@ -1133,6 +1329,7 @@ export default function Queue() {
       taxState,
       updateTaxState,
       recordTaxMutation,
+      recordTaxMutationFailure,
       activeCompanyId,
       fetchAllTxns,
       toast,
@@ -1159,7 +1356,7 @@ export default function Queue() {
       txnApi
         .undoCategorization(t.id, requestId)
         .then((result) => {
-          if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
+          recordTaxMutation(t, result, mutation, false);
         })
         .catch((error) => {
           if (!aliveRef.current) return;
@@ -1168,6 +1365,15 @@ export default function Queue() {
     },
     [updateTaxState, recordTaxMutation, recordTaxMutationFailure],
   );
+
+  const requireTransactionRefresh = useCallback((ids: string[]) => {
+    for (const id of ids) {
+      externalRefreshes.current[id] = {};
+      stageCoordinatorsRef.current[id]?.dispose();
+      delete stageCoordinatorsRef.current[id];
+    }
+    setExternalRefreshState(previous => ({ ...previous, ...Object.fromEntries(ids.map(id => [id, 'failed' as const])) }));
+  }, []);
 
   const doPost = useCallback(
     (id: string) => {
@@ -1191,12 +1397,20 @@ export default function Queue() {
         );
         return;
       }
+      const generation = companyGeneration.current.value;
+      const current = () => aliveRef.current && companyGeneration.current.value === generation;
       patchRow(id, { status: 'POSTING' });
       txnApi
         .post(id)
         .then((res) => {
-          if (!aliveRef.current) return;
           const dto = res as PostResponseDto;
+          if (dto.id !== id || dto.companyId !== t0.companyId) {
+            if (current()) requireTransactionRefresh([id]);
+            return;
+          }
+          notifyQboMutation(t0.companyId, [id], mutationOrigin.current);
+          if (!current()) return;
+          if (dto.status === 'DRY_RUN') toast('Dry run — payload logged, nothing sent to QuickBooks.');
           updateRow(dto);
           setSel((s) => ({ ...s, [id]: false }));
           if (
@@ -1214,8 +1428,12 @@ export default function Queue() {
           }
         })
         .catch((e) => {
-          if (!aliveRef.current) return;
-          patchRow(id, { status: 'PENDING' });
+          if (!current()) return;
+          if (e instanceof ApiError && ['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED', 'SUPERSEDED'].includes(e.code ?? '')) {
+            setRows(previous => previous.filter(row => row.id !== id));
+            setSel(previous => { const next = { ...previous }; delete next[id]; return next; });
+            notifyQboMutation(t0.companyId, [id], mutationOrigin.current);
+          } else patchRow(id, { status: 'PENDING' });
           toast(errText(e));
         });
     },
@@ -1227,55 +1445,82 @@ export default function Queue() {
       tagsRequired,
       patchRow,
       updateRow,
+      requireTransactionRefresh,
+      notifyQboMutation,
       toast,
     ],
   );
 
   const undoPost = useCallback(
     (id: string) => {
+      const row = rows.find(candidate => candidate.id === id);
+      if (!row || hasActiveMutation(row)) return;
+      const generation = companyGeneration.current.value;
+      const current = () => aliveRef.current && companyGeneration.current.value === generation;
       txnApi
         .undo(id)
         .then((dto) => {
-          if (!aliveRef.current) return;
+          if (dto.id !== id || dto.companyId !== row.companyId) {
+            if (current()) requireTransactionRefresh([id]);
+            return;
+          }
+          notifyQboMutation(row.companyId, [id], mutationOrigin.current);
+          if (!current()) return;
           updateRow(dto);
-          toast('Reverted — moved back to the queue');
+          toast(row.status === 'DRY_RUN' ? 'Dry run moved back to the queue.' : 'Categorization undone in QuickBooks.');
         })
-        .catch((e) => toast(errText(e)));
+        .catch((e) => { if (current()) toast(errText(e)); });
     },
-    [updateRow, toast],
+    [rows, hasActiveMutation, updateRow, requireTransactionRefresh, notifyQboMutation, toast],
   );
 
   const doRetry = useCallback(
     (id: string) => {
+      const row = rows.find(candidate => candidate.id === id);
+      if (!row || hasActiveMutation(row)) return;
+      const generation = companyGeneration.current.value;
+      const current = () => aliveRef.current && companyGeneration.current.value === generation;
       setErrOpenId(null);
       txnApi
         .retry(id)
         .then((dto) => {
-          if (!aliveRef.current) return;
+          if (dto.id !== id || dto.companyId !== row.companyId) {
+            if (current()) requireTransactionRefresh([id]);
+            return;
+          }
+          notifyQboMutation(row.companyId, [id], mutationOrigin.current);
+          if (!current()) return;
           updateRow(dto);
           toast('Re-fetched from QuickBooks — ready to post again');
         })
-        .catch((e) => toast(errText(e)));
+        .catch((e) => { if (current()) toast(errText(e)); });
     },
-    [updateRow, toast],
+    [rows, hasActiveMutation, updateRow, requireTransactionRefresh, notifyQboMutation, toast],
   );
 
   const recordTransfer = useCallback(
     (t: TransactionDto) => {
       const mate = xferMateOf(t);
-      if (!mate) return;
+      if (!mate || hasActiveMutation(t) || hasActiveMutation(mate)) return;
+      const generation = companyGeneration.current.value;
+      const current = () => aliveRef.current && companyGeneration.current.value === generation;
       txnApi
         .transfer(t.id, mate.id)
         .then((dtos) => {
-          if (!aliveRef.current) return;
+          if (dtos.some(dto => dto.companyId !== t.companyId || ![t.id, mate.id].includes(dto.id))) {
+            if (current()) requireTransactionRefresh([t.id, mate.id]);
+            return;
+          }
+          if (dtos.length) notifyQboMutation(t.companyId, dtos.map(dto => dto.id), mutationOrigin.current);
+          if (!current()) return;
           setRows((prev) =>
             prev.map((r) => dtos.find((d) => d.id === r.id) ?? r),
           );
           toast(dryRun ? 'Dry run — transfer payload logged' : 'Recorded as a transfer in QuickBooks');
         })
-        .catch((e) => toast(errText(e)));
+        .catch((e) => { if (current()) toast(errText(e)); });
     },
-    [xferMateOf, dryRun, toast],
+    [xferMateOf, hasActiveMutation, dryRun, requireTransactionRefresh, notifyQboMutation, toast],
   );
 
   const toggleTag = useCallback(
@@ -1361,11 +1606,14 @@ export default function Queue() {
       return;
     }
 
+    const generation = companyGeneration.current.value;
+    const versions = { ...notificationVersions.current };
     const request = companiesApi.sync(companyId);
     companySyncLocks.set(companyId, { request, listeners: new Set() });
     setSyncingCompanyId(companyId);
     const stillCurrent = () => (
       aliveRef.current && activeCompanyIdRef.current === companyId
+      && companyGeneration.current.value === generation
     );
 
     try {
@@ -1389,7 +1637,7 @@ export default function Queue() {
         return;
       }
       if (!stillCurrent()) return;
-      setRows(fresh);
+      applyTransactionRead(fresh, versions);
       toast(`Synced ${companyName} — ${result.message}`);
     } catch (error) {
       if (stillCurrent()) toast(`Sync failed for ${companyName} — ${errText(error)}`);
@@ -1399,7 +1647,7 @@ export default function Queue() {
         setSyncingCompanyId((current) => current === companyId ? null : current);
       }
     }
-  }, [activeCompany, activeCompanyId, fetchAllTxns, refreshCompanies, toast]);
+  }, [activeCompany, activeCompanyId, fetchAllTxns, applyTransactionRead, refreshCompanies, toast]);
 
   const isSyncingActiveCompany = syncingCompanyId !== null && syncingCompanyId === activeCompanyId;
 
@@ -1425,25 +1673,43 @@ export default function Queue() {
       return;
     }
     const ids = [...selReady];
+    const companyId = activeCompanyId;
+    const generation = companyGeneration.current.value;
+    const current = () => aliveRef.current && companyGeneration.current.value === generation;
+    const observed = new Map(ids.map(id => [id, rows.find(row => row.id === id)?.status]));
     setRows((prev) =>
       prev.map((r) => (ids.includes(r.id) ? { ...r, status: 'POSTING' as TxnStatus } : r)),
     );
     setBulkCat(null);
     try {
       await txnApi.bulkPost(ids);
+      notifyQboMutation(companyId, ids, mutationOrigin.current);
     } catch (e) {
-      toast(errText(e));
+      if (current()) toast(errText(e));
     }
     // Refetch and keep polling briefly while the server finishes posting.
     for (let attempt = 0; attempt < 8; attempt++) {
+      if (!current()) return;
       let fresh: TransactionDto[];
       try {
-        fresh = await fetchAllTxns(activeCompanyId);
+        fresh = await fetchAllTxns(companyId);
       } catch {
         break;
       }
-      if (!aliveRef.current) return;
-      setRows(fresh);
+      if (!current()) return;
+      const freshById = new Map(fresh.map(row => [row.id, row]));
+      const changed = ids.filter(id => {
+        const status = freshById.get(id)?.status;
+        if (status === observed.get(id)) return false;
+        observed.set(id, status);
+        return true;
+      });
+      if (changed.length) notifyQboMutation(companyId, changed, mutationOrigin.current);
+      setRows(previous => previous.flatMap(row => {
+        if (!ids.includes(row.id)) return [row];
+        const freshRow = freshById.get(row.id);
+        return freshRow ? [freshRow] : [];
+      }));
       setSel((prev) => {
         const next = { ...prev };
         for (const id of ids) {
@@ -1464,6 +1730,7 @@ export default function Queue() {
     usesTaxLifecycleFor,
     tagsRequired,
     fetchAllTxns,
+    notifyQboMutation,
     toast,
   ]);
 
@@ -1856,12 +2123,23 @@ export default function Queue() {
         </span>
       );
     }
+    if (mutation?.kind === 'undo' && mutation.outcome === 'VERIFIED' && mutation.resolution === 'unresolved') {
+      return <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5 }}>
+        <span>Undo verified — refresh Queue before editing</span>
+        <button className="btn-ghost" onClick={() => { void refreshAfterVerifiedUndo(v.t, mutation); }}>Refresh Queue</button>
+      </span>;
+    }
     if (mutation?.resolution === 'unresolved') {
       return (
         <span style={{ color: 'var(--erT)', fontSize: 12 }}>
           Write status unresolved — reload required
         </span>
       );
+    }
+    if (mutation?.outcome === 'REJECTED') {
+      return <span style={{ color: 'var(--erT)', fontSize: 12 }}>{mutation.kind === 'undo'
+        ? 'Undo rejected by QuickBooks — categorization remains posted'
+        : 'Rejected by QuickBooks — change categorization'}</span>;
     }
     if (mutation?.attemptStatus === 'PREPARED') {
       return (
@@ -1906,7 +2184,7 @@ export default function Queue() {
         <>
           <span className={mutation.outcome === 'DRY_RUN' ? 'pill-am' : 'pill-ok'}>
             {mutation.outcome === 'DRY_RUN'
-              ? 'Dry run — verified'
+              ? 'Dry run — nothing sent'
               : mutation.reconciled
                 ? 'Verified in QuickBooks ✓'
                 : 'Posted — verified ✓'}
@@ -1925,6 +2203,12 @@ export default function Queue() {
           )}
         </>
       );
+    }
+    if (mutation?.kind === 'undo' && (mutation.outcome === 'RETRYABLE' || mutation.outcome === 'UNCHANGED')) {
+      return <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5 }}>
+        <span>Undo not sent</span>
+        <button className="btn-ghost" onClick={() => undoTax(v.t)}>Retry undo</button>
+      </span>;
     }
     if (v.t.status === 'POSTED') {
       return (
@@ -1950,7 +2234,7 @@ export default function Queue() {
         <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>
         <button className="btn-ghost" onClick={(event) => {
           event.stopPropagation();
-          if (state.stage.status === 'conflict') {
+          if (state.stage.status === 'conflict' || !stageCoordinatorsRef.current[v.t.id]) {
             stageCoordinatorsRef.current[v.t.id]?.dispose();
             delete stageCoordinatorsRef.current[v.t.id];
             const next = { ...state, mutation: null, stage: initialTaxState(v.t).stage };
@@ -1981,6 +2265,11 @@ export default function Queue() {
   };
 
   const statusCell = (v: RowView, mobile: boolean) => {
+    const refreshState = externalRefreshState[v.t.id];
+    if (refreshState) return <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+      <span>{refreshState === 'loading' ? 'Refreshing transaction…' : 'Transaction changed — refresh before editing'}</span>
+      {refreshState === 'failed' && <button className="btn-ghost" onClick={event => { event.stopPropagation(); void refreshNotifiedTransactions(v.t.companyId, [v.t.id]); }}>Refresh transaction</button>}
+    </span>;
     if (usesTaxLifecycleFor(v.t)) return taxStatusCell(v, mobile);
     return (
     <>
@@ -2208,14 +2497,6 @@ export default function Queue() {
         <div style={{ marginBottom: 12 }}>
           <ProviderStatusRefresh key={activeCompanyId} companyId={activeCompanyId} onRefreshed={reloadProviderStatuses} />
         </div>
-      )}
-
-      {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
-        <AutopilotQueueStatus
-          key={activeCompanyId}
-          companyId={activeCompanyId}
-          surface="queue"
-        />
       )}
 
       {taxReadiness?.status !== 'ready' && (
@@ -2684,10 +2965,11 @@ export default function Queue() {
                       Split
                     </button>
                   )}
-                  <span className="queue-status-cell" style={{ flex: '1 1 240px', maxWidth: '100%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {!externalRefreshState[t.id] && <span className="queue-status-cell" style={{ flex: '1 1 240px', maxWidth: '100%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
                     {statusCell(v, true)}
-                  </span>
+                  </span>}
                 </div>
+                {externalRefreshState[t.id] && <div style={{ marginTop: 8 }}>{statusCell(v, true)}</div>}
                 {errLine(v, 6)}
                 {activeCompanyId && attachmentOpenId === t.id && (
                   <AttachmentPanel

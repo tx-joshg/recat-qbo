@@ -25,6 +25,7 @@ export type SafeToolErrorCode =
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
+  | 'OPERATION_RECONCILIATION_REQUIRED'
   | 'RESPONSE_TOO_LARGE'
   | 'COMPANY_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
@@ -37,6 +38,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   FORBIDDEN: 'This token does not have access to the requested data. Check its company role and try again.',
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
+  OPERATION_RECONCILIATION_REQUIRED: 'This operation requires reconciliation before it can continue.',
   RESPONSE_TOO_LARGE: 'The response exceeds the size limit. For list tools, request fewer items with limit. For single records, use the web app. For mutations, inspect the operation status before retrying.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
@@ -59,16 +61,29 @@ const CATEGORIZATION_INVALID_CODES = new Set([
   'INVALID_ACCOUNT',
   'INVALID_INPUT',
   'INVALID_TAG',
-  'INVALID_TRANSACTION_AMOUNT',
   'INVALID_TAX_CODE',
+  'INVALID_TRANSACTION_AMOUNT',
   'PRESERVE_SOURCE_ID_INVALID',
   'PRESERVE_SOURCE_SHAPE_INVALID',
   'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
   'PRESERVE_SOURCE_TAX_CALCULATION_INVALID',
   'PRESERVE_SOURCE_TOTAL_INVALID',
   'STALE_REVISION',
+  'TAX_AMOUNT_INVALID',
+  'TAX_AMOUNT_SIGN_MISMATCH',
+  'TAX_CODE_INACTIVE',
+  'TAX_CODE_MALFORMED',
+  'TAX_CODE_PURCHASE_ONLY',
+  'TAX_CODE_SALES_ONLY',
+  'TAX_CODE_UNAVAILABLE',
+  'TAX_COMPANY_MISMATCH',
   'TAX_NOT_READY',
+  'TAX_RATE_INACTIVE',
+  'TAX_RATE_MALFORMED',
+  'TAX_RATE_UNAVAILABLE',
+  'TAX_RATE_UNSUPPORTED',
   'TAX_REQUIRES_PURCHASE',
+  'TAX_TREATMENT_AMBIGUOUS',
   'UNBALANCED_TOTAL',
 ]);
 const WRITEBACK_INVALID_CODES = new Set([
@@ -76,14 +91,27 @@ const WRITEBACK_INVALID_CODES = new Set([
   'INVALID_STAGE',
   'INVALID_STATUS',
   'INVALID_TRANSACTION_AMOUNT',
+  'QBO_DEPOSIT_UNSUPPORTED',
   'QBO_PURCHASE_UNSUPPORTED',
   'QBO_STATE_DRIFT',
   'RECONCILE_NOT_ALLOWED',
   'STALE_QBO_BINDING',
   'STALE_REVISION',
   'STALE_STAGE',
+  'TAX_AMOUNT_INVALID',
+  'TAX_AMOUNT_SIGN_MISMATCH',
+  'TAX_CODE_INACTIVE',
+  'TAX_CODE_MALFORMED',
+  'TAX_CODE_PURCHASE_ONLY',
+  'TAX_CODE_SALES_ONLY',
   'TAX_CODE_UNAVAILABLE',
+  'TAX_COMPANY_MISMATCH',
   'TAX_NOT_READY',
+  'TAX_RATE_INACTIVE',
+  'TAX_RATE_MALFORMED',
+  'TAX_RATE_UNAVAILABLE',
+  'TAX_RATE_UNSUPPORTED',
+  'TAX_TREATMENT_AMBIGUOUS',
   'UNDO_PROOF_MISMATCH',
   'UNDO_PROOF_REQUIRED',
   'VERIFIED_POST_REQUIRED',
@@ -124,6 +152,8 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
       case 'IDEMPOTENCY_CONFLICT':
       case 'RETRY_NOT_ALLOWED':
         return 'INVALID_INPUT';
+      case 'OPERATION_CORRUPT':
+        return 'OPERATION_RECONCILIATION_REQUIRED';
       default:
         return 'COMPANY_UNAVAILABLE';
     }
@@ -192,11 +222,14 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
       case 'IDEMPOTENCY_CONFLICT':
       case 'RETRY_NOT_ALLOWED':
         return 'INVALID_INPUT';
+      case 'OPERATION_CORRUPT':
+        return 'OPERATION_RECONCILIATION_REQUIRED';
       default:
         return 'COMPANY_UNAVAILABLE';
     }
   }
   if (error instanceof McpUndoError) {
+    if (error.code === 'OPERATION_CORRUPT') return 'OPERATION_RECONCILIATION_REQUIRED';
     return error.code === 'UNDO_NOT_ALLOWED'
       ? 'INVALID_INPUT'
       : 'COMPANY_UNAVAILABLE';

@@ -79,6 +79,7 @@ describePostgres('MCP categorization PostgreSQL atomicity', () => {
         legalName: 'MCP PostgreSQL Fixture',
         nickname: `mcp-${suffix.slice(0, 8)}`,
         dryRun: false,
+        holdingAccountIds: ['holding'],
       },
     });
     await firstClient.membership.create({
@@ -116,6 +117,30 @@ describePostgres('MCP categorization PostgreSQL atomicity', () => {
         payee: 'MCP PostgreSQL Fixture',
         amount: '-10.50',
         bankAccount: 'Fixture bank',
+        rawData: {
+          Id: `purchase-${suffix}`, SyncToken: '0', TotalAmt: 10.5,
+          TxnDate: '2026-07-29', AccountRef: { value: 'payment-generic' },
+          GlobalTaxCalculation: 'NotApplicable',
+          Line: [{
+            Id: '1', Amount: 10.5, DetailType: 'AccountBasedExpenseLineDetail',
+            AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding' } },
+          }],
+        },
+      },
+    });
+    await firstClient.transactionActionability.create({
+      data: {
+        companyId: company.id,
+        transactionId: transaction.id,
+        disposition: 'WRITABLE',
+        checkedAt: NOW,
+        revision: transaction.revision,
+        qboSyncToken: transaction.qboSyncToken,
+        qboType: transaction.qboType,
+        qboId: transaction.qboId,
+        txnDate: transaction.date,
+        cleared: false,
+        reconciled: false,
       },
     });
     return {
@@ -207,7 +232,7 @@ describePostgres('MCP categorization PostgreSQL atomicity', () => {
           now: () => NOW,
         },
       );
-      await stagedAtCas.promise;
+      await Promise.race([stagedAtCas.promise, firstPrepare]);
 
       await expect(prepareMcpCategorization(
         fixture.principal,

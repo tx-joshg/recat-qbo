@@ -46,13 +46,13 @@ describe('createCategorizationRequestId', () => {
 });
 
 describe('structured mutation failures', () => {
-  it('preserves only the bounded mutation result on ApiError', async () => {
+  it.each(['RETRYABLE', 'REJECTED'] as const)('preserves only the bounded %s mutation result on ApiError', async (outcome) => {
     const responseBody = {
       transactionId: '00000000-0000-4000-8000-000000000030',
       requestId: '00000000-0000-4000-8000-000000000040',
       ok: false,
       status: 'PENDING',
-      outcome: 'RETRYABLE',
+      outcome,
       error: {
         code: 'RETRYABLE',
         message: 'The prepared write was not sent.',
@@ -80,7 +80,7 @@ describe('structured mutation failures', () => {
           requestId: '00000000-0000-4000-8000-000000000040',
           ok: false,
           status: 'PENDING',
-          outcome: 'RETRYABLE',
+          outcome,
           error: {
             code: 'RETRYABLE',
             message: 'The prepared write was not sent.',
@@ -305,6 +305,13 @@ describe('receipt workspace requests', () => {
   });
 });
 
+it('requests one scoped provider status check and encodes its continuation', async () => {
+  const fetcher=vi.fn(async()=>new Response(JSON.stringify({companyId:'company-a',processed:0,persisted:0,failed:0,nextCursor:null,partial:false,complete:true,items:[]}),{status:200,headers:{'Content-Type':'application/json'}}));
+  vi.stubGlobal('fetch',fetcher);
+  await transactions.refreshProviderStatus('company-a','cursor/example');
+  expect(fetcher).toHaveBeenCalledWith('/api/companies/company-a/transactions/actionability/refresh?limit=1&cursor=cursor%2Fexample',expect.objectContaining({method:'POST',body:'{}'}));
+});
+
 it('keeps safe request reference but ignores provider fields', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
     error: 'QuickBooks could not provide this report right now.',
@@ -325,11 +332,4 @@ it('omits malformed request references from API errors', async () => {
     error: 'Report unavailable.', requestId: 'UNTRUSTED_REFERENCE_SENTINEL',
   }), { status: 502 })));
   await expect(companies.dashboard('company-1')).rejects.toMatchObject({ requestId: undefined });
-});
-
-it('requests one scoped provider status check and encodes its continuation', async () => {
-  const fetcher=vi.fn(async()=>new Response(JSON.stringify({companyId:'company-a',processed:0,persisted:0,failed:0,nextCursor:null,partial:false,complete:true,items:[]}),{status:200,headers:{'Content-Type':'application/json'}}));
-  vi.stubGlobal('fetch',fetcher);
-  await transactions.refreshProviderStatus('company-a','cursor/example');
-  expect(fetcher).toHaveBeenCalledWith('/api/companies/company-a/transactions/actionability/refresh?limit=1&cursor=cursor%2Fexample',expect.objectContaining({method:'POST',body:'{}'}));
 });

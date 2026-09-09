@@ -1,9 +1,11 @@
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { mapPurchaseTaxSnapshot, preparePurchaseRecategorization, preparePurchaseRestore } from '../lib/qbo/purchaseTax.js';
 import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import type { StagedCategorization } from '@recat/shared';
 import {
   QboRequestTimeout,
+  QboHttpError,
   QboSyncTokenConflict,
   type QboClient,
   type QboDepositPreparedWrite,
@@ -572,6 +574,31 @@ describe('postTransaction dual-write honesty', () => {
 describe('undoPost', () => {
   const postedCompany = { id: 'co-1', dryRun: true, tagsRequired: false, holdingAccountIds: ['4'] };
 
+  it('resets an old tax-marked dry run locally without reading QuickBooks', async () => {
+    const row = makeTxnRow({ status: 'DRY_RUN', postedAt: null, taxCalculation: 'TaxInclusive', company: postedCompany });
+    const { deps } = makeDeps(row, {});
+    const getClient = vi.spyOn(deps, 'getClient');
+    await expect(undoPost('txn-1', { id: 'actor-example', label: 'Example user' }, deps)).resolves.toMatchObject({ ok: true, status: 'PENDING' });
+    expect(getClient).not.toHaveBeenCalled();
+  });
+
+  it('blocks a dry-run reset while a durable attempt is active', async () => {
+    const row = makeTxnRow({ status: 'DRY_RUN', postedAt: null, company: postedCompany });
+    const { deps, db } = makeDeps(row, {});
+    db.qboMutationAttempt.findFirst.mockResolvedValueOnce({ id: 'active-example' } as never);
+    await expect(undoPost('txn-1', { id: 'actor-example', label: 'Example user' }, deps)).rejects.toMatchObject({ code: 'MUTATION_BLOCKED' });
+    expect(db.transaction.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a future posted timestamp before legacy QuickBooks work', async () => {
+    const row = makeTxnRow({ status: 'POSTED', postedAt: new Date(Date.now() + 86400000), company: postedCompany });
+    const { deps } = makeDeps(row, {});
+    const getClient = vi.spyOn(deps, 'getClient');
+    await expect(undoPost('txn-1', { id: 'actor-example', label: 'Example user' }, deps)).rejects.toThrow(/undo window/i);
+    expect(getClient).not.toHaveBeenCalled();
+  });
+
+
   it.each(['Purchase', 'Deposit'] as const)(
     'undoes a reconciled %s in an open period',
     async (qboType) => {
@@ -659,7 +686,7 @@ describe('undoPost', () => {
   it('blocks a canonically sales-ready Deposit before legacy undo work', async () => {
     const row = makeTxnRow({
       qboType: 'Deposit',
-      status: 'DRY_RUN',
+      status: 'POSTED',
       postedAt: new Date(),
       company: {
         id: 'company-generic',
@@ -698,7 +725,7 @@ describe('undoPost', () => {
   it('keeps a staged Deposit out of legacy undo after sales-tax readiness is lost', async () => {
     const row = makeTxnRow({
       qboType: 'Deposit',
-      status: 'DRY_RUN',
+      status: 'POSTED',
       postedAt: new Date(),
       taxCalculation: 'TaxInclusive',
       company: {
@@ -1485,6 +1512,7 @@ class FakeDurableDb {
   failUncertainTransactionOnce = false;
   failUncertainFallbackAndReadOnce = false;
   failCommittingOnce = false;
+  failTransactionsWhileCommitting = 0;
   failRetryableOnce = false;
   raceAttemptOnCreate = false;
   raceDifferentActiveAttemptOnCreate = false;
@@ -1698,6 +1726,14 @@ class FakeDurableDb {
   };
 
   async $transaction<T>(callback: (tx: FakeDurableDb) => Promise<T>): Promise<T> {
+    if (
+      this.failTransactionsWhileCommitting > 0
+      && this.attempts.some((attempt) => attempt.status === 'COMMITTING')
+    ) {
+      this.failTransactionsWhileCommitting -= 1;
+      throw new Error('database unavailable during terminal persistence');
+    }
+
     if (
       this.failUncertainTransactionOnce &&
       this.attempts.some((attempt) => attempt.status === 'COMMITTING')
@@ -3467,6 +3503,26 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(restarted.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a PREPARED resume live when QuickBooks write safety is temporarily unavailable', async () => {
+    const db = new FakeDurableDb();
+    seedAttempt(db, 'PREPARED', 'request-generic');
+    const fixture = durableDeps(db);
+    fixture.fetchWriteSafety.mockRejectedValueOnce(
+      new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE'),
+    );
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(db.attempts[0]).toMatchObject({
+      status: 'PREPARED',
+      errorCode: null,
+      errorMessage: null,
+    });
+  });
+
   it.each(['PREPARED', 'COMMITTING', 'UNCERTAIN'])(
     'blocks a different request while a %s attempt exists',
     async (status) => {
@@ -3566,6 +3622,137 @@ describe('commitStagedCategorization durable lifecycle', () => {
       errorMessage: expect.stringMatching(/verify in QuickBooks/i),
     });
   });
+
+  it('preserves a retained RETRYABLE categorization while a new request sends once', async () => {
+    const fixture = durableDeps();
+    seedAttempt(fixture.db, 'RETRYABLE', 'old-retryable-request');
+    const old = structuredClone(fixture.db.attempts[0]);
+    const result = await commitStagedCategorization(commitInput('new-reviewed-request'), fixture.deps);
+    expect(result).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.db.attempts[0]).toEqual(old);
+    expect(fixture.db.attempts[1]).toMatchObject({ requestId: 'new-reviewed-request', status: 'VERIFIED' });
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+  });
+
+  it('records a deterministic provider validation rejection without claiming write uncertainty', async () => {
+    const fixture = durableDeps();
+    const providerError = new QboHttpError(
+      400,
+      'Provider rejected the prepared Deposit body.',
+    );
+    fixture.sendPreparedWrite.mockRejectedValueOnce(providerError);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      const result = await commitStagedCategorization(commitInput(), fixture.deps);
+
+      expect(result).toMatchObject({
+        ok: false,
+        status: 'PENDING',
+        outcome: 'REJECTED',
+        error: {
+          code: 'QBO_WRITE_REJECTED',
+          message: expect.stringMatching(/rejected/i),
+        },
+      });
+      expect(fixture.db.attempts[0]).toMatchObject({
+        status: 'REJECTED',
+        errorCode: 'QBO_WRITE_REJECTED',
+        verification: { outcome: 'REJECTED', status: 'PENDING' },
+      });
+      expect(fixture.db.transactionRow).toMatchObject({
+        status: 'PENDING',
+        errorCode: null,
+        errorMessage: null,
+      });
+      expect(fixture.audit).toHaveBeenCalledWith(
+        fixture.db,
+        expect.objectContaining({
+          action: 'blocked',
+          txnId: DURABLE_TRANSACTION_ID,
+          mutation: expect.objectContaining({ outcome: 'REJECTED' }),
+        }),
+      );
+
+      expect(logged).toHaveBeenCalledWith(
+        '[writeback] prepared QBO write or readback failed',
+        {
+          transactionId: DURABLE_TRANSACTION_ID,
+          qboType: 'Purchase',
+          qboId: 'purchase-generic',
+          operation: 'recategorize',
+          errorClass: 'QboHttpError',
+          errorCode: 'QBO_ERROR',
+          errorStatus: 400,
+          errorMessage: 'Provider rejected the prepared Deposit body.',
+        },
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('records a readback HTTP 400 after an accepted write as uncertain', async () => {
+    const fixture = durableDeps();
+    fixture.fetchPreparedSnapshot.mockReset()
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockRejectedValueOnce(new QboHttpError(400, 'Provider readback quirk.'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await expect(commitStagedCategorization(
+        commitInput('request-readback-400'),
+        fixture.deps,
+      )).resolves.toMatchObject({
+        ok: false,
+        status: 'ERROR',
+        outcome: 'UNCERTAIN',
+      });
+      expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+      expect(fixture.db.attempts[0]).toMatchObject({
+        status: 'UNCERTAIN',
+        errorCode: 'QBO_WRITE_UNCERTAIN',
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([1, 2])(
+    'returns a bounded provider rejection when %s persistence attempt(s) fail',
+    async (failures) => {
+      const fixture = durableDeps();
+      fixture.sendPreparedWrite.mockRejectedValueOnce(
+        new QboHttpError(400, 'Private provider validation detail.'),
+      );
+      fixture.db.failTransactionsWhileCommitting = failures;
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      try {
+        await expect(commitStagedCategorization(
+          commitInput(`request-rejection-persistence-${failures}`),
+          fixture.deps,
+        )).resolves.toMatchObject({
+          ok: false,
+          status: 'PENDING',
+          outcome: failures === 1 ? 'REJECTED' : 'IN_PROGRESS',
+          error: {
+            code: failures === 1
+              ? 'QBO_WRITE_REJECTED'
+              : 'OPERATION_RECONCILIATION_REQUIRED',
+            message: expect.not.stringContaining('Private'),
+          },
+        });
+        if (failures === 1) {
+          expect(fixture.db.attempts[0]?.status).toBe('REJECTED');
+        } else {
+          expect(fixture.db.attempts[0]?.status).toBe('COMMITTING');
+        }
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
 
   it('persists the live uncertainty hook in the same attempt and transaction transition', async () => {
     const onUncertainMutation = vi.fn(async () => undefined);
@@ -3752,6 +3939,22 @@ describe('legacy retryError with durable attempts', () => {
 });
 
 describe('reconcileMutationAttempt', () => {
+  it.each(['recategorize', 'restore'] as const)('rejects reconciliation of retained RETRYABLE %s without provider access or mutation', async (operation) => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = operation === 'restore' ? 'POSTED' : 'PENDING';
+    seedAttempt(db, 'RETRYABLE', 'retained-no-send-request', operation);
+    const before = structuredClone(db.attempts[0]);
+    const fixture = durableDeps(db);
+    await expect(reconcileMutationAttempt({
+      requestId: 'retained-no-send-request',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Synthetic reviewer' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'RECONCILE_NOT_ALLOWED' });
+    expect(db.attempts[0]).toEqual(before);
+    expect(db.transactionRow.status).toBe(operation === 'restore' ? 'POSTED' : 'PENDING');
+    expect(fixture.fetchPurchaseSnapshot).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('does not finalize when reconciliation is cancelled immediately after readback', async () => {
     const db = new FakeDurableDb();
     db.transactionRow.status = 'ERROR';
@@ -4078,7 +4281,7 @@ describe('prepareCategorizationUndo', () => {
       qboSyncToken: '8',
       preview: {
         action: 'restore_purchase_categorization',
-        resultingStatus: 'REVERTED',
+        resultingStatus: 'PENDING',
         direction: 'purchase',
         totalCents: -1050,
         totalTaxCents: 0,
@@ -4385,6 +4588,15 @@ describe('undoCategorization', () => {
     return fixture;
   }
 
+  it.each(['expired', 'future', 'missing'] as const)('rejects a new durable undo with an %s posted timestamp before provider work', async (kind) => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.postedAt = kind === 'missing' ? null : new Date(fixture.deps.now().getTime() + (kind === 'future' ? 86400000 : -31 * 86400000));
+    await expect(undoCategorization({ transactionId: DURABLE_TRANSACTION_ID, companyId: DURABLE_COMPANY_ID,
+      requestId: 'undo-window-example', actor: { id: DURABLE_ACTOR_ID, label: 'Example user' } }, fixture.deps)).rejects.toMatchObject({ code: 'UNDO_WINDOW_EXPIRED' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   async function prepareMcpProof(
     fixture: ReturnType<typeof postedFixture>,
   ) {
@@ -4467,7 +4679,7 @@ describe('undoCategorization', () => {
     expect(result).toMatchObject({
       requestId: 'undo-operation',
       outcome: 'VERIFIED',
-      status: 'REVERTED',
+      status: 'PENDING',
     });
     expect(fixture.db.qboMutationAttempt.findUnique)
       .toHaveBeenCalledWith({ where: { requestId: 'request-existing' } });
@@ -4610,7 +4822,44 @@ describe('undoCategorization', () => {
     expect(fixture.db.transactionRow.status).toBe('POSTED');
   });
 
-  it('persists and sends one exact restore, verifies readback, then marks REVERTED', async () => {
+  it('retains POSTED and replays a rejected restore without another provider send', async () => {
+    const fixture = postedFixture();
+    fixture.sendPreparedWrite.mockRejectedValueOnce(new QboHttpError(400, 'Synthetic validation rejection.'));
+    const input = {
+      transactionId: DURABLE_TRANSACTION_ID, companyId: DURABLE_COMPANY_ID,
+      requestId: 'rejected-undo-request', actor: { id: DURABLE_ACTOR_ID, label: 'Synthetic reviewer' },
+    };
+    const result = await undoCategorization(input, fixture.deps);
+    expect(result).toMatchObject({ ok: false, outcome: 'REJECTED', status: 'POSTED' });
+    expect(fixture.db.transactionRow.status).toBe('POSTED');
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      status: 'REJECTED', operation: 'restore',
+      verification: { outcome: 'REJECTED', status: 'POSTED' },
+    });
+    expect(await undoCategorization(input, fixture.deps)).toEqual(result);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+  });
+
+  it('prepares a new Undo request after a retained RETRYABLE restore without resending the old request', async () => {
+    const fixture = postedFixture();
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce({ ...structuredClone(beforePurchase), syncToken: '9' });
+    seedAttempt(fixture.db, 'RETRYABLE', 'old-retryable-restore', 'restore');
+    const old = structuredClone(fixture.db.attempts.at(-1));
+    const result = await undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID, companyId: DURABLE_COMPANY_ID,
+      requestId: 'new-undo-request', actor: { id: DURABLE_ACTOR_ID, label: 'Synthetic reviewer' },
+    }, fixture.deps);
+    expect(result).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'PENDING' });
+    expect(fixture.db.attempts.find((attempt) => attempt.requestId === 'old-retryable-restore')).toEqual(old);
+    expect(fixture.db.attempts.at(-1)).toMatchObject({ requestId: 'new-undo-request', status: 'VERIFIED' });
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+  });
+
+  it('persists and sends one exact restore, verifies readback, then requeues PENDING', async () => {
     const fixture = postedFixture();
     fixture.fetchPurchaseSnapshot
       .mockReset()
@@ -4628,7 +4877,7 @@ describe('undoCategorization', () => {
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
     }, fixture.deps);
 
-    expect(result).toMatchObject({ ok: true, status: 'REVERTED', outcome: 'VERIFIED' });
+    expect(result).toMatchObject({ ok: true, status: 'PENDING', outcome: 'VERIFIED' });
     expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite.mock.calls[0]?.[0]).toMatchObject({
@@ -4639,7 +4888,7 @@ describe('undoCategorization', () => {
       operation: 'restore',
       status: 'VERIFIED',
     });
-    expect(fixture.db.transactionRow.status).toBe('REVERTED');
+    expect(fixture.db.transactionRow.status).toBe('PENDING');
   });
 
   it('blocks a closed-period transaction before a prepared undo can enter COMMITTING', async () => {
@@ -4779,7 +5028,7 @@ describe('undoCategorization', () => {
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
     }, fixture.deps);
 
-    expect(result).toMatchObject({ ok: true, status: 'REVERTED', outcome: 'VERIFIED' });
+    expect(result).toMatchObject({ ok: true, status: 'PENDING', outcome: 'VERIFIED' });
     expect(fixture.db.qboAccount.findMany).not.toHaveBeenCalled();
     expect(fixture.db.qboTaxCode.findMany).not.toHaveBeenCalled();
     expect(fixture.db.qboTaxRate.findMany).not.toHaveBeenCalled();
@@ -4825,7 +5074,7 @@ describe('undoCategorization', () => {
     },
   );
 
-  it('replays a recorded verified undo after disconnect without another QBO client or send', async () => {
+  it('replays a recorded verified undo after expiry and disconnect without another QBO client or send', async () => {
     const fixture = postedFixture();
     const input = {
       transactionId: DURABLE_TRANSACTION_ID,
@@ -4843,6 +5092,7 @@ describe('undoCategorization', () => {
       });
     const first = await undoCategorization(input, fixture.deps);
     fixture.db.transactionRow.company.disconnectedAt = new Date();
+    fixture.deps.now = () => new Date('2026-09-01T12:00:00.000Z');
 
     const duplicate = await undoCategorization(input, fixture.deps);
 
@@ -4925,7 +5175,7 @@ describe('undoCategorization', () => {
     expect(results.every((result) =>
       result.outcome === 'VERIFIED' || result.outcome === 'IN_PROGRESS')).toBe(true);
     expect(fixture.db.attempts.at(-1)?.status).toBe('VERIFIED');
-    expect(fixture.db.transactionRow.status).toBe('REVERTED');
+    expect(fixture.db.transactionRow.status).toBe('PENDING');
   });
 
   it('rejects reuse of a recategorization request ID for undo', async () => {
@@ -5523,7 +5773,7 @@ describe('Deposit durable lifecycle matrix', () => {
       }, fixture.deps),
     ).resolves.toMatchObject({
       ok: true,
-      status: 'REVERTED',
+      status: 'PENDING',
       outcome: 'VERIFIED',
     });
     expect(fixture.prepareRestore).toHaveBeenCalledWith(
@@ -5547,6 +5797,7 @@ describe('Deposit durable lifecycle matrix', () => {
     const fixture = depositDurableFixture();
     seedAttempt(fixture.db, 'VERIFIED');
     fixture.db.transactionRow.status = 'POSTED';
+    fixture.db.transactionRow.postedAt = fixture.deps.now();
     fixture.db.transactionRow.qboSyncToken = '8';
     fixture.fetchPreparedSnapshot
       .mockReset()

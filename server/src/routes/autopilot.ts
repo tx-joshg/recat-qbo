@@ -280,6 +280,7 @@ function runStatus(value: string): AgentRunStatus | 'unavailable' {
     || value === 'unchanged'
     || value === 'uncertain'
     || value === 'retryable'
+    || value === 'rejected'
     ? value
     : 'unavailable';
 }
@@ -401,7 +402,7 @@ function safeOutcome(
       : 'shadow_proposed';
   }
   if (status === 'abstain') return 'abstained';
-  if (status === 'failed') return 'failed_before_write';
+  if (status === 'failed' || status === 'rejected') return 'failed_before_write';
   if (status === 'posted_verified' && revertedInvalidation(run) !== null) {
     return verification?.verificationMode === 'distinct_model'
       && canonicalRevertedProof(run, proofs)

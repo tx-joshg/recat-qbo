@@ -12,6 +12,7 @@ import {
 } from './operations.js';
 import {
   prepareMcpCategorization,
+  getPreparedMcpCategorization,
   type McpCategorizationDeps,
   type PrepareMcpCategorizationInput,
 } from './categorization.js';
@@ -243,6 +244,37 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe('prepareMcpCategorization', () => {
+  it('recovers the exact owned prepared operation without restaging', async () => {
+    const context = harness();
+    const prepared = await prepareMcpCategorization(
+      principal,
+      prepareInput(),
+      context.deps,
+    );
+    const recoveryStore: McpOperationStore = {
+      mcpOperation: {
+        findFirst: async ({ where }) => {
+          const row = [...context.rows.values()].find((candidate) => matches(candidate, where));
+          return row === undefined ? null : structuredClone(row);
+        },
+        createMany: async () => ({ count: 0 }),
+      },
+    };
+
+    await expect(getPreparedMcpCategorization(
+      principal,
+      {
+        companyId: COMPANY_ID,
+        transactionId: TRANSACTION_ID,
+        idempotencyKey: 'prepare-1',
+      },
+      { ...context.deps, operationStore: recoveryStore },
+    )).resolves.toEqual(prepared);
+
+    expect(context.revision).toBe(1);
+    expect(context.validationCalls).toBe(1);
+  });
+
   it('atomically stages and stores a bounded immutable receipt without any QBO call', async () => {
     const context = harness();
     const getQboClient = vi.fn(() => {

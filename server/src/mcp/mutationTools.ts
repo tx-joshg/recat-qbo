@@ -2,7 +2,9 @@ import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod-v4';
 import {
+  getPreparedMcpCategorization,
   prepareMcpCategorization,
+  type GetPreparedMcpCategorizationInput,
   type PrepareMcpCategorizationInput,
 } from '../services/mcp/categorization.js';
 import {
@@ -44,6 +46,7 @@ import {
 
 const CORE_MUTATION_TOOL_NAMES = [
   'prepare_categorization',
+  'get_prepared_categorization',
   'commit_categorization',
   'get_operation',
   'retry_operation',
@@ -65,6 +68,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: PrepareMcpCategorizationInput,
   ): ReturnType<typeof prepareMcpCategorization>;
+  getPreparedCategorization(
+    principal: McpPrincipal,
+    input: GetPreparedMcpCategorizationInput,
+  ): ReturnType<typeof getPreparedMcpCategorization>;
   commitCategorization(
     principal: McpPrincipal,
     input: CommitMcpCategorizationInput,
@@ -99,6 +106,7 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   ...mcpAttachmentOperations,
   ...mcpReceiptOperations,
   prepareCategorization: prepareMcpCategorization,
+  getPreparedCategorization: getPreparedMcpCategorization,
   commitCategorization: commitMcpCategorization,
   getOperation: getMcpOperation,
   retryOperation: retryMcpOperation,
@@ -249,6 +257,11 @@ const prepareCategorizationInput = z.strictObject({
   idempotencyKey,
   proposal,
 });
+const getPreparedCategorizationInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  idempotencyKey,
+});
 const operationWithOptionalIdempotencyInput = z.strictObject({
   operationId: uuid,
   idempotencyKey: idempotencyKey.optional(),
@@ -312,6 +325,7 @@ const operationResult = z.strictObject({
     'UNCHANGED',
     'DRY_RUN',
     'RETRYABLE',
+    'REJECTED',
   ]),
   status: z.enum([
     'PENDING',
@@ -341,6 +355,7 @@ const operationOutput = z.strictObject({
     'prepared',
     'committed',
     'retryable',
+    'rejected',
     'reconciliation_required',
     'expired',
     'cancelled',
@@ -351,6 +366,7 @@ const operationOutput = z.strictObject({
     'write_committing',
     'write_uncertain',
     'write_retryable',
+    'write_rejected',
     'write_unchanged',
     'verified',
     'dry_run',
@@ -482,7 +498,7 @@ const preparedUndoOutput = z.strictObject({
   expiresAt: z.iso.datetime(),
   preview: z.strictObject({
     action: z.literal('restore_purchase_categorization'),
-    resultingStatus: z.literal('REVERTED'),
+    resultingStatus: z.literal('PENDING'),
     direction: z.enum(['purchase', 'refund']),
     totalCents: safeInteger,
     totalTaxCents: safeInteger.nullable(),
@@ -545,6 +561,18 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.prepareCategorization(
         principal,
         input as PrepareMcpCategorizationInput,
+      ),
+  },
+  {
+    name: 'get_prepared_categorization',
+    description: 'Recover an exact owned prepared categorization after a transport response was lost.',
+    inputSchema: getPreparedCategorizationInput,
+    outputSchema: preparedCategorizationOutput,
+    annotations: getOperationAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.getPreparedCategorization(
+        principal,
+        input as GetPreparedMcpCategorizationInput,
       ),
   },
   {
