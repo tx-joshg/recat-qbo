@@ -26,6 +26,50 @@ export type TxnStatus =
   | 'SUPERSEDED'
   | 'REVERTED';
 
+/** Latest provider-side write disposition, independent of TxnStatus. */
+export type ProviderActionabilityDisposition =
+  | 'UNKNOWN'
+  | 'WRITABLE'
+  | 'BLOCKED_CLEARED'
+  | 'BLOCKED_RECONCILED'
+  | 'BLOCKED_PERIOD_CLOSED'
+  | 'UNAVAILABLE';
+
+/** Evidence-bound read-only QuickBooks safety observation. */
+export interface ProviderActionabilityDto {
+  disposition: ProviderActionabilityDisposition;
+  checkedAt: string | null;
+  revision: number;
+  qboSyncToken: string;
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  qboId: string;
+  txnDate: string;
+  bankAccountQboId: string | null;
+  bookCloseDate: string | null;
+  cleared: boolean | null;
+  reconciled: boolean | null;
+  unavailableCode: string | null;
+  unavailableReason: string | null;
+}
+
+export interface ProviderActionabilityRefreshItem {
+  transactionId: string;
+  persisted: boolean;
+  disposition: 'WRITABLE' | 'BLOCKED_CLEARED' | 'BLOCKED_RECONCILED' | 'BLOCKED_PERIOD_CLOSED' | 'UNAVAILABLE';
+  errorCode: string | null;
+}
+
+export interface ProviderActionabilityRefreshResult {
+  companyId: string;
+  processed: number;
+  persisted: number;
+  failed: number;
+  nextCursor: string | null;
+  partial: boolean;
+  complete: boolean;
+  items: ProviderActionabilityRefreshItem[];
+}
+
 export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
 export type TaxCalculation = 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
@@ -321,6 +365,7 @@ export interface LiveReadinessDto {
   } | null;
 }
 export type AuditAction =
+  | 'blocked'
   | 'posted'
   | 'dry-run'
   | 'error'
@@ -819,6 +864,8 @@ export interface TransactionDto {
   postedBy: string | null;
   /** Latest unresolved durable write attempt, reduced to reconciliation-safe fields. */
   activeCategorizationAttempt: ActiveCategorizationAttemptDto | null;
+  /** Latest provider safety observation; absent only for legacy internal fixtures. */
+  providerActionability?: ProviderActionabilityDto | null;
   /** id of a detected transfer counterpart (equal |amount|, opposite sign, different account, ≤3 days) */
   transferCandidateId?: string | null;
 }

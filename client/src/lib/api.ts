@@ -5,6 +5,7 @@
 // marked with a TODO — server routes will be built to match this file.
 
 import type {
+  ProviderActionabilityRefreshResult,
   AgentCompanySettingsDto,
   AgentRunStatus,
   AttachmentDto,
@@ -521,6 +522,12 @@ export const companies = {
 };
 
 export const transactions = {
+  /** Read QuickBooks status for one mirrored transaction; resume only with the returned cursor. */
+  refreshProviderStatus: (companyId: string, cursor?: string) =>
+    api.post<ProviderActionabilityRefreshResult>(
+      `/api/companies/${companyId}/transactions/actionability/refresh${qs({ limit: 1, cursor })}`,
+      {},
+    ),
   list: (companyId: string, params: TransactionListParams = {}) =>
     api.get<TransactionListResponse>(`/api/companies/${companyId}/transactions${qs({ ...params })}`),
   /** Stage category/splits/tags — no QBO write. */

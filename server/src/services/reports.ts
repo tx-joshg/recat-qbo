@@ -26,6 +26,12 @@ import { prisma } from '../lib/prisma.js';
 import { isMockRealmId, qboFactory } from '../lib/qbo/factory.js';
 import type { QboStatement, QboStatementRow } from '../lib/qbo/types.js';
 
+import {
+  actionabilityObservationFromRow,
+  effectiveProviderDisposition,
+  providerDispositionIsBlocked,
+} from './providerActionability.js';
+
 const M_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const FULL_M = [
   'January',
@@ -805,10 +811,26 @@ export async function dashboardData(companyId: string): Promise<DashboardDataDto
   const retrievedAt = new Date().toISOString();
   const pend = await prisma.transaction.findMany({
     where: { companyId, status: { in: ['PENDING', 'ERROR'] } },
-    select: { amount: true },
+    select: {
+      id: true,
+      companyId: true,
+      revision: true,
+      qboSyncToken: true,
+      qboType: true,
+      qboId: true,
+      date: true,
+      amount: true,
+      providerActionability: true,
+    },
   });
-  const pendingCount = pend.length;
-  const pendingTotal = pend.reduce((a, t) => a + Math.abs(Number(t.amount)), 0);
+  const queuePend = pend.filter((transaction) => !providerDispositionIsBlocked(
+    effectiveProviderDisposition(
+      actionabilityObservationFromRow(transaction.providerActionability),
+      transaction,
+    ),
+  ));
+  const pendingCount = queuePend.length;
+  const pendingTotal = queuePend.reduce((a, t) => a + Math.abs(Number(t.amount)), 0);
 
   const demo = await demoJson<DemoFin>(`demo:fin:${companyId}`);
   if (demo) {

@@ -28,4 +28,6 @@ COPY shared ./shared
 COPY --from=build /app/server/dist ./server/dist
 COPY --from=build /app/client/dist ./client/dist
 EXPOSE 3001
+# Schema-before-code deployment contract: the additive actionability relation
+# must exist before any generated Prisma relation include is evaluated.
 CMD ["sh", "-c", "npx prisma migrate deploy && node server/dist/index.js"]

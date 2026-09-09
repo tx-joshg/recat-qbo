@@ -1,3 +1,5 @@
+import { createCompanyReadService, type CompanyReadDb } from '../services/companyReads.js';
+import type { WriteSafetyReadOperations } from '../services/writeSafetyReads.js';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import {
   SpanStatusCode,
@@ -10,6 +12,7 @@ import {
   READ_TOOL_NAMES,
   createRecatMcpServer,
   type CompanyReadOperations,
+  type CompanySyncOperations,
 } from './readTools.js';
 
 const principal = Object.freeze({
@@ -72,6 +75,25 @@ function reads(): CompanyReadOperations {
   };
 }
 
+function safetyReads(): WriteSafetyReadOperations {
+  return {
+    getWriteSafety: vi.fn().mockResolvedValue({
+      transactionId: 'transaction-a',
+      revision: 1,
+      qboId: 'qbo-a',
+      qboType: 'Purchase',
+      qboSyncToken: '0',
+      txnDate: '2026-01-01',
+      bankAccountQboId: 'bank-a',
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+      writable: true,
+      blockCode: null,
+    }),
+  };
+}
+
 async function legacy(handler: ReturnType<typeof createMcpHandler>, method: string, params: object) {
   const response = await handler.fetch(new Request('http://localhost/mcp', {
     method: 'POST',
@@ -89,6 +111,216 @@ async function legacy(handler: ReturnType<typeof createMcpHandler>, method: stri
 }
 
 describe('Recat MCP read tools', () => {
+  it.each([
+    ['list_transactions', true],
+    ['list_companies', true],
+    ['list_companies', false],
+    ['list_tax_codes', true],
+  ] as const)('accepts actual %s service output with attachment retention %s', async (name, retainAttachmentFiles) => {
+    const row = {
+      id: 'company-a', realmId: 'realm-synthetic', legalName: 'Read contract fixture',
+      nickname: 'Read fixture', env: 'sandbox', syncMode: 'polling', pollIntervalMin: 10,
+      holdingAccountIds: [], dryRun: false, tagsRequired: false, retainAttachmentFiles,
+      connectedAt: new Date('2026-01-04T00:00:00.000Z'), disconnectedAt: null,
+      lastSyncedAt: null, memberships: [{ role: 'viewer' }],
+    };
+    const db = {
+      user: { findUnique: vi.fn().mockResolvedValue({ id: 'user-a', isInstanceAdmin: false }) },
+      membership: { findUnique: vi.fn().mockResolvedValue({ role: 'viewer' }) },
+      company: { findUnique: vi.fn().mockResolvedValue(row), findMany: vi.fn().mockResolvedValue([row]) },
+      transaction: { findMany: vi.fn().mockResolvedValue([]), count: vi.fn().mockResolvedValue(0) },
+      transactionActionability: { findMany: vi.fn().mockResolvedValue([]) },
+      qboTaxCode: { findMany: vi.fn().mockResolvedValue([{
+        qboId: 'tax-fixture', name: 'Synthetic tax', active: true, taxable: true,
+        combinedPurchaseRate: 0.07, combinedSalesRate: 0.09,
+      }]) },
+    } as unknown as CompanyReadDb;
+    const service = createCompanyReadService(db, 'synthetic-read-contract-cursor', {
+      suggestForMany: async () => [], transferCandidates: async () => new Map(),
+    });
+    const operations = {
+      ...reads(), listTransactions: service.listTransactions, listCompanies: service.listCompanies,
+      listTaxCodes: service.listTaxCodes,
+    };
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const response = await legacy(handler, 'tools/call', {
+      name, arguments: name !== 'list_companies' ? { companyId: 'company-a' } : {},
+    });
+    expect(response.result.isError).not.toBe(true);
+    if (name === 'list_transactions') {
+      expect(response.result.structuredContent).toMatchObject({
+        pendingCount: 0, actionableCount: 0, blockedCount: 0, unknownCount: 0,
+      });
+    } else if (name === 'list_tax_codes') {
+      expect(response.result.structuredContent.items[0]).toMatchObject({
+        combinedPurchaseRate: 0.07, combinedSalesRate: 0.09,
+      });
+    } else {
+      expect(response.result.structuredContent.items[0].retainAttachmentFiles).toBe(retainAttachmentFiles);
+    }
+  });
+
+  it('refreshes one visible mirror transaction without starting a company sweep', async () => {
+    const refreshTransaction = vi.fn().mockResolvedValue({
+      transactionId: 'transaction-a',
+      outcome: 'refreshed',
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, memberships: [{ companyId: 'company-a', role: 'categorizer' as const }] },
+        era: 'legacy',
+        reads: reads(),
+        sync: {
+          syncCompany: vi.fn(),
+          refreshTransaction,
+        },
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'refresh_transaction_mirror',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.refresh).toEqual({
+      transactionId: 'transaction-a',
+      outcome: 'refreshed',
+    });
+    expect(refreshTransaction).toHaveBeenCalledWith('company-a', 'transaction-a');
+  });
+
+  it('runs an authorized Recat mirror sync without writing QuickBooks', async () => {
+    const syncCompany = vi.fn().mockResolvedValue({
+      ok: true,
+      message: 'Synced 1 transaction.',
+      mirror: { created: 0, refreshed: 1, stale: 2, busy: 3, contended: 4 },
+    });
+    const sync: CompanySyncOperations = { syncCompany };
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, memberships: [{ companyId: 'company-a', role: 'categorizer' as const }] },
+        era: 'legacy',
+        reads: reads(),
+        sync,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.sync).toEqual({
+      companyId: 'company-a',
+      ok: true,
+      message: 'Synced 1 transaction.',
+      mirror: { created: 0, refreshed: 1, stale: 2, busy: 3, contended: 4 },
+    });
+    expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
+  });
+
+  it('allows an instance admin to sync a visible company without an explicit membership', async () => {
+    const syncCompany = vi.fn().mockResolvedValue({ ok: true, message: 'Synced 1 transaction.' });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, isInstanceAdmin: true, memberships: [] },
+        era: 'legacy',
+        reads: reads(),
+        sync: { syncCompany },
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
+  });
+
+  it('requires categorizer access before a Recat mirror sync', async () => {
+    const syncCompany = vi.fn();
+    const sync: CompanySyncOperations = { syncCompany };
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal,
+        era: 'legacy',
+        reads: reads(),
+        sync,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).toBe(true);
+    expect(response.result.structuredContent.error.code).toBe('FORBIDDEN');
+    expect(syncCompany).not.toHaveBeenCalled();
+  });
+
+  it.each(['get_write_safety', 'refresh_provider_actionability'])('rejects viewer provider-driving tool %s before reading QuickBooks', async (name) => {
+    const operations = safetyReads();
+    const refresh = vi.fn().mockResolvedValue({
+      companyId: 'company-a', processed: 0, persisted: 0, failed: 0,
+      nextCursor: null, partial: false, complete: true, items: [],
+    });
+    const handler = createMcpHandler(() => createRecatMcpServer({
+      principal, era: 'legacy', reads: reads(), writeSafetyReads: operations,
+      actionabilityRefresh: { refreshProviderActionability: refresh },
+    }), { legacy: 'stateless' });
+    const response = await legacy(handler, 'tools/call', {
+      name, arguments: name === 'get_write_safety'
+        ? { companyId: 'company-a', transactionId: 'transaction-a' }
+        : { companyId: 'company-a', limit: 1 },
+    });
+    expect(response.result.structuredContent.error?.code).toBe('FORBIDDEN');
+    expect(operations.getWriteSafety).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('routes the QuickBooks write-safety preflight with the fresh principal', async () => {
+    const operations = safetyReads();
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, memberships: [{ companyId: 'company-a', role: 'categorizer' }] },
+        era: 'legacy',
+        reads: reads(),
+        writeSafetyReads: operations,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'get_write_safety',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.writeSafety).toMatchObject({
+      transactionId: 'transaction-a',
+      writable: true,
+      blockCode: null,
+    });
+    expect(operations.getWriteSafety).toHaveBeenCalledWith(
+      'user-a',
+      'company-a',
+      'transaction-a',
+    );
+  });
+
+
   it('returns exact source gross through the strict transaction output schema', async () => {
     const operations = reads();
     vi.mocked(operations.getTransaction).mockResolvedValue({
@@ -204,7 +436,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine core reads and twenty conservatively annotated action tools', async () => {
+  it('registers thirteen core reads and twenty conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -235,10 +467,10 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(29);
+    expect(tools).toHaveLength(33);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
-        readOnlyHint: true,
+        readOnlyHint: !['sync_company', 'refresh_transaction_mirror', 'get_write_safety', 'refresh_provider_actionability'].includes(tool.name),
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: false,

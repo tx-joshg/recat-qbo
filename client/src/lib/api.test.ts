@@ -326,3 +326,10 @@ it('omits malformed request references from API errors', async () => {
   }), { status: 502 })));
   await expect(companies.dashboard('company-1')).rejects.toMatchObject({ requestId: undefined });
 });
+
+it('requests one scoped provider status check and encodes its continuation', async () => {
+  const fetcher=vi.fn(async()=>new Response(JSON.stringify({companyId:'company-a',processed:0,persisted:0,failed:0,nextCursor:null,partial:false,complete:true,items:[]}),{status:200,headers:{'Content-Type':'application/json'}}));
+  vi.stubGlobal('fetch',fetcher);
+  await transactions.refreshProviderStatus('company-a','cursor/example');
+  expect(fetcher).toHaveBeenCalledWith('/api/companies/company-a/transactions/actionability/refresh?limit=1&cursor=cursor%2Fexample',expect.objectContaining({method:'POST',body:'{}'}));
+});

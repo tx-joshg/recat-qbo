@@ -34,6 +34,10 @@ import {
   type LiveMutationContext,
   type LiveMutationProof,
 } from './agent/liveMutationAuthority.js';
+import {
+  ensureUnknownProviderActionability,
+  type ProviderActionabilityDb,
+} from './providerActionability.js';
 
 interface TransactionRow {
   id: string;
@@ -41,6 +45,7 @@ interface TransactionRow {
   qboType: string;
   qboId: string;
   qboSyncToken: string;
+  date: Date | string;
   amount: number | string | { toString(): string };
   status: string;
   revision: number;
@@ -1055,6 +1060,21 @@ async function stageWithOwner<T>(
         'The pending categorization changed before this proposal could be staged.',
       );
     }
+    // The revision CAS and actionability rebind are one database transaction.
+    // A crash can never leave a stale WRITABLE row attached to the new staged
+    // revision, and the next bounded safety refresh can persist immediately.
+    await ensureUnknownProviderActionability(
+      {
+        id: validated.transaction.id,
+        companyId: validated.transaction.companyId,
+        revision: validated.input.expectedRevision + 1,
+        qboSyncToken: validated.transaction.qboSyncToken,
+        qboType: validated.transaction.qboType,
+        qboId: validated.transaction.qboId,
+        date: validated.transaction.date,
+      },
+      tx as unknown as ProviderActionabilityDb,
+    );
     await afterRevisionCas?.();
 
     await tx.splitLine.deleteMany({ where: { txnId: validated.input.transactionId } });

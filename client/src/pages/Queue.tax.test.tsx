@@ -11,6 +11,8 @@ import type {
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   bankAccounts: vi.fn(),
+  refreshProviderStatus: vi.fn(),
+  role: undefined as 'admin' | 'viewer' | undefined,
   categorize: vi.fn(),
   stage: vi.fn(),
   commit: vi.fn(),
@@ -40,6 +42,7 @@ vi.mock('react-router-dom', async () => {
 
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({
+    role: mocks.role,
     activeCompany: {
       id: mocks.activeCompanyId,
       nickname: 'Generic company',
@@ -110,6 +113,7 @@ vi.mock('../lib/api', () => {
     rules: { create: mocks.rulesCreate },
     transactions: {
       list: mocks.list,
+      refreshProviderStatus: mocks.refreshProviderStatus,
       categorize: mocks.categorize,
       stageCategorization: mocks.stage,
       commitCategorization: mocks.commit,
@@ -124,6 +128,8 @@ vi.mock('../lib/api', () => {
     },
   };
 });
+
+vi.mock('./settings/AutopilotCard', () => ({ AutopilotQueueStatus: () => null }));
 
 import Queue from './Queue';
 import { ApiError } from '../lib/api';
@@ -289,6 +295,8 @@ async function renderQueue(row: TransactionDto | TransactionDto[] = transaction(
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.list.mockReset();
+  mocks.role = undefined;
+  mocks.refreshProviderStatus.mockResolvedValue({companyId: 'COMPANY_GENERIC', processed: 0, persisted: 0, failed: 0, nextCursor: null, partial: false, complete: true, items: []});
   Element.prototype.scrollIntoView = vi.fn();
   window.confirm = vi.fn(() => true);
   Object.defineProperty(window, 'matchMedia', {
@@ -2042,3 +2050,62 @@ function mockMobileMedia() {
       })),
     });
 }
+it('refreshes Queue rows and its count after read-only status checks without staging or posting', async () => {
+  mocks.role = 'admin';
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  const stagesBeforeRefresh = mocks.stage.mock.calls.length;
+  mocks.list.mockResolvedValue({ transactions: [], nextCursor: null });
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+  await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+  expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
+  expect(mocks.stage).toHaveBeenCalledTimes(stagesBeforeRefresh);expect(mocks.commit).not.toHaveBeenCalled();expect(mocks.legacyPost).not.toHaveBeenCalled();
+});
+it('adopts fresh Queue rows at the same revision after a status refresh', async () => {
+  mocks.role = 'admin';
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  mocks.list.mockResolvedValue({
+    transactions: [transaction({ payee: 'Updated generic supplier', revision: 5 })],
+    nextCursor: null,
+  });
+
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+
+  expect(await screen.findByText('Updated generic supplier')).toBeInTheDocument();
+  expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+});
+
+it('keeps a newer locally staged revision when an in-flight status reload returns older rows', async () => {
+  mocks.role = 'admin';
+  const pending = deferred<{ transactions: TransactionDto[]; nextCursor: null }>();
+  const user = userEvent.setup();
+  await renderQueue();
+  await waitForPostEnabled();
+  mocks.stage.mockResolvedValue({ ...STAGED, revision: 6, taxCalculation: 'TaxExcluded' });
+  mocks.list.mockReturnValueOnce(pending.promise);
+  await user.click(screen.getByRole('button', { name: 'Check QuickBooks status' }));
+  await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+
+  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(2));
+  await screen.findByText(/subtotal.*10\.00/i);
+  await act(async () => pending.resolve({
+    transactions: [transaction({ payee: 'Older generic supplier', revision: 5 })],
+    nextCursor: null,
+  }));
+
+  expect(screen.getByText('Generic supplier')).toBeInTheDocument();
+  expect(screen.queryByText('Older generic supplier')).not.toBeInTheDocument();
+  await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax inclusive');
+  await waitFor(() => expect(mocks.stage).toHaveBeenCalledTimes(3));
+  expect(mocks.stage.mock.calls[2]?.[1]).toMatchObject({ expectedRevision: 6 });
+});
+
+it('does not offer the provider status refresh to viewers', async () => {
+  mocks.role = 'viewer';
+  await renderQueue();
+  expect(screen.queryByRole('button', { name: 'Check QuickBooks status' })).not.toBeInTheDocument();
+});

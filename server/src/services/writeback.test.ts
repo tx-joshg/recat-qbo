@@ -247,6 +247,12 @@ function makeFakeDb(row: FakeTxnRow) {
     qboMutationAttempt: {
       findFirst: vi.fn(async () => null),
     },
+    transactionActionability: {
+      findUnique: vi.fn(async () => null),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+      upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => create),
+    },
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
     },
@@ -404,10 +410,10 @@ describe('legacy write safety', () => {
       const recategorize = vi.fn();
       const fetchWriteSafety = vi.fn(async () => ({
         bookCloseDate: '2026-07-05',
-        cleared: qboType === 'Purchase',
-        reconciled: qboType === 'Deposit',
+        cleared: false,
+        reconciled: false,
       }));
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('0', qboType),
         fetchWriteSafety,
         recategorize,
@@ -433,8 +439,87 @@ describe('legacy write safety', () => {
       });
       expect(recategorize).not.toHaveBeenCalled();
       expect(row.status).toBe('PENDING');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: 'BLOCKED_PERIOD_CLOSED',
+            cleared: false,
+            reconciled: false,
+          }),
+        }),
+      );
+      expect(audit).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: 'txn-1',
+        before: 'Ask My Accountant',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_PERIOD_CLOSED' },
+        }),
+      }));
     },
   );
+
+  it('creates a missing actionability row before caching a closed-period lock', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: '2026-07-05',
+        cleared: false,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.transactionActionability.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+
+    await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(db.transactionActionability.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        transactionId: 'txn-1',
+        disposition: 'UNKNOWN',
+      }),
+    });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(2);
+    expect(db.transactionActionability.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ disposition: 'BLOCKED_PERIOD_CLOSED' }),
+      }),
+    );
+  });
+
+  it('returns the original period lock when blocked-outcome persistence fails', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: '2026-07-05',
+        cleared: false,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.$transaction.mockRejectedValueOnce(new Error('temporary database failure'));
+
+    const result = await postTransaction(
+      'txn-1',
+      { id: 'u-1', label: 'Generic User' },
+      {},
+      deps,
+    );
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      status: 'PENDING',
+      error: { code: 'QBO_PERIOD_CLOSED' },
+    });
+  });
 
   it('rechecks safety after a SyncToken conflict before retrying', async () => {
     const row = makeTxnRow();
@@ -514,11 +599,11 @@ describe('undoPost', () => {
         company: postedCompany,
       });
       const moveToAccount = vi.fn();
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('4', qboType),
         fetchWriteSafety: async () => ({
           bookCloseDate: '2026-07-05',
-          cleared: true,
+          cleared: false,
           reconciled: false,
         }),
         moveToAccount,
@@ -529,6 +614,16 @@ describe('undoPost', () => {
       ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
       expect(moveToAccount).not.toHaveBeenCalled();
       expect(row.status).toBe('POSTED');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        txnId: 'txn-1',
+        action: 'blocked',
+        before: 'Software subscriptions',
+        after: 'Blocked — re-queue refused',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_PERIOD_CLOSED' },
+        }),
+      }));
     },
   );
 
@@ -1380,6 +1475,10 @@ function deferred<T>() {
 }
 
 class FakeDurableDb {
+  transactionActionability = {
+    updateMany: vi.fn(async () => ({ count: 1 })),
+  };
+
   transactionRow;
   attempts: DurableAttemptRow[] = [];
   failVerifiedCommitOnce = false;
@@ -1877,7 +1976,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
   it.each([
     ['Purchase', { bookCloseDate: '2026-07-28', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
-    ['Deposit', { bookCloseDate: '2026-07-28', cleared: false, reconciled: true }, 'QBO_PERIOD_CLOSED'],
+    ['Deposit', { bookCloseDate: '2026-07-28', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
   ] as const)(
     'blocks a safety-locked %s before COMMITTING or sending',
     async (qboType, evidence, code) => {
@@ -1900,6 +1999,20 @@ describe('commitStagedCategorization durable lifecycle', () => {
         expect.objectContaining({ data: { status: 'COMMITTING' } }),
       ]);
       expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: 'BLOCKED_PERIOD_CLOSED',
+          }),
+        }),
+      );
+      expect(fixture.audit).toHaveBeenCalledTimes(1);
+      expect(fixture.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: DURABLE_TRANSACTION_ID,
+        before: `QuickBooks ${qboType}`,
+        payload: expect.objectContaining({ error: { code } }),
+      }));
 
       const retry = durableDeps(fixture.db);
       await expect(
@@ -3035,6 +3148,44 @@ describe('commitStagedCategorization durable lifecycle', () => {
       status: 'RETRYABLE',
       errorCode: 'QBO_PERIOD_CLOSED',
     });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(restarted.audit).toHaveBeenCalledWith(db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock discovered after fresh preparation before sending', async () => {
+    const fixture = durableDeps();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: '2026-07-28',
+        cleared: false,
+        reconciled: false,
+      });
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
   });
 
   it('resumes a persisted PREPARED request when current account and tax references are unavailable', async () => {
@@ -4495,7 +4646,7 @@ describe('undoCategorization', () => {
     const fixture = postedFixture();
     fixture.fetchWriteSafety.mockResolvedValueOnce({
       bookCloseDate: '2026-07-28',
-      cleared: true,
+      cleared: false,
       reconciled: false,
     });
 
@@ -4509,6 +4660,81 @@ describe('undoCategorization', () => {
     expect(fixture.db.attempts).toHaveLength(1);
     expect(fixture.prepareRestore).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock discovered after fresh restore preparation before sending', async () => {
+    const fixture = postedFixture();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: '2026-07-28',
+        cleared: false,
+        reconciled: false,
+      });
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo-final-lock',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock when resuming a persisted PREPARED restore', async () => {
+    const fixture = postedFixture();
+    seedAttempt(fixture.db, 'PREPARED', 'request-undo', 'restore');
+    fixture.fetchWriteSafety.mockResolvedValueOnce({
+      bookCloseDate: '2026-07-28',
+      cleared: false,
+      reconciled: false,
+    });
+
+    await expect(
+      undoCategorization({
+        transactionId: DURABLE_TRANSACTION_ID,
+        companyId: DURABLE_COMPANY_ID,
+        requestId: 'request-undo',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      status: 'RETRYABLE',
+      errorCode: 'QBO_PERIOD_CLOSED',
+    });
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
   });
 
   it('verifies undo on a reconciled transaction in an open period', async () => {

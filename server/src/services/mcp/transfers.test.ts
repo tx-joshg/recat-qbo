@@ -145,6 +145,37 @@ function harness() {
 }
 
 describe('MCP transfer preparation', () => {
+  it.each([firstId, secondId, null])('checks both transfer leg observations before a new preparation (%s)', async (blockedId) => {
+    const h = harness();
+    const observation = vi.fn(async ({ where }) => ({
+      companyId: coordinator.companyId, transactionId: where.transactionId,
+      qboId: where.transactionId, qboType: 'Purchase', qboSyncToken: '7',
+      revision: 3, txnDate: NOW, checkedAt: NOW,
+      disposition: where.transactionId === blockedId ? 'UNKNOWN' : 'WRITABLE',
+    }));
+    Object.assign(h.store, {
+      transactionActionability: { findUnique: observation },
+      transaction: { findFirst: vi.fn(async ({ where }) => ({
+        id: where.id, companyId: coordinator.companyId, qboId: where.id,
+        qboType: 'Purchase', qboSyncToken: '7', revision: 3, date: NOW,
+      })) },
+    });
+    const result = prepareMcpTransfer(principal, {
+      companyId: coordinator.companyId, transactionId: firstId,
+      counterpartTransactionId: secondId, expectedRevision: 3,
+      counterpartExpectedRevision: 4, idempotencyKey: 'blocked-transfer-fixture',
+    }, { prepare: h.prepare, createOperation: createPreparedOperation, now: () => NOW });
+    if (blockedId === null) {
+      await expect(result).resolves.toHaveProperty('operationId');
+      expect(h.operations.size).toBe(1);
+      expect(observation).toHaveBeenCalledTimes(2);
+    } else {
+      await expect(result).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+      expect(h.operations.size).toBe(0);
+      expect(observation).toHaveBeenCalledWith({ where: { transactionId: blockedId } });
+    }
+  });
+
   it('stores the complete private pair binding in the shared final transaction and returns only a bounded preview', async () => {
     const h = harness();
     const result = await prepareMcpTransfer(principal, {
@@ -210,6 +241,11 @@ describe('MCP transfer preparation', () => {
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
+    const lookup = vi.fn(async () => null);
+    Object.assign(h.store, {
+      transactionActionability: { findUnique: lookup },
+      transaction: { findFirst: lookup },
+    });
     const replay = await prepareMcpTransfer(principal, input, {
       prepare: h.prepare,
       createOperation: createPreparedOperation,
@@ -219,6 +255,7 @@ describe('MCP transfer preparation', () => {
     expect(replay).toEqual(first);
     expect(h.prepare).toHaveBeenCalledTimes(2);
     expect(h.operations).toHaveLength(1);
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it('rejects a private payload or scalar binding that disagrees with the immutable coordinator', async () => {

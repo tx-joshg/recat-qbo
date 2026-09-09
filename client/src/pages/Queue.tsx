@@ -1,3 +1,4 @@
+import ProviderStatusRefresh from '../components/ProviderStatusRefresh';
 // Queue — the categorization screen. Faithful port of Recat.dc.html
 // lines 229–409 (markup) and the interaction logic in visible()/renderVals()/
 // onKey()/post()/openSplit()/xferMate()/recordTransfer()/undoPost()/cycleSort().
@@ -377,6 +378,17 @@ export default function Queue() {
       .catch((error) => { if (!cancelled) toast(errText(error)); });
     return () => { cancelled = true; };
   }, [activeCompanyId, toast]);
+  const reloadProviderStatuses = useCallback(async (companyId: string) => {
+    const fresh = await fetchAllTxns(companyId);
+    if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+    setRows(previous => {
+      const byId = new Map(previous.map(row => [row.id, row]));
+      return fresh.map(row => {
+        const local = byId.get(row.id);
+        return local && local.revision > row.revision ? local : row;
+      });
+    });
+  }, [fetchAllTxns]);
 
   // ---- pending badge: recompute locally (pending = PENDING + ERROR rows) ----
   useEffect(() => {
@@ -2191,6 +2203,12 @@ export default function Queue() {
           </button>
         </div>
       </div>
+
+      {loaded && activeCompanyId && (role === 'categorizer' || role === 'admin') && (
+        <div style={{ marginBottom: 12 }}>
+          <ProviderStatusRefresh key={activeCompanyId} companyId={activeCompanyId} onRefreshed={reloadProviderStatuses} />
+        </div>
+      )}
 
       {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
         <AutopilotQueueStatus

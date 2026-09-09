@@ -1,3 +1,4 @@
+import { HttpError } from '../lib/http.js';
 import {
   McpServer,
   type JSONObject,
@@ -31,6 +32,21 @@ import type {
   TransferCandidateDto,
 } from '../services/companyReads.js';
 import type { QboAccountDto, TagDto } from '@recat/shared';
+import {
+  writeSafetyReads,
+  type WriteSafetyReadOperations,
+} from '../services/writeSafetyReads.js';
+import {
+  DEFAULT_ACTIONABILITY_REFRESH_LIMIT,
+  MAX_ACTIONABILITY_REFRESH_LIMIT,
+  refreshProviderActionability,
+  type ProviderActionabilityRefreshResult,
+} from '../services/providerActionabilityRefresh.js';
+import {
+  refreshMirroredTransaction,
+  syncCompany,
+  type MirroredTransactionRefreshResult,
+} from '../services/sync.js';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
 import {
@@ -55,6 +71,10 @@ export const READ_TOOL_NAMES = [
   'list_companies',
   'list_transactions',
   'get_transaction',
+  'get_write_safety',
+  'sync_company',
+  'refresh_transaction_mirror',
+  'refresh_provider_actionability',
   'list_categories',
   'list_tax_codes',
   'list_tags',
@@ -101,6 +121,14 @@ export interface CompanyReadOperations {
   ): Promise<Page<TransferCandidateDto>>;
 }
 
+export interface ProviderActionabilityRefreshOperations {
+  refreshProviderActionability(
+    userId: string,
+    companyId: string,
+    options?: { cursor?: string | null; limit?: number },
+  ): Promise<ProviderActionabilityRefreshResult>;
+}
+
 export const companyReads: CompanyReadOperations = Object.freeze({
   listCompanies,
   listTransactions,
@@ -116,6 +144,9 @@ export interface RecatMcpContext {
   principal: McpPrincipal;
   era: 'legacy' | 'modern';
   reads?: CompanyReadOperations;
+  writeSafetyReads?: WriteSafetyReadOperations;
+  sync?: CompanySyncOperations;
+  actionabilityRefresh?: ProviderActionabilityRefreshOperations;
   mutations?: McpMutationOperations;
   requestId?: string;
   traceId?: string;
@@ -124,12 +155,40 @@ export interface RecatMcpContext {
   log?: McpToolLogger;
 }
 
+/** A Recat mirror refresh reads QBO and writes only Recat's local mirror. */
+export interface CompanySyncOperations {
+  syncCompany(companyId: string, kind: 'manual'): Promise<{
+    ok: boolean;
+    message: string;
+    mirror?: {
+      created: number;
+      refreshed: number;
+      stale: number;
+      busy: number;
+      contended: number;
+    };
+  }>;
+  refreshTransaction(
+    companyId: string,
+    transactionId: string,
+  ): Promise<MirroredTransactionRefreshResult>;
+}
+
+
+const ACTIONABILITY_CURSOR_MAX = 128;
 const ID_MAX = 128;
 const CURSOR_MAX = 2_048;
 const SEARCH_MAX = 200;
 const ACCOUNT_MAX = 120;
 const annotations: ToolAnnotations = Object.freeze({
   readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+const syncAnnotations: ToolAnnotations = Object.freeze({
+  readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: true,
   openWorldHint: false,
@@ -166,6 +225,14 @@ const listTransactionsInput = z.strictObject({
     'ERROR',
     'SUPERSEDED',
     'REVERTED',
+  ]).optional(),
+  providerDisposition: z.enum([
+    'UNKNOWN',
+    'WRITABLE',
+    'BLOCKED_CLEARED',
+    'BLOCKED_RECONCILED',
+    'BLOCKED_PERIOD_CLOSED',
+    'UNAVAILABLE',
   ]).optional(),
   search: z.string().max(SEARCH_MAX).optional(),
   account: z.string().max(ACCOUNT_MAX).optional(),
@@ -260,6 +327,28 @@ const transaction = z.strictObject({
     operation: z.enum(['recategorize', 'restore']),
     status: z.enum(['PREPARED', 'COMMITTING', 'UNCERTAIN']),
   }).nullable(),
+  providerActionability: z.strictObject({
+    disposition: z.enum([
+      'UNKNOWN',
+      'WRITABLE',
+      'BLOCKED_CLEARED',
+      'BLOCKED_RECONCILED',
+      'BLOCKED_PERIOD_CLOSED',
+      'UNAVAILABLE',
+    ]),
+    checkedAt: nullableIsoDate,
+    revision: z.number().int().nonnegative(),
+    qboSyncToken: text,
+    qboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+    qboId: text,
+    txnDate: isoDate,
+    bankAccountQboId: nullableText,
+    bookCloseDate: nullableIsoDate,
+    cleared: z.boolean().nullable(),
+    reconciled: z.boolean().nullable(),
+    unavailableCode: nullableText,
+    unavailableReason: nullableText,
+  }).nullable().optional(),
   transferCandidateId: id.nullable().optional(),
 });
 const transactionRead = transaction.extend({
@@ -280,6 +369,7 @@ const company = z.strictObject({
   holdingAccountIds: z.array(text).max(MAX_READ_LIMIT),
   dryRun: z.boolean(),
   tagsRequired: z.boolean(),
+  retainAttachmentFiles: z.boolean(),
   connectedAt: isoDate,
   disconnectedAt: nullableIsoDate,
   lastSyncedAt: nullableIsoDate,
@@ -341,6 +431,9 @@ const transactionPageOutput = z.strictObject({
   items: z.array(transactionRead).max(MAX_READ_LIMIT),
   nextCursor: z.string().max(CURSOR_MAX).nullable(),
   pendingCount: z.number().int().nonnegative(),
+  actionableCount: z.number().int().nonnegative().optional(),
+  blockedCount: z.number().int().nonnegative().optional(),
+  unknownCount: z.number().int().nonnegative().optional(),
 });
 const taxPageOutput = z.strictObject({
   status: z.enum(['unsupported', 'needs_setup', 'ready']),
@@ -351,6 +444,87 @@ const taxPageOutput = z.strictObject({
   nextCursor: z.string().max(CURSOR_MAX).nullable(),
 });
 const transactionOutput = z.strictObject({ transaction: transactionRead });
+const writeSafetyOutput = z.strictObject({
+  writeSafety: z.strictObject({
+    transactionId: id,
+    revision: z.number().int().nonnegative(),
+    qboId: text,
+    qboType: z.enum(['Purchase', 'Deposit']),
+    qboSyncToken: text,
+    txnDate: z.iso.date(),
+    bankAccountQboId: text,
+    bookCloseDate: z.iso.date().nullable(),
+    cleared: z.boolean(),
+    reconciled: z.boolean(),
+    writable: z.boolean(),
+    blockCode: z.enum([
+      'QBO_PERIOD_CLOSED',
+      'QBO_TRANSACTION_LOCKED',
+    ]).nullable(),
+  }),
+});
+const actionabilityRefreshInput = z.strictObject({
+  companyId: id,
+  cursor: z.string().min(1).max(ACTIONABILITY_CURSOR_MAX).nullable().optional(),
+  limit: z.number().int().min(1).max(MAX_ACTIONABILITY_REFRESH_LIMIT)
+    .default(DEFAULT_ACTIONABILITY_REFRESH_LIMIT).optional(),
+});
+const syncCompanyInput = z.strictObject({ companyId: id });
+const refreshTransactionMirrorInput = z.strictObject({
+  companyId: id,
+  transactionId: id,
+});
+const syncCompanyOutput = z.strictObject({
+  sync: z.strictObject({
+    companyId: id,
+    ok: z.boolean(),
+    message: text,
+    mirror: z.strictObject({
+      created: z.number().int().nonnegative(),
+      refreshed: z.number().int().nonnegative(),
+      stale: z.number().int().nonnegative(),
+      busy: z.number().int().nonnegative(),
+      contended: z.number().int().nonnegative(),
+    }).optional(),
+  }),
+});
+const refreshTransactionMirrorOutput = z.strictObject({
+  refresh: z.strictObject({
+    transactionId: id,
+    outcome: z.enum([
+      'refreshed',
+      'stale',
+      'busy',
+      'contended',
+      'not_found',
+      'missing_in_qbo',
+      'not_in_holding',
+    ]),
+  }),
+});
+const actionabilityRefreshOutput = z.strictObject({
+  refresh: z.strictObject({
+    companyId: id,
+    processed: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+    persisted: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+    failed: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+    nextCursor: z.string().max(ACTIONABILITY_CURSOR_MAX).nullable(),
+    partial: z.boolean(),
+    complete: z.boolean(),
+    items: z.array(z.strictObject({
+      transactionId: id,
+      persisted: z.boolean(),
+      disposition: z.enum([
+        'WRITABLE',
+        'BLOCKED_CLEARED',
+        'BLOCKED_RECONCILED',
+        'BLOCKED_PERIOD_CLOSED',
+        'UNAVAILABLE',
+      ]),
+      errorCode: nullableText,
+    })).max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+  }),
+});
 const identityOutput = z.strictObject({
   identity: z.strictObject({
     userId: id,
@@ -377,6 +551,9 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [listCompaniesInput, companyListOutput],
   [listTransactionsInput, transactionPageOutput],
   [getTransactionInput, transactionOutput],
+  [getTransactionInput, writeSafetyOutput],
+  [syncCompanyInput, syncCompanyOutput],
+  [actionabilityRefreshInput, actionabilityRefreshOutput],
   [companyPageInput, categoryListOutput],
   [companyPageInput, taxPageOutput],
   [companyPageInput, tagListOutput],
@@ -404,6 +581,14 @@ function inputWithoutCompany<T extends { companyId: string }>(
 
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
+  const safetyReads = context.writeSafetyReads ?? writeSafetyReads;
+  const sync = context.sync ?? {
+    syncCompany,
+    refreshTransaction: refreshMirroredTransaction,
+  } satisfies CompanySyncOperations;
+  const actionabilityRefresh = context.actionabilityRefresh ?? {
+    refreshProviderActionability,
+  } satisfies ProviderActionabilityRefreshOperations;
   const mutations = context.mutations ?? mcpMutationOperations;
   const requestId = context.requestId ?? randomUUID();
   const traceContext = context.traceContext ?? (
@@ -502,6 +687,18 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
       },
     };
   });
+  const assertCanRefresh = (companyId: string): void => {
+    const membership = context.principal.memberships.find(
+      (candidate) => candidate.companyId === companyId,
+    );
+    if (
+      !context.principal.isInstanceAdmin
+      && membership?.role !== 'admin'
+      && membership?.role !== 'categorizer'
+    ) {
+      throw new HttpError(403, 'Company categorizer access is required.', 'FORBIDDEN');
+    }
+  };
   register('list_companies', 'List companies visible to the authenticated user.', listCompaniesInput, companyListOutput,
     (input) => reads.listCompanies(context.principal.userId, input));
   register('list_transactions', 'List bounded transactions for a company.', listTransactionsInput, transactionPageOutput,
@@ -518,6 +715,59 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
         input.transactionId,
       ),
     }));
+  register(
+    'get_write_safety',
+    'Read current QuickBooks book-close, cleared, and reconciled safety and update Recat’s local observation. This never modifies QuickBooks transactions. Provider rate limits include a bounded retry hint.',
+    getTransactionInput,
+    writeSafetyOutput,
+    async (input) => {
+      assertCanRefresh(input.companyId);
+      return { writeSafety: await safetyReads.getWriteSafety(
+        context.principal.userId,
+        input.companyId,
+        input.transactionId,
+      ) };
+    },
+    syncAnnotations,
+  );
+  register(
+    'sync_company',
+    'Refresh one company\'s Recat mirror from QuickBooks. This reads QuickBooks and updates only Recat\'s local mirror; it never writes QuickBooks.',
+    syncCompanyInput,
+    syncCompanyOutput,
+    async (input) => {
+      assertCanRefresh(input.companyId);
+      const result = await sync.syncCompany(input.companyId, 'manual');
+      return { sync: { companyId: input.companyId, ...result } };
+    },
+    syncAnnotations,
+  );
+  register(
+    'refresh_transaction_mirror',
+    'Refresh one existing Recat transaction from QuickBooks without a company-wide sweep. This updates only Recat’s local source mirror; it never writes QuickBooks.',
+    refreshTransactionMirrorInput,
+    refreshTransactionMirrorOutput,
+    async (input) => {
+      assertCanRefresh(input.companyId);
+      return { refresh: await sync.refreshTransaction(input.companyId, input.transactionId) };
+    },
+    syncAnnotations,
+  );
+  register(
+    'refresh_provider_actionability',
+    'Read and persist one bounded page of current QuickBooks write-safety observations. Resume with nextCursor; this never mutates QuickBooks.',
+    actionabilityRefreshInput,
+    actionabilityRefreshOutput,
+    async (input) => {
+      assertCanRefresh(input.companyId);
+      return { refresh: await actionabilityRefresh.refreshProviderActionability(
+        context.principal.userId,
+        input.companyId,
+        { cursor: input.cursor ?? null, limit: input.limit },
+      ) };
+    },
+    syncAnnotations,
+  );
   register('list_categories', 'List active category accounts.', companyPageInput, categoryListOutput,
     (input) => reads.listCategories(context.principal.userId, input.companyId, inputWithoutCompany(input)));
   register('list_tax_codes', 'List eligible tax codes and readiness.', companyPageInput, taxPageOutput,
