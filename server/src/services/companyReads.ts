@@ -1,7 +1,11 @@
+import { categorizationSourceGrossCents } from './tax/sourceGross.js';
+import { CategorizationError } from './categorizationError.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import type {
   CompanyDto,
+  ProviderActionabilityDisposition,
+  ProviderActionabilityDto,
   QboAccountDto,
   Role,
   RuleDto,
@@ -20,6 +24,13 @@ import { prisma } from '../lib/prisma.js';
 import { suggestForMany as defaultSuggestForMany } from './suggestions.js';
 import { getTaxReadiness as defaultGetTaxReadiness } from './tax/reference.js';
 import { transferCandidates as defaultTransferCandidates } from './transferCandidates.js';
+import {
+  PROVIDER_ACTIONABILITY_DISPOSITIONS,
+  actionabilityObservationFromRow,
+  effectiveProviderActionabilityCounts,
+  effectiveProviderDisposition,
+  providerActionabilityDto,
+} from './providerActionability.js';
 
 export const DEFAULT_READ_LIMIT = 20;
 export const MAX_READ_LIMIT = 100;
@@ -29,6 +40,7 @@ const MAX_ACCOUNT_LENGTH = 120;
 const MAX_ID_LENGTH = 128;
 const ROLE_RANK: Record<Role, number> = { viewer: 0, categorizer: 1, admin: 2 };
 const VIEWER_HIDDEN_STATUSES = new Set<TxnStatus>(['PENDING', 'POSTING', 'ERROR']);
+const QUEUE_STATUSES = ['PENDING', 'ERROR'] as const;
 const TXN_STATUSES: readonly TxnStatus[] = [
   'PENDING',
   'POSTING',
@@ -46,6 +58,9 @@ export interface CompanyReadDb {
   membership: { findUnique: DbMethod };
   company: { findUnique: DbMethod; findMany: DbMethod };
   transaction: { findUnique: DbMethod; findMany: DbMethod; count: DbMethod };
+  /** Optional only for legacy unit-test adapters. Production applies the
+   * additive migration before starting the application process. */
+  transactionActionability?: { findMany?: DbMethod; count?: DbMethod };
   qboAccount: { findMany: DbMethod };
   qboTaxCode: { findMany: DbMethod };
   tag: { findMany: DbMethod };
@@ -64,6 +79,8 @@ export interface Page<T> {
 
 export interface TransactionListInput extends PageInput {
   status?: TxnStatus;
+  /** Provider disposition filter; omitted means the actionable queue view. */
+  providerDisposition?: ProviderActionabilityDisposition;
   search?: string;
   account?: string;
   startDate?: string;
@@ -85,6 +102,10 @@ export interface CompanyReadTransactionDto extends TransactionDto {
 
 export interface TransactionPage extends Page<CompanyReadTransactionDto> {
   pendingCount: number;
+  /** Counts are additive and only returned when the actionability index exists. */
+  actionableCount?: number;
+  blockedCount?: number;
+  unknownCount?: number;
 }
 
 export interface CompanyReadDto extends CompanyDto {
@@ -327,17 +348,106 @@ function suggestionDto(value: unknown): SuggestionDto | null {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+function hasProviderActionability(db: CompanyReadDb): boolean {
+  return db.transactionActionability !== undefined;
+}
+
+function rowActionabilityIdentity(row: Row) {
+  return {
+    id: String(row.id ?? ''),
+    companyId: String(row.companyId ?? ''),
+    revision: Number(row.revision),
+    qboSyncToken: String(row.qboSyncToken ?? ''),
+    qboType: String(row.qboType ?? ''),
+    qboId: String(row.qboId ?? ''),
+    date: row.date instanceof Date ? row.date : String(row.date ?? ''),
+  };
+}
+
+function rowProviderDisposition(
+  row: Row,
+  supportsActionability: boolean,
+  now = new Date(),
+): ProviderActionabilityDisposition | null {
+  // Legacy test stores may omit the index; production never does because the
+  // container applies migrations before loading application code.
+  if (!supportsActionability) return null;
+  const observation = actionabilityObservationFromRow(row.providerActionability);
+  if (observation === null) return 'UNKNOWN';
+  return effectiveProviderDisposition(observation, rowActionabilityIdentity(row), now);
+}
+
+function rowProviderActionabilityDto(
+  row: Row,
+  supportsActionability: boolean,
+): ProviderActionabilityDto | null | undefined {
+  if (!supportsActionability && !Object.prototype.hasOwnProperty.call(row, 'providerActionability')) {
+    return undefined;
+  }
+  const observation = actionabilityObservationFromRow(row.providerActionability);
+  if (observation === null) return null;
+  const dto = providerActionabilityDto(observation);
+  if (dto === null) return null;
+  // A stale cached WRITABLE row must never look actionable to the client.  The
+  // evidence fields remain useful for diagnostics, while the disposition is
+  // reduced to UNKNOWN until a bounded refresh checks it again.
+  const disposition = effectiveProviderDisposition(
+    observation,
+    rowActionabilityIdentity(row),
+  );
+  return disposition === dto.disposition ? dto : { ...dto, disposition };
+}
+
+function filterRowsForProviderQueue(
+  rows: Row[],
+  dtos: TransactionDto[],
+  supportsActionability: boolean,
+  requested: ProviderActionabilityDisposition | undefined,
+  role: Role,
+): TransactionDto[] {
+  if (!supportsActionability) return dtos;
+  const byId = new Map(rows.map((row) => [String(row.id), row]));
+  return dtos.filter((dto) => {
+    const row = byId.get(dto.id);
+    if (!row) return false;
+    const disposition = rowProviderDisposition(row, true);
+    if (requested !== undefined) return disposition === requested;
+    if (role === 'viewer' || !QUEUE_STATUSES.includes(row.status as (typeof QUEUE_STATUSES)[number])) {
+      return true;
+    }
+    // The interactive queue is the complete pending-work surface. Cached
+    // actionability is advisory metadata; commits still obtain fresh safety.
+    return true;
+  });
+}
+
+function provenSourceGross(row: Row, holdingAccountIds: unknown): number | undefined {
+  try {
+    return categorizationSourceGrossCents({
+      amount: String(row.amount), qboId: String(row.qboId),
+      qboType: String(row.qboType), rawData: row.rawData,
+    }, holdingAccountIds);
+  } catch (error) {
+    if (error instanceof CategorizationError) return undefined;
+    throw error;
+  }
+}
+
 function transactionDto(
   row: Row,
   posterLabel: Map<string, string>,
   liveSuggestion: SuggestionDto | null,
   transferCandidateId: string | null,
+  supportsActionability = false,
+  holdingAccountIds: unknown = [],
 ): TransactionDto {
   const splitLines = Array.isArray(row.splitLines) ? (row.splitLines as Row[]) : [];
   const attempts = Array.isArray(row.qboMutationAttempts) ? (row.qboMutationAttempts as Row[]) : [];
   const attempt = attempts[0];
   const operation = attempt?.operation;
   const attemptStatus = attempt?.status;
+  const actionability = rowProviderActionabilityDto(row, supportsActionability);
+  const providerWritable = !supportsActionability || actionability?.disposition === 'WRITABLE';
   const activeCategorizationAttempt: TransactionDto['activeCategorizationAttempt'] =
     attempt &&
     typeof attempt.requestId === 'string' &&
@@ -350,6 +460,7 @@ function transactionDto(
           status: attemptStatus as 'PREPARED' | 'COMMITTING' | 'UNCERTAIN',
         }
       : null;
+  const sourceGrossCents = provenSourceGross(row, holdingAccountIds);
   const posterId = typeof row.postedByUserId === 'string' ? row.postedByUserId : null;
   return {
     id: String(row.id),
@@ -361,6 +472,7 @@ function transactionDto(
     payee: String(row.payee),
     memo: typeof row.memo === 'string' ? row.memo : null,
     amount: Number(row.amount),
+    ...(sourceGrossCents === undefined ? {} : { sourceGrossCents }),
     bankAccount: String(row.bankAccount),
     status: TXN_STATUSES.includes(row.status as TxnStatus) ? row.status as TxnStatus : 'PENDING',
     revision: Number(row.revision),
@@ -403,7 +515,8 @@ function transactionDto(
     postedAt: nullableIso(row.postedAt),
     postedBy: posterId === null ? null : posterLabel.get(posterId) ?? null,
     activeCategorizationAttempt,
-    transferCandidateId,
+    ...(actionability !== undefined ? { providerActionability: actionability } : {}),
+    transferCandidateId: providerWritable ? transferCandidateId : null,
   };
 }
 
@@ -419,6 +532,7 @@ export const transactionReadInclude = {
     take: 1,
     select: { requestId: true, operation: true, status: true },
   },
+  providerActionability: true,
 } as const satisfies Prisma.TransactionInclude;
 
 export type TransactionReadRow = Prisma.TransactionGetPayload<{
@@ -436,6 +550,7 @@ export const companyReadTransactionInclude = {
     take: 1,
     select: { status: true, verification: true },
   },
+  providerActionability: true,
 } as const satisfies Prisma.TransactionInclude;
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -492,11 +607,17 @@ function transactionHaystack(dto: TransactionDto, fullNameOf: Map<string, string
 
 export function filterTransactionDtos(
   dtos: TransactionDto[],
-  input: Pick<TransactionListInput, 'status' | 'account' | 'search'>,
+  input: Pick<TransactionListInput, 'status' | 'account' | 'search' | 'providerDisposition'>,
   fullNameOf: Map<string, string> = new Map(),
 ): TransactionDto[] {
   let filtered = dtos;
   if (input.status !== undefined) filtered = filtered.filter((dto) => dto.status === input.status);
+  if (input.providerDisposition !== undefined) {
+    filtered = filtered.filter((dto) => {
+      const raw = dto.providerActionability?.disposition ?? 'UNKNOWN';
+      return raw === input.providerDisposition;
+    });
+  }
   if (input.account !== undefined && input.account !== '' && input.account !== 'all') {
     filtered = filtered.filter((dto) => dto.bankAccount === input.account);
   }
@@ -532,11 +653,17 @@ async function transactionDtosWithDeps(
   rows: Row[],
   candidatesIn?: Map<string, string>,
 ): Promise<TransactionDto[]> {
-  const [labels, candidates] = await Promise.all([
+  const [labels, candidates, company] = await Promise.all([
     posterLabels(db, rows),
     candidatesIn ? Promise.resolve(candidatesIn) : deps.transferCandidates(companyId),
+    db.company.findUnique({ where: { id: companyId }, select: { holdingAccountIds: true } }),
   ]);
-  const pendingRows = rows.filter((row) => row.status === 'PENDING');
+  const supportsActionability = hasProviderActionability(db);
+  const pendingRows = rows.filter((row) => {
+    if (row.status !== 'PENDING') return false;
+    const disposition = rowProviderDisposition(row, supportsActionability);
+    return disposition === null || disposition === 'WRITABLE';
+  });
   const liveSuggestions = await deps.suggestForMany(
     companyId,
     pendingRows.map((row) => ({
@@ -553,6 +680,8 @@ async function transactionDtosWithDeps(
     labels,
     liveById.get(String(row.id)) ?? null,
     candidates.get(String(row.id)) ?? null,
+    supportsActionability,
+    (company as Row | null)?.holdingAccountIds,
   ));
 }
 
@@ -833,12 +962,25 @@ export function createCompanyReadService(
     Omit<TransactionListInput, 'limit'> {
     const limit = readLimit(input.limit);
     if (input.status !== undefined && !TXN_STATUSES.includes(input.status)) badRequest('Invalid transaction status');
+    if (
+      input.providerDisposition !== undefined
+      && !PROVIDER_ACTIONABILITY_DISPOSITIONS.includes(input.providerDisposition)
+    ) badRequest('Invalid provider disposition');
     const search = optionalString(input.search, 'search', MAX_SEARCH_LENGTH);
     const account = optionalString(input.account, 'account', MAX_ACCOUNT_LENGTH);
     const startDate = strictDate(input.startDate, 'startDate');
     const endDate = strictDate(input.endDate, 'endDate');
     if (startDate && endDate && startDate > endDate) badRequest('startDate must not be after endDate');
-    return { limit, cursor: input.cursor, status: input.status, search, account, startDate, endDate };
+    return {
+      limit,
+      cursor: input.cursor,
+      status: input.status,
+      providerDisposition: input.providerDisposition,
+      search,
+      account,
+      startDate,
+      endDate,
+    };
   }
 
   async function listTransactionsForUser(
@@ -850,6 +992,7 @@ export function createCompanyReadService(
     const normalized = normalizedTransactionInput(input);
     const filter = canonicalFilter({
       status: normalized.status,
+      providerDisposition: normalized.providerDisposition,
       search: normalized.search,
       account: normalized.account,
       startDate: normalized.startDate,
@@ -886,8 +1029,10 @@ export function createCompanyReadService(
       const after = [{ date: { gt: cursorDate } }, { date: cursorDate, id: { gt: cursorId } }];
       where.OR = after;
     }
-    const scanLimit = normalized.search ? MAX_READ_LIMIT : normalized.limit;
-    const [rawRows, pendingCount] = await Promise.all([
+    const supportsActionability = hasProviderActionability(db);
+    // Match the TTL- and identity-aware disposition used by DTOs and counts.
+    const scanLimit = supportsActionability || normalized.search ? MAX_READ_LIMIT : normalized.limit;
+    const [rawRows, queueCounts] = await Promise.all([
       db.transaction.findMany({
         where,
         include: companyReadTransactionInclude,
@@ -895,8 +1040,35 @@ export function createCompanyReadService(
         take: scanLimit,
       }) as Promise<Row[]>,
       role === 'viewer'
-        ? Promise.resolve(0)
-        : db.transaction.count({ where: { companyId, status: { in: ['PENDING', 'ERROR'] } } }) as Promise<number>,
+        ? Promise.resolve({ total: 0, actionable: 0, blocked: 0, unknown: 0 })
+        : (async () => {
+            const totalWhere = { companyId, status: { in: QUEUE_STATUSES } };
+            if (!supportsActionability) {
+              return {
+                total: await db.transaction.count({ where: totalWhere }) as number,
+                actionable: 0,
+                blocked: 0,
+                unknown: 0,
+              };
+            }
+            const actionabilityRows = await db.transaction.findMany({
+              where: totalWhere,
+              select: {
+                id: true,
+                companyId: true,
+                revision: true,
+                qboSyncToken: true,
+                qboType: true,
+                qboId: true,
+                date: true,
+                providerActionability: true,
+              },
+            }) as Row[];
+            return effectiveProviderActionabilityCounts(actionabilityRows.map((row) => ({
+              ...rowActionabilityIdentity(row),
+              providerActionability: row.providerActionability,
+            })));
+          })(),
     ]);
     const visibleRows = rawRows.filter((row) =>
       row.status !== 'SUPERSEDED' &&
@@ -921,6 +1093,13 @@ export function createCompanyReadService(
     } else {
       dtos = filterTransactionDtos(dtos, normalized);
     }
+    dtos = filterRowsForProviderQueue(
+      visibleRows,
+      dtos,
+      supportsActionability,
+      normalized.providerDisposition,
+      role,
+    );
     const hasMoreMatches = dtos.length > normalized.limit;
     const items = hasMoreMatches ? dtos.slice(0, normalized.limit) : dtos;
     const enrichedItems = await enrichTransactionReads(visibleRows, items);
@@ -954,7 +1133,14 @@ export function createCompanyReadService(
       nextCursor: cursorPosition
         ? encodeCursor(cursorSecret, { v: 1, ...expected, position: cursorPosition })
         : null,
-      pendingCount: Number(pendingCount),
+      pendingCount: Number(queueCounts.total),
+      ...(supportsActionability
+        ? {
+            actionableCount: Number(queueCounts.actionable),
+            blockedCount: Number(queueCounts.blocked),
+            unknownCount: Number(queueCounts.unknown),
+          }
+        : {}),
     };
   }
 

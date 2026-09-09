@@ -83,6 +83,7 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         legalName: 'Categorization PostgreSQL Test',
         nickname: `pg-${suffix.slice(0, 8)}`,
         dryRun: false,
+        holdingAccountIds: ['holding'],
       },
     });
     const account = await stageClient.qboAccount.create({
@@ -104,6 +105,15 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         payee: 'PostgreSQL lease fixture',
         amount: '-10.50',
         bankAccount: 'Test bank',
+        rawData: {
+          Id: `purchase-${suffix}`, SyncToken: '0', TotalAmt: 10.5,
+          TxnDate: '2026-07-28', AccountRef: { value: 'payment-generic' },
+          GlobalTaxCalculation: 'NotApplicable',
+          Line: [{
+            Id: '1', Amount: 10.5, DetailType: 'AccountBasedExpenseLineDetail',
+            AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding' } },
+          }],
+        },
       },
     });
     return {
@@ -188,6 +198,83 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     };
   }
 
+  async function seedPreserveCurrentPurchase(): Promise<Fixture> {
+    const fixture = await seed();
+    const target = await stageClient.qboAccount.create({
+      data: {
+        companyId: fixture.companyId,
+        qboId: '42',
+        name: 'Bank Charges',
+        fullName: 'Expenses · Bank Charges',
+        classification: 'Expenses',
+      },
+    });
+    await stageClient.transaction.update({
+      where: { id: fixture.transactionId },
+      data: {
+        amount: '-43.20',
+        category: 'Uncategorized Expense',
+        categoryQboId: '2',
+        taxCalculation: 'NotApplicable',
+        taxCode: 'Non-taxable',
+        taxCodeQboId: 'NON',
+        rawData: {
+          Id: fixture.key.qboId,
+          SyncToken: '0',
+          TotalAmt: 43.20,
+          GlobalTaxCalculation: 'NotApplicable',
+          Line: [{
+            Id: '1',
+            Amount: 43.20,
+            DetailType: 'AccountBasedExpenseLineDetail',
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: '2' },
+              TaxCodeRef: { value: 'NON' },
+            },
+          }],
+        },
+      },
+    });
+    await Promise.all([
+      stageClient.qboAccount.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: '2',
+          name: 'Uncategorized Expense',
+          fullName: 'Expenses · Uncategorized Expense',
+          classification: 'Expenses',
+        },
+      }),
+      stageClient.qboTaxCode.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: 'NON',
+          name: 'Non-taxable',
+          taxable: false,
+          purchaseTaxRateList: [],
+          salesTaxRateList: [],
+        },
+      }),
+    ]);
+    return {
+      ...fixture,
+      input: {
+        ...fixture.input,
+        proposal: {
+          taxDisposition: 'preserve_current',
+          taxCalculation: 'NotApplicable',
+          lines: [{
+            grossCents: -4_320,
+            categoryQboId: target.qboId,
+            taxCodeQboId: 'NON',
+            tagIds: [],
+          }],
+          tagIds: [],
+        },
+      },
+    };
+  }
+
   async function cleanup(fixture: Fixture): Promise<void> {
     await stageClient.qboEntityLease.deleteMany({
       where: fixture.key,
@@ -236,6 +323,80 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         revision: 1,
         totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
         lines: [{ subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 }],
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it('persists an exact preserve-current Purchase intent from synchronized QBO references', async () => {
+    const fixture = await seedPreserveCurrentPurchase();
+
+    try {
+      await expect(
+        stageCategorization(fixture.input, realStageDeps(stageClient)),
+      ).resolves.toMatchObject({
+        transactionId: fixture.transactionId,
+        revision: 1,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        totals: { subtotalCents: -4_320, taxCents: 0, totalCents: -4_320 },
+        lines: [{
+          categoryQboId: '42',
+          taxCodeQboId: 'NON',
+          totalCents: -4_320,
+        }],
+      });
+      await expect(stageClient.transaction.findUniqueOrThrow({
+        where: { id: fixture.transactionId },
+        select: {
+          taxCalculation: true,
+          taxCodeQboId: true,
+          splitLines: {
+            select: { categoryQboId: true, taxCodeQboId: true },
+          },
+        },
+      })).resolves.toEqual({
+        taxCalculation: 'NotApplicable',
+        taxCodeQboId: 'NON',
+        splitLines: [{ categoryQboId: '42', taxCodeQboId: 'NON' }],
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it('persists synchronized NON when QBO tax-code inventory omits the sentinel', async () => {
+    const fixture = await seedPreserveCurrentPurchase();
+    await stageClient.qboTaxCode.deleteMany({
+      where: { companyId: fixture.companyId, qboId: 'NON' },
+    });
+
+    try {
+      await expect(
+        stageCategorization(fixture.input, realStageDeps(stageClient)),
+      ).resolves.toMatchObject({
+        transactionId: fixture.transactionId,
+        revision: 1,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        lines: [{
+          categoryQboId: '42',
+          taxCodeQboId: 'NON',
+          totalCents: -4_320,
+        }],
+      });
+      await expect(stageClient.transaction.findUniqueOrThrow({
+        where: { id: fixture.transactionId },
+        select: {
+          taxCode: true,
+          taxCodeQboId: true,
+          splitLines: { select: { taxCode: true, taxCodeQboId: true } },
+        },
+      })).resolves.toEqual({
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        splitLines: [{ taxCode: 'NON', taxCodeQboId: 'NON' }],
       });
     } finally {
       await cleanup(fixture);

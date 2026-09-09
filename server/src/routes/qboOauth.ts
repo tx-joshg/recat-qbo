@@ -221,6 +221,7 @@ qboOauthRouter.get(
           data: {
             ...tokenData,
             disconnectedAt: null,
+            qboTokenRevocations: { deleteMany: {} },
             legalName: inspected.info.legalName,
             ...(choice.mode === 'demo' && existing.disconnectedAt !== null
               ? { connectedAt: new Date() }

@@ -1,8 +1,11 @@
+import ProviderStatusRefresh from '../components/ProviderStatusRefresh';
 // Queue — the categorization screen. Faithful port of Recat.dc.html
 // lines 229–409 (markup) and the interaction logic in visible()/renderVals()/
 // onKey()/post()/openSplit()/xferMate()/recordTransfer()/undoPost()/cycleSort().
 // All filtering, sorting and row-state transitions happen client-side on the
 // locally-held transaction list, exactly like the prototype.
+
+import { createRowStageCoordinator, sameDesired, type DesiredStage, type RowStageView } from './queue/rowStageCoordinator';
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
@@ -14,7 +17,6 @@ import {
   type CategorizationMutationResult,
   type SplitDto,
   type StageCategorizationBody,
-  type StagedCategorization,
   type TaxCalculation,
   type TransactionDto,
   type TxnStatus,
@@ -25,12 +27,13 @@ import {
   companies as companiesApi,
   createCategorizationRequestId,
   rules as rulesApi,
+  reports as reportsApi,
   transactions as txnApi,
 } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import CategoryPicker from '../components/CategoryPicker';
-import type { CategoryOption } from '../components/CategoryPicker';
+import { Select } from '../components/SelectCombobox';
 import TagPicker from '../components/TagPicker';
 import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
@@ -72,6 +75,20 @@ const STATUS_WORDS: Record<UiState, string> = {
 
 type SortKey = 'date' | 'payee' | 'amt' | 'acct' | 'cat' | 'status';
 
+type CompanySyncLock = {
+  request: Promise<unknown>;
+  listeners: Set<() => void>;
+};
+
+const companySyncLocks = new Map<string, CompanySyncLock>();
+
+function releaseCompanySyncLock(companyId: string, request: Promise<unknown>) {
+  const lock = companySyncLocks.get(companyId);
+  if (!lock || lock.request !== request) return;
+  companySyncLocks.delete(companyId);
+  for (const listener of lock.listeners) listener();
+}
+
 const SORT_KEYS: SortKey[] = ['date', 'payee', 'amt', 'acct', 'cat', 'status'];
 const SORT_LABELS: Record<SortKey, string> = {
   date: 'Date',
@@ -85,10 +102,13 @@ const SORT_LABELS: Record<SortKey, string> = {
 // The date track holds fmtDate's widest output. That is 'May 28, 2024' (~90px at
 // --rfs 14.5) now that fmtDate appends the year outside the current year — 80px
 // fit the year-less form only and wrapped these onto a second line.
-const GRID_COLS = '38px 96px minmax(180px,1fr) 104px 118px minmax(200px,240px) 110px';
+const GRID_COLS = '38px 96px minmax(180px,1fr) 104px 118px minmax(200px,240px) minmax(270px, 290px)';
+
+// Column minima, six gaps, and horizontal row padding.
+const GRID_MIN_WIDTH = 38 + 96 + 180 + 104 + 118 + 200 + 270 + 6 * 12 + 2 * 18;
 
 const SHORTCUT_TIP =
-  '↑↓ or j/k — move between rows · x — select · c — open category picker · t — open tags · Enter — post the active row. Inside a picker: ↑↓ navigate, Enter select, Esc close.';
+  '↑↓ or j/k — move between rows · x — select · t — open tags · Enter — post the active row.';
 
 /** '4 min ago' / 'just now' style relative timestamp. */
 function relTime(iso: string | null | undefined): string {
@@ -142,12 +162,7 @@ interface TaxMutationState {
 interface TaxRowState {
   taxCalculation: TaxCalculation;
   taxCodeQboId: string | null;
-  staged: StagedCategorization | null;
-  staging: boolean;
-  stagingRequestId: number | null;
-  reloadRequired: boolean;
-  version: number;
-  stagedVersion: number | null;
+  stage: RowStageView;
   mutation: TaxMutationState | null;
 }
 
@@ -168,12 +183,7 @@ function initialTaxState(t: TransactionDto): TaxRowState {
           ? 'TaxExcluded'
           : 'TaxInclusive',
     taxCodeQboId,
-    staged: null,
-    staging: false,
-    stagingRequestId: null,
-    reloadRequired: false,
-    version: 0,
-    stagedVersion: null,
+    stage: { status: 'idle', desired: null, staged: null, result: null, error: null },
     mutation: t.activeCategorizationAttempt === null
       ? null
       : {
@@ -222,16 +232,15 @@ export default function Queue() {
   // ---- local state (mirrors the prototype's single component state) ----
   const [rows, setRows] = useState<TransactionDto[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [bankAccounts, setBankAccounts] = useState<string[]>([]);
   const [search, setSearch] = useState('');
   const [acct, setAcct] = useState('all');
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [activeIdx, setActiveIdx] = useState(0);
   const [sel, setSel] = useState<Record<string, boolean>>({});
-  const [picker, setPicker] = useState<string | null>(null); // txn id | 'bulk' | null
-  const [pickQ, setPickQ] = useState('');
-  const [pickIdx, setPickIdx] = useState(0);
   const [tagPicker, setTagPicker] = useState<string | null>(null);
+  const tagPickerRootRef = useRef<HTMLSpanElement>(null);
   const [errOpenId, setErrOpenId] = useState<string | null>(null);
   const [rulePrompt, setRulePrompt] = useState<RulePromptState | null>(null);
   const [splitEditId, setSplitEditId] = useState<string | null>(null);
@@ -239,9 +248,10 @@ export default function Queue() {
   const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
   const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({});
   const [taxRows, setTaxRows] = useState<Record<string, TaxRowState>>({});
-  const taxVersionsRef = useRef<Record<string, number>>({});
-  const stageRequestSequenceRef = useRef(0);
-  const stageRequestTokensRef = useRef<Record<string, number>>({});
+  const stageCoordinatorsRef = useRef<Record<string, ReturnType<typeof createRowStageCoordinator>>>({});
+  const [syncingCompanyId, setSyncingCompanyId] = useState<string | null>(
+    () => activeCompanyId && companySyncLocks.has(activeCompanyId) ? activeCompanyId : null,
+  );
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia('(max-width: 640px)').matches,
   );
@@ -250,6 +260,24 @@ export default function Queue() {
   useEffect(() => {
     setAttachmentOpenId(null);
     setAttachmentCounts({});
+  }, [activeCompanyId]);
+
+  useEffect(() => {
+    if (!activeCompanyId) {
+      setSyncingCompanyId(null);
+      return;
+    }
+    const lock = companySyncLocks.get(activeCompanyId);
+    setSyncingCompanyId(lock ? activeCompanyId : null);
+    if (!lock) return;
+
+    const notify = () => {
+      setSyncingCompanyId(companySyncLocks.has(activeCompanyId) ? activeCompanyId : null);
+    };
+    lock.listeners.add(notify);
+    return () => {
+      lock.listeners.delete(notify);
+    };
   }, [activeCompanyId]);
 
   const taxState = useCallback(
@@ -281,21 +309,6 @@ export default function Queue() {
       );
     },
     [taxState],
-  );
-
-  const invalidateTaxStage = useCallback(
-    (t: TransactionDto, patch: Partial<Pick<TaxRowState, 'taxCalculation' | 'taxCodeQboId'>> = {}) => {
-      const nextVersion = (taxVersionsRef.current[t.id] ?? 0) + 1;
-      taxVersionsRef.current[t.id] = nextVersion;
-      updateTaxState(t, (current) => ({
-        ...current,
-        ...patch,
-        staged: null,
-        stagedVersion: null,
-        version: nextVersion,
-      }));
-    },
-    [updateTaxState],
   );
 
   const aliveRef = useRef(true);
@@ -351,6 +364,31 @@ export default function Queue() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompanyId]);
+
+  useEffect(() => {
+    setAcct('all');
+    setBankAccounts([]);
+    if (!activeCompanyId) return;
+    const companyId = activeCompanyId;
+    let cancelled = false;
+    reportsApi.bankAccounts(companyId)
+      .then((names) => {
+        if (!cancelled && activeCompanyIdRef.current === companyId) setBankAccounts(names);
+      })
+      .catch((error) => { if (!cancelled) toast(errText(error)); });
+    return () => { cancelled = true; };
+  }, [activeCompanyId, toast]);
+  const reloadProviderStatuses = useCallback(async (companyId: string) => {
+    const fresh = await fetchAllTxns(companyId);
+    if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+    setRows(previous => {
+      const byId = new Map(previous.map(row => [row.id, row]));
+      return fresh.map(row => {
+        const local = byId.get(row.id);
+        return local && local.revision > row.revision ? local : row;
+      });
+    });
+  }, [fetchAllTxns]);
 
   // ---- pending badge: recompute locally (pending = PENDING + ERROR rows) ----
   useEffect(() => {
@@ -512,7 +550,10 @@ export default function Queue() {
     minimumFractionDigits: 2,
   })} waiting · last synced ${relTime(activeCompany?.lastSyncedAt)}`;
 
-  const bankOpts = useMemo(() => [...new Set(rows.map((t) => t.bankAccount))], [rows]);
+  const bankOpts = useMemo(
+    () => [...new Set([...bankAccounts, ...rows.map((t) => t.bankAccount)])],
+    [bankAccounts, rows],
+  );
 
   // ---- selection ----
   const selIds = useMemo(() => Object.keys(sel).filter((k) => sel[k]), [sel]);
@@ -537,115 +578,36 @@ export default function Queue() {
     [selPend, rows, tagsRequired, taxReadyFor],
   );
 
-  // ---- picker options (suggested pinned first) ----
-  const filteredOpts = useMemo(() => {
-    const q = pickQ.toLowerCase();
-    let opts = catAccounts.filter(
-      (a) => !q || a.name.toLowerCase().includes(q) || a.classification.toLowerCase().includes(q),
-    );
-    if (picker !== null && picker !== 'bulk') {
-      const t = rows.find((x) => x.id === picker);
-      const sg = t?.suggestion?.category;
-      if (sg) opts = [...opts.filter((a) => a.name === sg), ...opts.filter((a) => a.name !== sg)];
-    }
-    return opts;
-  }, [pickQ, picker, rows, catAccounts]);
-
-  const pickOpts = useMemo<CategoryOption[]>(() => {
-    const t = picker !== null && picker !== 'bulk' ? rows.find((x) => x.id === picker) : undefined;
-    const sg = t?.suggestion?.category;
-    return filteredOpts.slice(0, 40).map((a) => ({
-      group: a.classification,
-      name: a.name,
-      sug: !!(t && sg === a.name),
-    }));
-  }, [filteredOpts, picker, rows]);
-
-  const closePicker = useCallback(() => {
-    setPicker(null);
-    setPickQ('');
-    setPickIdx(0);
-  }, []);
-
   // ---- actions ----
 
-  const openPicker = useCallback((id: string) => {
-    setPicker(id);
-    setPickQ('');
-    setPickIdx(0);
+  const openSplit = useCallback(() => {
+    // Draft seeding lives in <SplitEditor/> (mounts fresh).
+    setTagPicker(null);
   }, []);
 
-  const openSplit = useCallback(() => {
-    // draft seeding lives in <SplitEditor/> (mounts fresh); mirror the rest of
-    // the prototype's openSplit(): close pickers, reset query.
-    setPicker(null);
-    setTagPicker(null);
-    setPickQ('');
-    setPickIdx(0);
-  }, []);
+  useEffect(() => {
+    if (tagPicker === null) return;
+    const dismissTagPicker = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Node && tagPickerRootRef.current?.contains(target)) return;
+      setTagPicker(null);
+    };
+    document.addEventListener('mousedown', dismissTagPicker);
+    return () => document.removeEventListener('mousedown', dismissTagPicker);
+  }, [tagPicker]);
 
   const doOpenSplit = useCallback(
     (id: string) => {
       const row = rows.find((candidate) => candidate.id === id);
-      if (!row || hasActiveMutation(row)) return;
+      if (!row || row.status !== 'PENDING' || hasActiveMutation(row)) return;
       openSplit();
       setSplitEditId(id);
     },
     [rows, hasActiveMutation, openSplit],
   );
 
-  /** Assign a category: server merges matching rule tags — use the returned dto. */
-  const categorizeTo = useCallback(
-    (t: TransactionDto, name: string) => {
-      if (hasActiveMutation(t)) return;
-      const prev = { category: t.category, categoryQboId: t.categoryQboId };
-      const categoryQboId = qboIdOf(name);
-      patchRow(t.id, { category: name, categoryQboId }); // optimistic
-      if (taxReadyFor(t)) {
-        invalidateTaxStage(t);
-        return;
-      }
-      txnApi
-        .categorize(t.id, { category: name, categoryQboId, tagIds: t.tagIds })
-        .then((dto) => {
-          if (aliveRef.current) updateRow(dto);
-        })
-        .catch((e) => {
-          if (aliveRef.current) patchRow(t.id, prev); // roll back the optimistic patch
-          toast(errText(e));
-        });
-    },
-    [
-      hasActiveMutation,
-      qboIdOf,
-      patchRow,
-      taxReadyFor,
-      invalidateTaxStage,
-      updateRow,
-      toast,
-    ],
-  );
-
-  const pickChoose = useCallback(
-    (name: string) => {
-      const target = picker;
-      closePicker();
-      if (target === 'bulk') {
-        setBulkCat(name);
-        for (const id of selPend) {
-          const t = rows.find((r) => r.id === id);
-          if (t) categorizeTo(t, name);
-        }
-      } else if (target !== null) {
-        const t = rows.find((r) => r.id === target);
-        if (t) categorizeTo(t, name);
-      }
-    },
-    [picker, closePicker, selPend, rows, categorizeTo],
-  );
-
   const stageBodyFor = useCallback(
-    (t: TransactionDto, state: TaxRowState): StageCategorizationBody | null => {
+    (t: TransactionDto, state: TaxRowState): DesiredStage | null => {
       const taxCalculation: TaxCalculation =
         t.splits && t.splits.length > 0
           ? state.taxCalculation
@@ -663,7 +625,7 @@ export default function Queue() {
             tagIds: split.tagIds,
           }))
         : [{
-            amount: t.amount,
+            amount: t.sourceGrossCents === undefined ? t.amount : t.sourceGrossCents / 100,
             categoryQboId: t.categoryQboId ?? (t.category ? qboIdOf(t.category) : null),
             taxCodeQboId: state.taxCodeQboId,
             memo: undefined,
@@ -687,7 +649,6 @@ export default function Queue() {
         });
       }
       return {
-        expectedRevision: t.revision,
         taxCalculation,
         lines,
         tagIds: [...t.tagIds],
@@ -696,115 +657,173 @@ export default function Queue() {
     [qboIdOf, isTaxCodeUsableFor],
   );
 
-  const stageTax = useCallback(
-    (t: TransactionDto) => {
+  const readyStageFor = useCallback((t: TransactionDto, state: TaxRowState) => {
+    const desired = stageBodyFor(t, state);
+    if (hasActiveMutation(t) || desired === null || state.stage.status !== 'ready' ||
+      state.stage.staged === null || state.stage.staged !== state.stage.desired ||
+      !sameDesired(state.stage.staged, desired)) return null;
+    return state.stage.result;
+  }, [hasActiveMutation, stageBodyFor]);
+
+  const requestStage = useCallback(
+    (t: TransactionDto, state: TaxRowState) => {
+      if (t.status !== 'PENDING' || state.stage.status === 'conflict' || hasActiveMutation(t) || !taxReadyFor(t)) return;
+      const desired = stageBodyFor(t, state);
+      if (desired === null) return;
+      let coordinator = stageCoordinatorsRef.current[t.id];
+      if (!coordinator) {
+        const companyId = activeCompanyIdRef.current;
+        // A revision-only change or a lost response may rebase safely. A different
+        // server draft must be shown for review before another local write.
+        let acknowledged = stageBodyFor(t, initialTaxState(t));
+        let lastSent: DesiredStage | null = null;
+        let concurrentEdit = false;
+        coordinator = createRowStageCoordinator(t.revision, {
+          stage: async (expectedRevision, nextDesired) => {
+            lastSent = nextDesired;
+            const result = await txnApi.stageCategorization(t.id, { ...nextDesired, expectedRevision });
+            acknowledged = nextDesired;
+            return result;
+          },
+          reload: async () => {
+            if (!companyId) return null;
+            const latestRows = await fetchAllTxns(companyId);
+            if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return null;
+            const latest = latestRows.find((row) => row.id === t.id) ?? null;
+            const latestDesired = latest ? stageBodyFor(latest, initialTaxState(latest)) : null;
+            concurrentEdit = latest !== null && latest.status === 'PENDING' && latest.activeCategorizationAttempt === null
+              && (latestDesired === null || !(
+                (acknowledged !== null && sameDesired(latestDesired, acknowledged))
+                || (lastSent !== null && sameDesired(latestDesired, lastSent))
+              ));
+            if (latest === null) {
+              setRows((prev) => prev.filter((row) => row.id !== t.id));
+            } else if (latest.status !== 'PENDING' || latest.activeCategorizationAttempt !== null || concurrentEdit) {
+              patchRow(t.id, latest);
+              setTaxRows((prev) => ({ ...prev, [t.id]: {
+                ...initialTaxState(latest), stage: prev[t.id]?.stage ?? initialTaxState(latest).stage,
+              } }));
+            }
+            if (latest && !concurrentEdit) {
+              patchRow(t.id, { revision: latest.revision, payee: latest.payee, memo: latest.memo,
+                amount: latest.amount, date: latest.date, bankAccount: latest.bankAccount,
+                qboId: latest.qboId, qboType: latest.qboType });
+            }
+            return latest;
+          },
+          isMutable: (latest) => !concurrentEdit && latest.status === 'PENDING' && (
+            latest.activeCategorizationAttempt === null
+          ),
+        }, (view) => {
+          if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+          setTaxRows((prev) => ({ ...prev, [t.id]: {
+            ...(prev[t.id] ?? initialTaxState(t)), stage: concurrentEdit && view.status === 'conflict'
+              ? { ...view, error: 'The transaction changed. Review the refreshed details, then calculate tax again.' } : view,
+            ...(view.status === 'ready' ? { mutation: null } : {}),
+          } }));
+          if (view.status === 'ready' && view.result !== null) {
+            patchRow(t.id, { revision: view.result.revision, taxCalculation: view.result.taxCalculation });
+          }
+        });
+        stageCoordinatorsRef.current[t.id] = coordinator;
+      }
+      coordinator.update(desired);
+    },
+    [hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
+  );
+
+  useEffect(() => {
+    if (activeRow) requestStage(activeRow, taxRows[activeRow.id] ?? initialTaxState(activeRow));
+  }, [requestStage, activeRow, taxRows]);
+
+  useEffect(() => {
+    const present = new Set(rows.map((row) => row.id));
+    for (const [id, coordinator] of Object.entries(stageCoordinatorsRef.current)) {
+      if (present.has(id)) continue;
+      coordinator.dispose();
+      delete stageCoordinatorsRef.current[id];
+    }
+  }, [rows]);
+
+  useEffect(() => () => {
+    for (const coordinator of Object.values(stageCoordinatorsRef.current)) coordinator.dispose();
+    stageCoordinatorsRef.current = {};
+  }, []);
+
+  /** Assign a category: server merges matching rule tags — use the returned dto. */
+  const categorizeTo = useCallback(
+    (t: TransactionDto, name: string, categoryQboId: string) => {
       if (hasActiveMutation(t)) return;
-      const current = taxState(t);
-      const body = stageBodyFor(t, current);
-      if (!body) {
-        toast('Choose a valid category and tax code for every line');
+      const prev = { category: t.category, categoryQboId: t.categoryQboId };
+      patchRow(t.id, { category: name, categoryQboId }); // optimistic
+      if (taxReadyFor(t)) {
+        requestStage({ ...t, category: name, categoryQboId }, taxState(t));
         return;
       }
-      const capturedVersion = taxVersionsRef.current[t.id] ?? current.version;
-      const stagingRequestId = ++stageRequestSequenceRef.current;
-      stageRequestTokensRef.current[t.id] = stagingRequestId;
-      updateTaxState(t, (state) => ({
-        ...state,
-        staging: true,
-        stagingRequestId,
-        reloadRequired: false,
-        staged: null,
-        stagedVersion: null,
-      }));
       txnApi
-        .stageCategorization(t.id, body)
-        .then((staged) => {
-          if (!aliveRef.current) return;
-          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
-          delete stageRequestTokensRef.current[t.id];
-          const isCurrentVersion =
-            (taxVersionsRef.current[t.id] ?? 0) === capturedVersion;
-          setTaxRows((prev) => {
-            const latest = prev[t.id] ?? initialTaxState(t);
-            if (latest.stagingRequestId !== stagingRequestId) return prev;
-            if (!isCurrentVersion || latest.version !== capturedVersion) {
-              return {
-                ...prev,
-                [t.id]: {
-                  ...latest,
-                  staging: false,
-                  stagingRequestId: null,
-                  reloadRequired: false,
-                  staged: null,
-                  stagedVersion: null,
-                },
-              };
-            }
-            return {
-              ...prev,
-              [t.id]: {
-                ...latest,
-                staging: false,
-                stagingRequestId: null,
-                reloadRequired: false,
-                staged,
-                stagedVersion: capturedVersion,
-                mutation: null,
-              },
-            };
-          });
-          patchRow(t.id, {
-            revision: staged.revision,
-            ...(isCurrentVersion ? { taxCalculation: staged.taxCalculation } : {}),
-          });
+        .categorize(t.id, { category: name, categoryQboId, tagIds: t.tagIds })
+        .then((dto) => {
+          if (aliveRef.current) updateRow(dto);
         })
-        .catch((error) => {
-          if (!aliveRef.current) return;
-          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
-          delete stageRequestTokensRef.current[t.id];
-          const staleRevision = error instanceof ApiError && error.code === 'STALE_REVISION';
-          updateTaxState(t, (state) =>
-            state.stagingRequestId === stagingRequestId
-              ? {
-                  ...state,
-                  staging: false,
-                  stagingRequestId: null,
-                  reloadRequired: staleRevision,
-                }
-              : state,
-          );
-          if (staleRevision && activeCompanyId) {
-            fetchAllTxns(activeCompanyId)
-              .then((all) => {
-                if (!aliveRef.current) return;
-                setRows(all);
-                delete taxVersionsRef.current[t.id];
-                setTaxRows((prev) => {
-                  const next = { ...prev };
-                  delete next[t.id];
-                  return next;
-                });
-                toast('The transaction changed. Loaded the latest version.');
-              })
-              .catch((reloadError) => {
-                if (!aliveRef.current) return;
-                toast(`${errText(reloadError)}. Reload the page before previewing again.`);
-              });
-            return;
-          }
-          toast(errText(error));
+        .catch((e) => {
+          if (aliveRef.current) patchRow(t.id, prev); // roll back the optimistic patch
+          toast(errText(e));
         });
     },
     [
-      taxState,
       hasActiveMutation,
-      stageBodyFor,
-      updateTaxState,
       patchRow,
+      taxReadyFor,
+      requestStage,
+      taxState,
+      updateRow,
       toast,
-      activeCompanyId,
-      fetchAllTxns,
     ],
+  );
+
+  const bulkCategoryOptions = useMemo(
+    () => catAccounts.map((account) => ({
+      value: account.qboId,
+      group: account.classification,
+      name: account.name,
+      sug: false,
+    })),
+    [catAccounts],
+  );
+
+  const rowCategoryOptions = useMemo(() => {
+    const bySuggestion = new Map<string, typeof bulkCategoryOptions>();
+    return (t: TransactionDto) => {
+      const suggested = t.suggestion?.category;
+      if (!suggested) return bulkCategoryOptions;
+      const cached = bySuggestion.get(suggested);
+      if (cached) return cached;
+      const options = bulkCategoryOptions.map((option) => ({ ...option, sug: option.name === suggested }));
+      const ordered = [...options.filter((option) => option.sug), ...options.filter((option) => !option.sug)];
+      bySuggestion.set(suggested, ordered);
+      return ordered;
+    };
+  }, [bulkCategoryOptions]);
+
+  const pickRowCategory = useCallback(
+    (t: TransactionDto, qboId: string) => {
+      const account = catAccounts.find((candidate) => candidate.qboId === qboId);
+      if (account) categorizeTo(t, account.name, account.qboId);
+    },
+    [catAccounts, categorizeTo],
+  );
+
+  const pickBulkCategory = useCallback(
+    (qboId: string) => {
+      const account = catAccounts.find((candidate) => candidate.qboId === qboId);
+      if (!account) return;
+      setBulkCat(account.qboId);
+      for (const id of selPend) {
+        const t = rows.find((row) => row.id === id);
+        if (t) categorizeTo(t, account.name, account.qboId);
+      }
+    },
+    [catAccounts, selPend, rows, categorizeTo],
   );
 
   const recordTaxMutation = useCallback(
@@ -878,13 +897,9 @@ export default function Queue() {
   const commitTax = useCallback(
     (t: TransactionDto) => {
       const current = taxState(t);
-      if (
-        !current.staged ||
-        current.stagedVersion === null ||
-        current.stagedVersion !== current.version ||
-        current.staging
-      ) return;
-      const totals = current.staged.totals;
+      const staged = readyStageFor(t, current);
+      if (staged === null || current.mutation?.outcome === 'RETRYABLE' || current.mutation?.outcome === 'UNCHANGED') return;
+      const totals = staged.totals;
       if (!window.confirm(
         [
           'Post this categorization to QuickBooks?',
@@ -907,7 +922,7 @@ export default function Queue() {
       updateTaxState(t, (state) => ({ ...state, mutation }));
       patchRow(t.id, { status: 'POSTING', error: null });
       txnApi
-        .commitCategorization(t.id, current.staged.revision, requestId)
+        .commitCategorization(t.id, staged.revision, requestId)
         .then((result) => {
           if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
         })
@@ -916,7 +931,7 @@ export default function Queue() {
           recordTaxMutationFailure(t, error, mutation);
         });
     },
-    [taxState, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
+    [taxState, readyStageFor, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
   );
 
   const reconcileTax = useCallback(
@@ -1272,7 +1287,7 @@ export default function Queue() {
         : [...t.tagIds, tagId];
       patchRow(t.id, { tagIds: next }); // optimistic
       if (taxReadyFor(t)) {
-        invalidateTaxStage(t);
+        requestStage({ ...t, tagIds: next }, taxState(t));
         return;
       }
       txnApi
@@ -1285,7 +1300,7 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [hasActiveMutation, patchRow, taxReadyFor, invalidateTaxStage, updateRow, toast],
+    [hasActiveMutation, patchRow, taxReadyFor, requestStage, taxState, updateRow, toast],
   );
 
   const saveSplit = useCallback(
@@ -1309,10 +1324,9 @@ export default function Queue() {
       patchRow(t.id, { category: null, categoryQboId: null, splits }); // optimistic
       toast('Split saved — ready to post');
       if (taxReadyFor(t)) {
-        invalidateTaxStage(t, {
-          taxCalculation: taxCalculation ?? 'NotApplicable',
-          taxCodeQboId: null,
-        });
+        const nextState = { ...taxState(t), taxCalculation: taxCalculation ?? 'NotApplicable', taxCodeQboId: null };
+        updateTaxState(t, () => nextState);
+        requestStage({ ...t, category: null, categoryQboId: null, splits }, nextState);
         return;
       }
       txnApi
@@ -1330,27 +1344,64 @@ export default function Queue() {
       qboIdOf,
       patchRow,
       taxReadyFor,
-      invalidateTaxStage,
+      requestStage,
+      taxState,
+      updateTaxState,
       updateRow,
       toast,
     ],
   );
 
   const syncNow = useCallback(async () => {
-    if (!activeCompanyId) return;
-    try {
-      const res = (await companiesApi.sync(activeCompanyId)) as unknown as
-        | { message?: string }
-        | undefined;
-      const fresh = await fetchAllTxns(activeCompanyId);
-      if (!aliveRef.current) return;
-      setRows(fresh);
-      refreshCompanies().catch(() => {});
-      toast(res && typeof res.message === 'string' ? res.message : 'Synced — no new transactions');
-    } catch (e) {
-      toast(errText(e));
+    const companyId = activeCompanyId;
+    const companyName = activeCompany?.nickname ?? 'selected company';
+    if (!companyId) return;
+    if (companySyncLocks.has(companyId)) {
+      setSyncingCompanyId(companyId);
+      return;
     }
-  }, [activeCompanyId, fetchAllTxns, refreshCompanies, toast]);
+
+    const request = companiesApi.sync(companyId);
+    companySyncLocks.set(companyId, { request, listeners: new Set() });
+    setSyncingCompanyId(companyId);
+    const stillCurrent = () => (
+      aliveRef.current && activeCompanyIdRef.current === companyId
+    );
+
+    try {
+      const result = await request;
+      // Company metadata belongs to the app provider, which survives Queue remounts.
+      // Refresh it on sync success even when this Queue no longer owns the view.
+      if (result.ok) void refreshCompanies().catch(() => {});
+      if (!stillCurrent()) return;
+      if (!result.ok) {
+        toast(`Sync failed for ${companyName} — ${result.message}`);
+        return;
+      }
+
+      let fresh: TransactionDto[];
+      try {
+        fresh = await fetchAllTxns(companyId);
+      } catch (error) {
+        if (stillCurrent()) {
+          toast(`Synced ${companyName}, but Queue refresh failed — ${errText(error)}`);
+        }
+        return;
+      }
+      if (!stillCurrent()) return;
+      setRows(fresh);
+      toast(`Synced ${companyName} — ${result.message}`);
+    } catch (error) {
+      if (stillCurrent()) toast(`Sync failed for ${companyName} — ${errText(error)}`);
+    } finally {
+      releaseCompanySyncLock(companyId, request);
+      if (stillCurrent()) {
+        setSyncingCompanyId((current) => current === companyId ? null : current);
+      }
+    }
+  }, [activeCompany, activeCompanyId, fetchAllTxns, refreshCompanies, toast]);
+
+  const isSyncingActiveCompany = syncingCompanyId !== null && syncingCompanyId === activeCompanyId;
 
   const bulkPost = useCallback(async () => {
     if (!activeCompanyId) return;
@@ -1446,27 +1497,13 @@ export default function Queue() {
     [sortKey, sortDir],
   );
 
-  // ---- outside-click closes popups (prototype root onClick closeMenus) ----
-  const closeMenusRef = useRef<() => void>(() => {});
-  closeMenusRef.current = () => {
-    if (picker !== null || tagPicker !== null) {
-      setPicker(null);
-      setTagPicker(null);
-      setPickQ('');
-      setPickIdx(0);
-    }
-  };
-  useEffect(() => {
-    const fn = () => closeMenusRef.current();
-    document.addEventListener('mousedown', fn);
-    return () => document.removeEventListener('mousedown', fn);
-  }, []);
-
   // ---- keyboard (prototype onKey, verbatim ordering) ----
   const keyRef = useRef<(e: KeyboardEvent) => void>(() => {});
   keyRef.current = (e: KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    // The split dialog owns keyboard interaction, including its non-input heading.
+    if (splitEditId !== null) return;
     if (e.key === 'Escape') {
-      closePicker();
       setSel({});
       setTagPicker(null);
       setErrOpenId(null);
@@ -1474,25 +1511,9 @@ export default function Queue() {
       setSplitEditId(null);
       return;
     }
-    if (picker !== null) {
-      // Navigate/select within the rendered list (pickOpts, capped at 40) so
-      // Enter can never land on an option the popup doesn't show.
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setPickIdx((i) => Math.min(i + 1, pickOpts.length - 1));
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setPickIdx((i) => Math.max(i - 1, 0));
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        const opt = pickOpts[pickIdx];
-        if (opt) pickChoose(opt.name);
-      }
-      return;
-    }
     const target = e.target as HTMLElement | null;
-    const tag = (target?.tagName || '').toUpperCase();
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (target?.closest('input, select, textarea, .control-trigger, .control-popover, [role="combobox"], [role="listbox"], [contenteditable="true"]')) return;
+    if (e.key === 'Enter' && target?.closest('button, a, summary, [role="button"]')) return;
     if (!vis.length) return;
     const i = Math.min(activeIdx, vis.length - 1);
     const cur = vis[i];
@@ -1507,18 +1528,14 @@ export default function Queue() {
       if (!hasActiveMutation(cur)) {
         setSel((s) => ({ ...s, [cur.id]: !s[cur.id] }));
       }
-    } else if (e.key === 'c') {
-      e.preventDefault();
-      if (cur.status === 'PENDING' && !hasActiveMutation(cur)) openPicker(cur.id);
     } else if (e.key === 't') {
       e.preventDefault();
       if (!hasActiveMutation(cur)) {
         setTagPicker((tp) => (tp === cur.id ? null : cur.id));
-        setPicker(null);
       }
     } else if (e.key === 'Enter') {
       // Splits count as categorized — doPost's own guards handle the rest.
-      if (cur.status === 'PENDING' && (cur.category || (cur.splits && cur.splits.length))) {
+      if (cur.status === 'PENDING' && !hasActiveMutation(cur) && (cur.category || (cur.splits && cur.splits.length))) {
         doPost(cur.id);
       }
     }
@@ -1582,7 +1599,6 @@ export default function Queue() {
     notReady: boolean;
     pendTip: string;
     pickLabel: string;
-    pickColor: string;
   }
 
   const rowView = (t: TransactionDto): RowView => {
@@ -1618,14 +1634,12 @@ export default function Queue() {
             : 'Tags are required — add a tag first'
           : 'Choose a category first',
       pickLabel: hasSplit
-        ? `Split · ${t.splits!.length} categories`
+        ? `Split · ${t.splits!.length} ${t.splits!.length === 1 ? 'category' : 'categories'}`
         : t.category
           ? fullCat(t.category)
           : suggested
             ? sugName!
             : 'Choose category…',
-      pickColor:
-        t.category || hasSplit ? 'var(--ink)' : suggested ? 'var(--amT)' : 'var(--fnt)',
     };
   };
 
@@ -1634,44 +1648,46 @@ export default function Queue() {
     setErrOpenId((cur) => (cur === t.id ? cur : null));
   };
 
-  const onOpenPicker = (v: RowView) => (e: ReactMouseEvent) => {
-    e.stopPropagation();
-    if (v.t.status !== 'PENDING' || hasActiveMutation(v.t)) return;
-    if (v.t.splits && v.t.splits.length) {
-      doOpenSplit(v.t.id);
-    } else {
-      openPicker(v.t.id);
-    }
-  };
-
   const onTagBtn = (t: TransactionDto) => (e: ReactMouseEvent) => {
     e.stopPropagation();
     if (hasActiveMutation(t)) return;
     setTagPicker((tp) => (tp === t.id ? null : t.id));
-    setPicker(null);
   };
 
-  const rowPicker = (v: RowView, mobile: boolean) =>
-    picker === v.t.id ? (
-      <CategoryPicker
-        query={pickQ}
-        onQueryChange={(q) => {
-          setPickQ(q);
-          setPickIdx(0);
+  const rowCategoryPicker = (v: RowView, mobile: boolean) =>
+    v.t.splits && v.t.splits.length ? (
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          doOpenSplit(v.t.id);
         }}
-        options={pickOpts}
-        empty={filteredOpts.length === 0}
-        activeIdx={pickIdx}
-        onPick={pickChoose}
-        onSplitFooter={() => doOpenSplit(v.t.id)}
-        showBadges={!mobile}
-        containerStyle={
-          mobile
-            ? { zIndex: 15, top: 'calc(100% + 6px)', width: 'min(300px,86vw)' }
-            : { zIndex: 15, top: 'calc(100% + 6px)', width: 300 }
-        }
-      />
-    ) : null;
+        disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
+        className="control-trigger queue-split-trigger hov-brd"
+      >
+        {v.pickLabel}
+      </button>
+    ) : (
+      <span onClick={(event) => event.stopPropagation()}>
+        <CategoryPicker
+          label={`Category for ${v.t.payee}`}
+          value={v.t.categoryQboId}
+          options={rowCategoryOptions(v.t)}
+          onPick={(qboId) => pickRowCategory(v.t, qboId)}
+          onSplitFooter={() => doOpenSplit(v.t.id)}
+          showBadges={!mobile}
+          disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
+          triggerText={v.pickLabel}
+          triggerTone={v.suggested ? 'suggested' : undefined}
+          triggerBadge={v.suggested ? v.isRule ? 'rule' : 'suggested' : undefined}
+          triggerBadgeTooltip={
+            v.isRule && (v.t.suggestion?.matchedRules ?? 0) > 1
+              ? `Matched ${v.t.suggestion?.matchedRules} rules — “${v.t.suggestion?.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`
+              : undefined
+          }
+        />
+      </span>
+    );
 
   const tagChips = (t: TransactionDto) =>
     t.tagIds
@@ -1712,25 +1728,14 @@ export default function Queue() {
       return null;
     }
     const state = taxState(t);
+    const readyStage = readyStageFor(t, state);
     const direction = taxDirectionFor(t);
     const taxLabel = taxLabelFor(t);
     const isSplit = !!(t.splits && t.splits.length);
     const locked = hasActiveMutation(t);
-    const canStage =
-      stageBodyFor(t, state) !== null &&
-      !state.staging &&
-      !state.reloadRequired &&
-      !locked;
     return (
-      <span
-        style={{
-          display: 'grid',
-          gridTemplateColumns: isSplit ? '1fr auto' : 'minmax(130px,1fr) minmax(120px,1fr) auto',
-          gap: 6,
-          alignItems: 'end',
-          marginTop: 8,
-        }}
-      >
+      <span className="queue-tax-controls">
+        <span className={`queue-tax-line${isMobile ? ' queue-tax-line-mobile' : ''}`}>
         {!isSplit && (
           <TaxCodePicker
             id={`tax-code-${t.id}`}
@@ -1746,7 +1751,7 @@ export default function Queue() {
                 taxCode:
                   taxCodesFor(t).find((code) => code.qboId === taxCodeQboId)?.name ?? null,
               });
-              invalidateTaxStage(t, {
+              const nextState: TaxRowState = { ...state,
                 taxCodeQboId,
                 taxCalculation:
                   taxCodeQboId === null
@@ -1754,66 +1759,69 @@ export default function Queue() {
                     : state.taxCalculation === 'TaxExcluded'
                       ? 'TaxExcluded'
                       : 'TaxInclusive',
-              });
+              };
+              updateTaxState(t, () => nextState);
+              requestStage({ ...t, taxCodeQboId }, nextState);
             }}
           />
         )}
         {state.taxCodeQboId !== null ||
         (isSplit && state.taxCalculation !== 'NotApplicable') ? (
           <span style={{ display: 'block' }}>
-            <label
-              htmlFor={`tax-calculation-${t.id}`}
-              style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
-            >
-              Tax calculation for {t.payee}
-            </label>
-            <select
+            <Select
               id={`tax-calculation-${t.id}`}
-              className="select"
+              label={`Tax calculation for ${t.payee}`}
               value={state.taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
               disabled={locked}
-              onChange={(event) => {
-                if (locked) return;
-                invalidateTaxStage(t, {
-                  taxCalculation: event.target.value as TaxCalculation,
-                });
+              options={[{ value: 'TaxInclusive', label: 'Tax inclusive' }, { value: 'TaxExcluded', label: 'Tax exclusive' }]}
+              onValueChange={(next) => {
+                if (locked || (next !== 'TaxInclusive' && next !== 'TaxExcluded')) return;
+                const nextState: TaxRowState = { ...state, taxCalculation: next };
+                updateTaxState(t, () => nextState);
+                requestStage(t, nextState);
               }}
-              style={{ width: '100%' }}
-            >
-              <option value="TaxInclusive">Tax inclusive</option>
-              <option value="TaxExcluded">Tax exclusive</option>
-            </select>
+            />
           </span>
         ) : (
           <span style={{ fontSize: 12, color: 'var(--mut)', paddingBottom: 8 }}>
             No tax selected
           </span>
         )}
-        <button
-          type="button"
-          className="btn-ghost"
-          disabled={!canStage}
-          onClick={() => stageTax(t)}
-          style={{ opacity: canStage ? 1 : 0.45, whiteSpace: 'nowrap' }}
-        >
-          {state.staging ? 'Calculating…' : 'Preview tax'}
-        </button>
-        {state.staged && state.stagedVersion === state.version && (
-          <span
-            style={{
-              gridColumn: '1 / -1',
-              display: 'flex',
-              gap: 10,
-              color: 'var(--mut)',
-              fontSize: 12,
-              flexWrap: 'wrap',
-            }}
-          >
-            <span>Subtotal {centsLabel(state.staged.totals.subtotalCents)}</span>
-            <span>Tax {centsLabel(state.staged.totals.taxCents)}</span>
-            <span>Total {centsLabel(state.staged.totals.totalCents)}</span>
+        {readyStage !== null && (
+          <span className="queue-tax-totals">
+            <span>Subtotal {centsLabel(readyStage.totals.subtotalCents)}</span>
+            <span>Tax {centsLabel(readyStage.totals.taxCents)}</span>
+            <span>Total {centsLabel(readyStage.totals.totalCents)}</span>
           </span>
         )}
+        </span>
+        <span className="queue-tax-feedback">
+        {!locked && stageBodyFor(t, state) === null && <span style={{ gridColumn: '1 / -1', color: 'var(--amT)', fontSize: 12 }}>
+          {t.splits?.length ? 'Open Split to review its categories and tax codes before calculating tax.'
+            : 'Choose an available category and tax code before calculating tax.'}
+        </span>}
+        {(state.stage.status === 'idle' || (state.stage.status === 'conflict' && !locked)) && <button type="button" className="btn-ghost"
+          aria-label={`Calculate tax for ${t.payee}`}
+          disabled={locked || stageBodyFor(t, state) === null}
+          onClick={(event) => {
+            event.stopPropagation();
+            const next = { ...state, stage: initialTaxState(t).stage };
+            if (state.stage.status === 'conflict') {
+              stageCoordinatorsRef.current[t.id]?.dispose();
+              delete stageCoordinatorsRef.current[t.id];
+              updateTaxState(t, () => next);
+            }
+            requestStage(t, next);
+          }}>
+          Calculate tax
+        </button>}
+        {state.stage.status === 'calculating' && <span style={{ gridColumn: '1 / -1', color: 'var(--mut)', fontSize: 12 }}>Calculating tax…</span>}
+        {state.stage.status === 'error' && <span style={{ gridColumn: '1 / -1', color: 'var(--erT)', fontSize: 12 }}>
+          {state.stage.error ?? 'Could not calculate tax.'}
+          <button type="button" className="btn-ghost" onClick={(event) => { event.stopPropagation(); stageCoordinatorsRef.current[t.id]?.retry(); }}>Retry calculation</button>
+        </span>}
+        {state.stage.status === 'conflict' && <span style={{ gridColumn: '1 / -1', color: 'var(--erT)', fontSize: 12 }}>{state.stage.error}</span>}
+        </span>
       </span>
     );
   };
@@ -1821,11 +1829,7 @@ export default function Queue() {
   const taxStatusCell = (v: RowView, mobile: boolean) => {
     const state = taxState(v.t);
     const mutation = state.mutation;
-    const validStage =
-      state.staged !== null &&
-      state.stagedVersion !== null &&
-      state.stagedVersion === state.version &&
-      !state.staging;
+    const validStage = readyStageFor(v.t, state) !== null;
     const buttonStyle: CSSProperties = {
       fontSize: 13.5,
       fontWeight: 600,
@@ -1873,11 +1877,11 @@ export default function Queue() {
     }
     if (mutation?.outcome === 'UNCERTAIN' || mutation?.outcome === 'IN_PROGRESS') {
       return (
-        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, alignItems: 'center' }}>
+        <span className="queue-recovery-content">
           <span style={{ color: 'var(--erT)', fontSize: 12 }}>
             Verify in QuickBooks — outcome uncertain
           </span>
-          <span style={{ display: 'inline-flex', gap: 7 }}>
+          <span className="queue-recovery-actions">
             <button className="btn-ghost" onClick={() => reconcileTax(v.t, false)}>
               Reconcile
             </button>
@@ -1942,7 +1946,22 @@ export default function Queue() {
       );
     }
     if (mutation?.outcome === 'RETRYABLE' || mutation?.outcome === 'UNCHANGED') {
-      return <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>;
+      return <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5 }}>
+        <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>
+        <button className="btn-ghost" onClick={(event) => {
+          event.stopPropagation();
+          if (state.stage.status === 'conflict') {
+            stageCoordinatorsRef.current[v.t.id]?.dispose();
+            delete stageCoordinatorsRef.current[v.t.id];
+            const next = { ...state, mutation: null, stage: initialTaxState(v.t).stage };
+            updateTaxState(v.t, () => next);
+            requestStage(v.t, next);
+            return;
+          }
+          if (!stageCoordinatorsRef.current[v.t.id]?.restage()) return;
+          updateTaxState(v.t, (current) => ({ ...current, mutation: null }));
+        }}>Restage categorization</button>
+      </span>;
     }
     if (v.t.status === 'PENDING') {
       return (
@@ -2161,26 +2180,35 @@ export default function Queue() {
             placeholder="Search anything — payee, amount, category, status…"
             style={{ width: 280, maxWidth: '100%' }}
           />
-          <select
-            className="select"
+          <Select
+            label="Account filter"
             value={acct}
-            onChange={(e) => {
-              setAcct(e.target.value);
+            options={[
+              { value: 'all', label: 'All accounts' },
+              ...bankOpts.map((name) => ({ value: name, label: name })),
+            ]}
+            onValueChange={(next) => {
+              setAcct(next ?? 'all');
               setActiveIdx(0);
             }}
+          />
+          <button
+            className="btn-ghost"
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={isSyncingActiveCompany}
+            aria-busy={isSyncingActiveCompany}
           >
-            <option value="all">All accounts</option>
-            {bankOpts.map((b) => (
-              <option key={b} value={b}>
-                {b}
-              </option>
-            ))}
-          </select>
-          <button className="btn-ghost" onClick={syncNow}>
-            ↻ Sync now
+            {isSyncingActiveCompany ? <><Spinner size={11} /> Syncing…</> : '↻ Sync now'}
           </button>
         </div>
       </div>
+
+      {loaded && activeCompanyId && (role === 'categorizer' || role === 'admin') && (
+        <div style={{ marginBottom: 12 }}>
+          <ProviderStatusRefresh key={activeCompanyId} companyId={activeCompanyId} onRefreshed={reloadProviderStatuses} />
+        </div>
+      )}
 
       {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
         <AutopilotQueueStatus
@@ -2220,7 +2248,7 @@ export default function Queue() {
             overflowX: 'auto',
           }}
         >
-          <div style={{ minWidth: 1020 }}>
+          <div style={{ minWidth: GRID_MIN_WIDTH }}>
             <div
               style={{
                 display: 'grid',
@@ -2310,6 +2338,7 @@ export default function Queue() {
                       </span>
                     )}
                     <span
+                      ref={tagPicker === t.id ? tagPickerRootRef : undefined}
                       style={{
                         display: 'flex',
                         flexWrap: 'wrap',
@@ -2414,49 +2443,7 @@ export default function Queue() {
                   <span
                     style={{ position: 'relative', display: 'flex', gap: 5, alignItems: 'center' }}
                   >
-                    <button
-                      onClick={onOpenPicker(v)}
-                      onMouseDown={stopMouse}
-                      disabled={hasActiveMutation(t)}
-                      className="hov-brd"
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        boxSizing: 'border-box',
-                        textAlign: 'left',
-                        border: `1px solid ${picker === t.id ? 'var(--acc)' : 'var(--bd)'}`,
-                        borderRadius: 7,
-                        padding: '7px 12px',
-                        fontSize: 14,
-                        background: 'var(--card)',
-                        color: v.pickColor,
-                        cursor: 'pointer',
-                        font: 'inherit',
-                        boxShadow: picker === t.id ? '0 0 0 3px rgba(47,93,80,.12)' : 'none',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                      }}
-                    >
-                      {v.pickLabel}
-                      {v.suggested && (
-                        <span
-                          {...(v.isRule && t.suggestion && (t.suggestion.matchedRules ?? 0) > 1
-                            ? {
-                                'data-tip': `Matched ${t.suggestion.matchedRules} rules — “${t.suggestion.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`,
-                              }
-                            : {})}
-                          style={{
-                            fontSize: 11.5,
-                            fontWeight: 600,
-                            color: 'var(--amT)',
-                            marginLeft: 7,
-                          }}
-                        >
-                          {v.isRule ? 'rule' : 'suggested'}
-                        </span>
-                      )}
-                    </button>
+                    {rowCategoryPicker(v, false)}
                     {v.state === 'pending' && (
                       <button
                         onClick={(e) => {
@@ -2485,9 +2472,9 @@ export default function Queue() {
                         Split
                       </button>
                     )}
-                    {rowPicker(v, false)}
+
                   </span>
-                  <span style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
+                  <span className="queue-status-cell" style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
                 </div>
                 {activeCompanyId && attachmentOpenId === t.id && (
                   <AttachmentPanel
@@ -2585,7 +2572,7 @@ export default function Queue() {
                     {fmtMoney(t.amount)}
                   </span>
                 </div>
-                <span
+                <span ref={tagPicker === t.id ? tagPickerRootRef : undefined}
                   style={{
                     display: 'flex',
                     flexWrap: 'wrap',
@@ -2666,32 +2653,10 @@ export default function Queue() {
                     </a>
                   </span>
                 )}
-                <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
-                  <span style={{ position: 'relative', flex: 1, minWidth: 0 }}>
-                    <button
-                      onClick={onOpenPicker(v)}
-                      onMouseDown={stopMouse}
-                      disabled={hasActiveMutation(t)}
-                      style={{
-                        width: '100%',
-                        boxSizing: 'border-box',
-                        textAlign: 'left',
-                        border: `1px solid ${picker === t.id ? 'var(--acc)' : 'var(--bd)'}`,
-                        borderRadius: 7,
-                        padding: '9px 12px',
-                        fontSize: 13.5,
-                        background: 'var(--card)',
-                        color: v.pickColor,
-                        cursor: 'pointer',
-                        font: 'inherit',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                      }}
-                    >
-                      {v.pickLabel}
-                    </button>
-                    {rowPicker(v, true)}
+                <div className="queue-mobile-actions" style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+                  <span style={{ position: 'relative', flex: '1 1 150px', minWidth: 0 }}>
+                    {rowCategoryPicker(v, true)}
+
                   </span>
                   {v.state === 'pending' && (
                     <button
@@ -2719,7 +2684,7 @@ export default function Queue() {
                       Split
                     </button>
                   )}
-                  <span style={{ flex: 'none', display: 'inline-flex', alignItems: 'center' }}>
+                  <span className="queue-status-cell" style={{ flex: '1 1 240px', maxWidth: '100%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
                     {statusCell(v, true)}
                   </span>
                 </div>
@@ -2777,12 +2742,7 @@ export default function Queue() {
       {selIds.length > 0 && (
         <BulkBar
           count={selCount}
-          label={bulkCat ? fullCat(bulkCat) : 'Assign one category…'}
           btnOpacity={selReady.length ? 1 : 0.45}
-          onOpenPicker={(e) => {
-            e.stopPropagation();
-            openPicker('bulk');
-          }}
           onPost={() => {
             void bulkPost();
           }}
@@ -2790,32 +2750,20 @@ export default function Queue() {
             setSel({});
             setBulkCat(null);
           }}
-          picker={
-            picker === 'bulk' ? (
-              <CategoryPicker
-                query={pickQ}
-                onQueryChange={(q) => {
-                  setPickQ(q);
-                  setPickIdx(0);
-                }}
-                options={pickOpts}
-                empty={filteredOpts.length === 0}
-                activeIdx={pickIdx}
-                onPick={pickChoose}
-                showBadges={false}
-                containerStyle={{
-                  zIndex: 30,
-                  bottom: 'calc(100% + 8px)',
-                  width: 300,
-                  color: 'var(--ink)',
-                }}
-              />
-            ) : null
+          categoryControl={
+            <CategoryPicker
+              label="Category for selected transactions"
+              triggerText="Assign one category…"
+              disabled={selPend.length === 0}
+              value={bulkCat}
+              options={bulkCategoryOptions}
+              onPick={pickBulkCategory}
+              showBadges={false}
+            />
           }
         />
       )}
 
-      {/* rule prompt */}
       {rulePrompt && (
         <RulePrompt
           payee={rulePrompt.payee}

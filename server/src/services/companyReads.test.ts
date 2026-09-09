@@ -105,7 +105,154 @@ function makeDb() {
 }
 
 describe('company read services', () => {
+  it('uses the same full-binding effective disposition for queue views and counts', async () => {
+    const db = makeDb();
+    const now = new Date();
+    const withActionability = (
+      id: string,
+      disposition: string,
+      overrides: Record<string, unknown> = {},
+    ) => transaction({
+      id,
+      qboId: id,
+      qboSyncToken: '1',
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: id,
+        disposition,
+        checkedAt: now,
+        revision: 2,
+        qboSyncToken: '1',
+        qboType: 'Purchase',
+        qboId: id,
+        txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        ...overrides,
+      },
+    });
+    const rows = [
+      withActionability('writable', 'WRITABLE'),
+      withActionability('blocked', 'BLOCKED_CLEARED'),
+      withActionability('stale', 'BLOCKED_RECONCILED', { qboId: 'old-provider-id' }),
+    ];
+    Object.assign(db, { transactionActionability: {} });
+    db.transaction.findMany.mockImplementation(async (args: Record<string, unknown>) => {
+      if ('select' in args && !('include' in args)) return rows;
+      return rows;
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      transferCandidates: async () => new Map(),
+      suggestForMany: async (_companyId, txns) => txns.map(() => null),
+    });
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      providerDisposition: 'UNKNOWN',
+    })).resolves.toMatchObject({
+      items: [{ id: 'stale', providerActionability: { disposition: 'UNKNOWN' } }],
+      pendingCount: 3,
+      actionableCount: 2,
+      blockedCount: 0,
+      unknownCount: 1,
+    });
+  });
+
+  it('returns unknown pending rows in the default interactive queue', async () => {
+    const db = makeDb();
+    const now = new Date();
+    const rows = [
+      transaction({
+        id: 'writable',
+        qboId: 'writable',
+        qboSyncToken: '1',
+        providerActionability: {
+          companyId: COMPANY_ID,
+          transactionId: 'writable',
+          disposition: 'WRITABLE',
+          checkedAt: now,
+          revision: 2,
+          qboSyncToken: '1',
+          qboType: 'Purchase',
+          qboId: 'writable',
+          txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        },
+      }),
+      transaction({
+        id: 'unknown',
+        qboId: 'unknown',
+        qboSyncToken: '1',
+        providerActionability: {
+          companyId: COMPANY_ID,
+          transactionId: 'unknown',
+          disposition: 'WRITABLE',
+          checkedAt: now,
+          revision: 2,
+          qboSyncToken: 'stale-token',
+          qboType: 'Purchase',
+          qboId: 'unknown',
+          txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        },
+      }),
+    ];
+    Object.assign(db, { transactionActionability: {} });
+    db.transaction.findMany.mockImplementation(async (args: Record<string, unknown>) => {
+      if ('select' in args && !('include' in args)) return rows;
+      return rows;
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      transferCandidates: async () => new Map(),
+      suggestForMany: async (_companyId, txns) => txns.map(() => null),
+    });
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID)).resolves.toMatchObject({
+      items: [
+        { id: 'writable', providerActionability: { disposition: 'WRITABLE' } },
+        { id: 'unknown', providerActionability: { disposition: 'UNKNOWN' } },
+      ],
+      pendingCount: 2,
+      actionableCount: 1,
+      unknownCount: 1,
+    });
+  });
+
+
   beforeEach(() => vi.clearAllMocks());
+
+  it('exposes proven Purchase source gross separately from the mirrored net without raw QBO data', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      amount: -100,
+      rawData: {
+        Id: '1001', SyncToken: '1', TxnDate: '2026-01-03',
+        PaymentType: 'Cash', AccountRef: { value: 'bank-1' },
+        GlobalTaxCalculation: 'TaxInclusive', TotalAmt: 112,
+        Line: [{ Id: '1', Amount: 100, DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding-1' }, TaxCodeRef: { value: 'tax-1' }, TaxInclusiveAmt: 112 } }],
+        TxnTaxDetail: { TotalTax: 12 },
+      },
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const result = await service.getTransaction(USER_ID, COMPANY_ID, 'txn-1');
+    expect(result).toMatchObject({ amount: -100, sourceGrossCents: -11200 });
+    expect(result).not.toHaveProperty('rawData');
+  });
+
+  it('omits source gross when the raw Purchase belongs to a different provider transaction', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      amount: -100,
+      rawData: {
+        Id: 'different-purchase', SyncToken: '1', TxnDate: '2026-01-03',
+        PaymentType: 'Cash', AccountRef: { value: 'bank-1' },
+        GlobalTaxCalculation: 'TaxInclusive', TotalAmt: 112,
+        Line: [{ Id: '1', Amount: 100, DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: { AccountRef: { value: 'holding-1' }, TaxCodeRef: { value: 'tax-1' }, TaxInclusiveAmt: 112 } }],
+        TxnTaxDetail: { TotalTax: 12 },
+      },
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const result = await service.getTransaction(USER_ID, COMPANY_ID, 'txn-1');
+    expect(result).not.toHaveProperty('sourceGrossCents');
+    expect(result).not.toHaveProperty('rawData');
+  });
 
   it('exports every bounded read operation', () => {
     expect([

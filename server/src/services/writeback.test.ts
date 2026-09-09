@@ -1,3 +1,4 @@
+import { mapPurchaseTaxSnapshot, preparePurchaseRecategorization, preparePurchaseRestore } from '../lib/qbo/purchaseTax.js';
 import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import type { StagedCategorization } from '@recat/shared';
@@ -8,6 +9,7 @@ import {
   type QboDepositPreparedWrite,
   type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboPurchaseSnapshot,
   type QboTxn,
 } from '../lib/qbo/types.js';
@@ -119,6 +121,14 @@ describe('hashStagedCategorization', () => {
         tagIds: ['tag-a', 'tag-b'],
       }],
       tagIds: ['tag-c', 'tag-d'],
+    }));
+    expect(hashStagedCategorization(staged)).toBe(hashStagedCategorization({
+      ...staged,
+      taxDisposition: 'set',
+    }));
+    expect(hashStagedCategorization(staged)).not.toBe(hashStagedCategorization({
+      ...staged,
+      taxDisposition: 'preserve_current',
     }));
   });
 });
@@ -237,8 +247,24 @@ function makeFakeDb(row: FakeTxnRow) {
     qboMutationAttempt: {
       findFirst: vi.fn(async () => null),
     },
+    transactionActionability: {
+      findUnique: vi.fn(async () => null),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+      upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => create),
+    },
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
+    },
+    qboTaxRate: {
+      findMany: vi.fn(async () => [{
+        qboId: 'sales-rate-generic',
+        name: 'Generic sales rate',
+        description: null,
+        active: true,
+        rateValue: 5,
+        sourceUpdatedAt: null,
+      }]),
     },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db)),
   };
@@ -343,16 +369,51 @@ describe('postTransaction SyncToken conflict handling', () => {
 
 describe('legacy write safety', () => {
   it.each(['Purchase', 'Deposit'] as const)(
-    'blocks a locked %s before posting and preserves PENDING state',
+    'posts a reconciled %s in an open period',
+    async (qboType) => {
+      const row = makeTxnRow({ qboType });
+      const recategorize = vi.fn().mockResolvedValue({ ok: true, newSyncToken: '1' });
+      const { deps } = makeDeps(row, {
+        fetchTxn: async () => freshQboTxn('0', qboType),
+        fetchWriteSafety: async () => ({ bookCloseDate: null, cleared: true, reconciled: true }),
+        recategorize,
+      });
+      await expect(postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps))
+        .resolves.toMatchObject({ ok: true, status: 'POSTED' });
+      expect(recategorize).toHaveBeenCalledTimes(1);
+      expect(row.status).toBe('POSTED');
+    },
+  );
+
+  it('retries a SyncToken conflict when the open-period transaction becomes reconciled', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn()
+      .mockRejectedValueOnce(new QboSyncTokenConflict())
+      .mockResolvedValueOnce({ ok: true, newSyncToken: '2' });
+    const fetchWriteSafety = vi.fn()
+      .mockResolvedValueOnce({ bookCloseDate: null, cleared: false, reconciled: false })
+      .mockResolvedValueOnce({ bookCloseDate: null, cleared: true, reconciled: true });
+    const { deps } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn('1'), fetchWriteSafety, recategorize,
+    });
+    await expect(postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps))
+      .resolves.toMatchObject({ ok: true, status: 'POSTED' });
+    expect(fetchWriteSafety).toHaveBeenCalledTimes(2);
+    expect(recategorize).toHaveBeenCalledTimes(2);
+    expect(row.qboSyncToken).toBe('2');
+  });
+
+  it.each(['Purchase', 'Deposit'] as const)(
+    'blocks a closed-period %s before posting and preserves PENDING state',
     async (qboType) => {
       const row = makeTxnRow({ qboType });
       const recategorize = vi.fn();
       const fetchWriteSafety = vi.fn(async () => ({
-        bookCloseDate: null,
-        cleared: qboType === 'Purchase',
-        reconciled: qboType === 'Deposit',
+        bookCloseDate: '2026-07-05',
+        cleared: false,
+        reconciled: false,
       }));
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('0', qboType),
         fetchWriteSafety,
         recategorize,
@@ -368,7 +429,7 @@ describe('legacy write safety', () => {
       expect(result).toMatchObject({
         ok: false,
         status: 'PENDING',
-        error: { code: 'QBO_TRANSACTION_LOCKED' },
+        error: { code: 'QBO_PERIOD_CLOSED' },
       });
       expect(fetchWriteSafety).toHaveBeenCalledWith({
         qboType,
@@ -378,8 +439,87 @@ describe('legacy write safety', () => {
       });
       expect(recategorize).not.toHaveBeenCalled();
       expect(row.status).toBe('PENDING');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: 'BLOCKED_PERIOD_CLOSED',
+            cleared: false,
+            reconciled: false,
+          }),
+        }),
+      );
+      expect(audit).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: 'txn-1',
+        before: 'Ask My Accountant',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_PERIOD_CLOSED' },
+        }),
+      }));
     },
   );
+
+  it('creates a missing actionability row before caching a closed-period lock', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: '2026-07-05',
+        cleared: false,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.transactionActionability.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+
+    await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(db.transactionActionability.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        transactionId: 'txn-1',
+        disposition: 'UNKNOWN',
+      }),
+    });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(2);
+    expect(db.transactionActionability.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ disposition: 'BLOCKED_PERIOD_CLOSED' }),
+      }),
+    );
+  });
+
+  it('returns the original period lock when blocked-outcome persistence fails', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: '2026-07-05',
+        cleared: false,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.$transaction.mockRejectedValueOnce(new Error('temporary database failure'));
+
+    const result = await postTransaction(
+      'txn-1',
+      { id: 'u-1', label: 'Generic User' },
+      {},
+      deps,
+    );
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      status: 'PENDING',
+      error: { code: 'QBO_PERIOD_CLOSED' },
+    });
+  });
 
   it('rechecks safety after a SyncToken conflict before retrying', async () => {
     const row = makeTxnRow();
@@ -387,7 +527,7 @@ describe('legacy write safety', () => {
     const fetchWriteSafety = vi
       .fn()
       .mockResolvedValueOnce({ bookCloseDate: null, cleared: false, reconciled: false })
-      .mockResolvedValueOnce({ bookCloseDate: null, cleared: true, reconciled: false });
+      .mockResolvedValueOnce({ bookCloseDate: '2026-07-05', cleared: true, reconciled: false });
     const { deps } = makeDeps(row, {
       fetchTxn: async () => freshQboTxn('1'),
       fetchWriteSafety,
@@ -401,7 +541,7 @@ describe('legacy write safety', () => {
       deps,
     );
 
-    expect(result).toMatchObject({ status: 'PENDING', error: { code: 'QBO_TRANSACTION_LOCKED' } });
+    expect(result).toMatchObject({ status: 'PENDING', error: { code: 'QBO_PERIOD_CLOSED' } });
     expect(fetchWriteSafety).toHaveBeenCalledTimes(2);
     expect(recategorize).toHaveBeenCalledTimes(1);
   });
@@ -433,7 +573,24 @@ describe('undoPost', () => {
   const postedCompany = { id: 'co-1', dryRun: true, tagsRequired: false, holdingAccountIds: ['4'] };
 
   it.each(['Purchase', 'Deposit'] as const)(
-    'blocks a locked %s before legacy undo and preserves POSTED state',
+    'undoes a reconciled %s in an open period',
+    async (qboType) => {
+      const row = makeTxnRow({ qboType, status: 'POSTED', postedAt: new Date(), company: postedCompany });
+      const moveToAccount = vi.fn().mockResolvedValue({ ok: true, newSyncToken: '5' });
+      const { deps } = makeDeps(row, {
+        fetchTxn: async () => freshQboTxn('4', qboType),
+        fetchWriteSafety: async () => ({ bookCloseDate: null, cleared: true, reconciled: true }),
+        moveToAccount,
+      });
+      await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+        .resolves.toMatchObject({ ok: true, status: 'PENDING' });
+      expect(moveToAccount).toHaveBeenCalledTimes(1);
+      expect(row.qboSyncToken).toBe('5');
+    },
+  );
+
+  it.each(['Purchase', 'Deposit'] as const)(
+    'blocks a closed-period %s before legacy undo and preserves POSTED state',
     async (qboType) => {
       const row = makeTxnRow({
         qboType,
@@ -442,11 +599,11 @@ describe('undoPost', () => {
         company: postedCompany,
       });
       const moveToAccount = vi.fn();
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('4', qboType),
         fetchWriteSafety: async () => ({
-          bookCloseDate: null,
-          cleared: true,
+          bookCloseDate: '2026-07-05',
+          cleared: false,
           reconciled: false,
         }),
         moveToAccount,
@@ -454,9 +611,19 @@ describe('undoPost', () => {
 
       await expect(
         undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps),
-      ).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+      ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
       expect(moveToAccount).not.toHaveBeenCalled();
       expect(row.status).toBe('POSTED');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        txnId: 'txn-1',
+        action: 'blocked',
+        before: 'Software subscriptions',
+        after: 'Blocked — re-queue refused',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_PERIOD_CLOSED' },
+        }),
+      }));
     },
   );
 
@@ -1089,6 +1256,79 @@ function preparedWrite(
   };
 }
 
+function explicitNonPreparedWrite(
+  requestId: string,
+): QboPurchasePreparedWrite {
+  const before: QboPurchaseSnapshot = {
+    ...structuredClone(beforePurchase),
+    globalTaxCalculation: 'NotApplicable',
+    totalTaxCents: 0,
+  };
+  const body: QboPurchasePreparedWrite['body'] = {
+    Id: 'purchase-generic',
+    SyncToken: '7',
+    TxnDate: '2026-07-28',
+    TotalAmt: 10.5,
+    AccountRef: { value: 'payment-generic' },
+    GlobalTaxCalculation: 'NotApplicable',
+    Line: [{
+      Amount: 4,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'expense-generic' },
+        TaxCodeRef: { value: 'NON' },
+      },
+    }, {
+      Amount: 6.5,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'expense-second' },
+        TaxCodeRef: { value: 'NON' },
+      },
+    }],
+  };
+  return {
+    operation: 'recategorize',
+    qboType: 'Purchase',
+    qboId: 'purchase-generic',
+    requestId,
+    requestHash: hashPreparedWriteBody(body),
+    body,
+    before,
+    expected: {
+      qboId: 'purchase-generic',
+      totalCents: -1050,
+      accountQboId: 'payment-generic',
+      date: '2026-07-28',
+      direction: 'purchase',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      targetLines: [{
+        id: null,
+        amountCents: -400,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+      }, {
+        id: null,
+        amountCents: -650,
+        description: null,
+        accountQboId: 'expense-second',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+      }],
+      untouchedLineHashes: [],
+    },
+  };
+}
+
 function restoredWrite(
   original: QboPreparedWrite,
   requestId: string,
@@ -1179,6 +1419,24 @@ function durableTransaction(qboType: PreparedEntity = 'Purchase') {
     revision: 1,
     status: 'PENDING',
     amount: deposit ? 10.5 : -10.5,
+    rawData: deposit ? {} : {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 10.5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxInclusiveAmt: 10.5,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 0 },
+    },
     payee: deposit ? 'Generic Customer' : 'Generic Supplier',
     postedAt: null as Date | null,
     postedByUserId: null as string | null,
@@ -1217,6 +1475,10 @@ function deferred<T>() {
 }
 
 class FakeDurableDb {
+  transactionActionability = {
+    updateMany: vi.fn(async () => ({ count: 1 })),
+  };
+
   transactionRow;
   attempts: DurableAttemptRow[] = [];
   failVerifiedCommitOnce = false;
@@ -1714,7 +1976,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
   it.each([
     ['Purchase', { bookCloseDate: '2026-07-28', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
-    ['Deposit', { bookCloseDate: null, cleared: false, reconciled: true }, 'QBO_TRANSACTION_LOCKED'],
+    ['Deposit', { bookCloseDate: '2026-07-28', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
   ] as const)(
     'blocks a safety-locked %s before COMMITTING or sending',
     async (qboType, evidence, code) => {
@@ -1737,11 +1999,43 @@ describe('commitStagedCategorization durable lifecycle', () => {
         expect.objectContaining({ data: { status: 'COMMITTING' } }),
       ]);
       expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: 'BLOCKED_PERIOD_CLOSED',
+          }),
+        }),
+      );
+      expect(fixture.audit).toHaveBeenCalledTimes(1);
+      expect(fixture.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: DURABLE_TRANSACTION_ID,
+        before: `QuickBooks ${qboType}`,
+        payload: expect.objectContaining({ error: { code } }),
+      }));
 
       const retry = durableDeps(fixture.db);
       await expect(
         commitStagedCategorization(commitInput(), retry.deps),
       ).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+    },
+  );
+
+  it.each(['Purchase', 'Deposit'] as const)(
+    'verifies a category correction on a reconciled %s in an open period',
+    async (qboType) => {
+      const fixture = durableDeps(new FakeDurableDb(qboType));
+      fixture.fetchWriteSafety.mockResolvedValue({
+        bookCloseDate: null,
+        cleared: true,
+        reconciled: true,
+      });
+
+      await expect(
+        commitStagedCategorization(commitInput(), fixture.deps),
+      ).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+      expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+      expect(fixture.db.attempts.at(-1)).toMatchObject({ status: 'VERIFIED' });
     },
   );
 
@@ -1773,6 +2067,38 @@ describe('commitStagedCategorization durable lifecycle', () => {
     });
   });
 
+  // Persisted by the pre-taxDisposition implementation for durableTransaction().
+  // Literal digest deliberately does not use the current hash helper.
+  const legacyStageHash = 'adf42aea57fda2f01d6c61ae82766635660381663699daeed90d6f70ffe787a1';
+
+  it.each(['fresh', 'PREPARED'] as const)(
+    'accepts a legacy stored stage hash for a %s commit after upgrade',
+    async (state) => {
+      const fixture = durableDeps();
+      if (state === 'PREPARED') seedAttempt(fixture.db, state, 'request-generic');
+      await expect(commitStagedCategorization({
+        ...commitInput(),
+        expectedStageHash: legacyStageHash,
+        expectedTaxDisposition: 'set',
+      }, fixture.deps)).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+      expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('reconciles an uncertain pre-upgrade operation using its legacy stored stage hash without resending', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.status = 'ERROR';
+    seedAttempt(fixture.db, 'UNCERTAIN');
+    fixture.fetchPreparedSnapshot.mockReset().mockResolvedValue(structuredClone(verifiedPurchase));
+    await expect(reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      expectedStageHash: legacyStageHash,
+      expectedTaxDisposition: 'set',
+    }, fixture.deps)).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('rejects a mismatched expected stage hash before QBO access on a fresh commit', async () => {
     const fixture = durableDeps();
 
@@ -1790,6 +2116,544 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
     expect(fixture.getClient).not.toHaveBeenCalled();
     expect(fixture.preparePurchaseRecategorization).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a resumed PREPARED explicit NON attempt whose body no longer matches its staged intent', async () => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      { idx: 0, amount: -4, category: 'Bank Charges', categoryQboId: 'expense-generic', taxCode: 'NON', taxCodeQboId: 'NON', memo: null, tags: [] },
+      { idx: 1, amount: -6.5, category: 'Office expense', categoryQboId: 'expense-second', taxCode: 'NON', taxCodeQboId: 'NON', memo: null, tags: [] },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        { idx: 0, subtotalCents: -400, taxCents: 0, totalCents: -400, categoryQboId: 'expense-generic', taxCodeQboId: 'NON', memo: null, tagIds: [] },
+        { idx: 1, subtotalCents: -650, taxCents: 0, totalCents: -650, categoryQboId: 'expense-second', taxCodeQboId: 'NON', memo: null, tagIds: [] },
+      ],
+      tagIds: [],
+    };
+    const prepared = explicitNonPreparedWrite('request-explicit-non-resume');
+    delete prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef;
+    prepared.requestHash = hashPreparedWriteBody(prepared.body);
+    const attempt = seedAttempt(fixture.db, 'PREPARED', 'request-explicit-non-resume');
+    attempt.requestPayload = structuredClone(prepared);
+    attempt.beforeSnapshot = structuredClone(prepared.before);
+    attempt.requestHash = prepared.requestHash;
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValue(structuredClone(prepared.before));
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-resume'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('reconstructs and durably replays an exact preserve-current Purchase stage', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const input = {
+      ...commitInput('request-preserve-current'),
+      expectedTaxDisposition: 'preserve_current' as const,
+      expectedStageHash: hashStagedCategorization(preserved),
+    };
+
+    const first = await commitStagedCategorization(input, fixture.deps);
+    const persistedBody = structuredClone(fixture.db.attempts[0]!.requestPayload);
+    const replay = await commitStagedCategorization(input, fixture.deps);
+
+    expect(first).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(replay).toEqual(first);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      preserved,
+      expect.anything(),
+      'request-preserve-current',
+    );
+    expect(fixture.db.attempts[0]!.requestPayload).toEqual(persistedBody);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconstructs a tax-inclusive preserve-current stage without tax inventory', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Prepared purchase',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Preserved source code',
+      taxCodeQboId: 'tax-generic',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.qboTaxCode.findMany.mockResolvedValue([]);
+    fixture.db.qboTaxRate.findMany.mockResolvedValue([]);
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-inclusive-preserve'),
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: hashStagedCategorization(preserved),
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+
+    expect(fixture.db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(fixture.db.qboTaxRate.findMany).not.toHaveBeenCalled();
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      preserved,
+      expect.anything(),
+      'request-tax-inclusive-preserve',
+    );
+  });
+
+  it('commits a tax-inclusive preserve-current stage at the source gross when the ledger amount is net', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.amount = -9.29;
+    fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
+    fixture.db.transactionRow.rawData = {
+      ...fixture.db.transactionRow.rawData,
+      TotalAmt: 10.5,
+      Line: [{
+        Id: 'line-holding',
+        Amount: 9.29,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxCodeRef: { value: 'tax-generic' },
+          TaxInclusiveAmt: 10.5,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 1.21 },
+    };
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Prepared purchase',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Preserved source code',
+      taxCodeQboId: 'tax-generic',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -929, taxCents: -121, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -929,
+        taxCents: -121,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-inclusive-preserve-net-ledger'),
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: hashStagedCategorization(preserved),
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+  });
+
+  it('commits a tax change whose staged gross differs from the source holding net', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.amount = -12.62;
+    fixture.db.transactionRow.rawData = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 14.14,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 12.62,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxCodeRef: { value: 'old-tax' },
+          TaxInclusiveAmt: 14.14,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 1.52 },
+    };
+    fixture.db.transactionRow.splitLines[0]!.amount = -14.14;
+    fixture.db.qboTaxRate.findMany.mockResolvedValue([{
+      qboId: 'rate-generic',
+      name: 'Generic rate',
+      active: true,
+      rateValue: 13,
+    }]);
+    const before: QboPurchaseSnapshot = {
+      qboId: 'purchase-generic',
+      syncToken: '7',
+      totalCents: -1_414,
+      accountQboId: 'payment-generic',
+      date: '2026-07-28',
+      direction: 'purchase',
+      globalTaxCalculation: 'TaxInclusive',
+      totalTaxCents: -152,
+      lines: [{
+        id: 'line-holding',
+        amountCents: -1_262,
+        description: null,
+        accountQboId: 'holding-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'old-tax',
+        taxAmountCents: -152,
+        taxInclusiveCents: -1_414,
+      }],
+    };
+    const after: QboPurchaseSnapshot = {
+      ...before,
+      syncToken: '8',
+      totalTaxCents: -163,
+      lines: [{
+        ...before.lines[0]!,
+        amountCents: -1_251,
+        accountQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        taxAmountCents: -163,
+      }],
+    };
+    const body: QboPurchasePreparedWrite['body'] = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 14.14,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 12.51,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'expense-generic' },
+          TaxCodeRef: { value: 'tax-generic' },
+          TaxAmount: 1.63,
+          TaxInclusiveAmt: 14.14,
+        },
+      }],
+    };
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      requestId: 'request-tax-gross',
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before,
+      expected: {
+        qboId: 'purchase-generic',
+        totalCents: -1_414,
+        accountQboId: 'payment-generic',
+        date: '2026-07-28',
+        direction: 'purchase',
+        globalTaxCalculation: 'TaxInclusive',
+        totalTaxCents: -163,
+        targetLines: after.lines,
+        untouchedLineHashes: [],
+      },
+    };
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(before)
+      .mockResolvedValue(after);
+    fixture.prepareRecategorization.mockResolvedValueOnce(prepared);
+    fixture.client.fetchTxn = vi.fn(async () => ({
+      ...currentQboTxn('7'),
+      amount: -12.62,
+    }));
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-gross'),
+      expectedTaxDisposition: 'set',
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        taxDisposition: 'set',
+        totals: { subtotalCents: -1_251, taxCents: -163, totalCents: -1_414 },
+      }),
+      before,
+      'request-tax-gross',
+    );
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledWith(prepared);
+  });
+
+  it('reconstructs an exact set NotApplicable Purchase stage with NON on every split', async () => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      {
+        idx: 0,
+        amount: -4,
+        category: 'Bank Charges',
+        categoryQboId: 'expense-generic',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+      {
+        idx: 1,
+        amount: -6.5,
+        category: 'Office expense',
+        categoryQboId: 'expense-second',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        {
+          idx: 0,
+          subtotalCents: -400,
+          taxCents: 0,
+          totalCents: -400,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+        {
+          idx: 1,
+          subtotalCents: -650,
+          taxCents: 0,
+          totalCents: -650,
+          categoryQboId: 'expense-second',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+
+    const prepared = explicitNonPreparedWrite('request-explicit-non-split');
+    fixture.prepareRecategorization.mockResolvedValue(structuredClone(prepared));
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(prepared.before))
+      .mockResolvedValue({
+        ...structuredClone(prepared.before),
+        syncToken: '8',
+        lines: prepared.expected.targetLines.map((line, index) => ({
+          ...line,
+          id: `line-posted-${index}`,
+        })),
+      });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-split'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).resolves.toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        taxCalculation: 'NotApplicable',
+        lines: staged.lines,
+      }),
+      expect.anything(),
+      'request-explicit-non-split',
+    );
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal: expect.objectContaining({
+          taxCalculation: 'NotApplicable',
+          lines: staged.lines,
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    ['omits a target TaxCodeRef', (prepared: QboPurchasePreparedWrite) => {
+      delete prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef;
+    }],
+    ['uses an arbitrary target TaxCodeRef', (prepared: QboPurchasePreparedWrite) => {
+      prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef = { value: 'OTHER' };
+    }],
+    ['uses a mismatched expected target tax code', (prepared: QboPurchasePreparedWrite) => {
+      prepared.expected.targetLines[0]!.taxCodeQboId = 'OTHER';
+    }],
+  ])('rejects an explicit NON stage when preparation %s before persist or send', async (
+    _case,
+    mutate,
+  ) => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      {
+        idx: 0,
+        amount: -4,
+        category: 'Bank Charges',
+        categoryQboId: 'expense-generic',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+      {
+        idx: 1,
+        amount: -6.5,
+        category: 'Office expense',
+        categoryQboId: 'expense-second',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        {
+          idx: 0,
+          subtotalCents: -400,
+          taxCents: 0,
+          totalCents: -400,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+        {
+          idx: 1,
+          subtotalCents: -650,
+          taxCents: 0,
+          totalCents: -650,
+          categoryQboId: 'expense-second',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+    const prepared = explicitNonPreparedWrite('request-explicit-non-invalid');
+    mutate(prepared);
+    prepared.requestHash = hashPreparedWriteBody(prepared.body);
+    fixture.prepareRecategorization.mockResolvedValue(structuredClone(prepared));
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(prepared.before))
+      .mockResolvedValue({
+        ...structuredClone(prepared.before),
+        syncToken: '8',
+        lines: prepared.expected.targetLines.map((line, index) => ({
+          ...line,
+          id: `line-posted-${index}`,
+        })),
+      });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-invalid'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_STATE_DRIFT' });
+
+    expect(fixture.db.attempts).toHaveLength(0);
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
@@ -2284,6 +3148,44 @@ describe('commitStagedCategorization durable lifecycle', () => {
       status: 'RETRYABLE',
       errorCode: 'QBO_PERIOD_CLOSED',
     });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(restarted.audit).toHaveBeenCalledWith(db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock discovered after fresh preparation before sending', async () => {
+    const fixture = durableDeps();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: '2026-07-28',
+        cleared: false,
+        reconciled: false,
+      });
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
   });
 
   it('resumes a persisted PREPARED request when current account and tax references are unavailable', async () => {
@@ -3200,6 +4102,175 @@ describe('prepareCategorizationUndo', () => {
     expect(fixture.audit).not.toHaveBeenCalled();
   });
 
+  it('prepares undo from the exact verified preserve-current stage binding', async () => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.body.GlobalTaxCalculation = 'NotApplicable';
+    sourcePrepared.body.Line![0]!.AccountBasedExpenseLineDetail = {
+      AccountRef: { value: 'expense-generic' },
+      TaxCodeRef: { value: 'NON' },
+    };
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1050,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+        rawHash: 'preserved-target',
+        categoryOnlyHash: 'preserved-category-only',
+      }],
+      untouchedLineHashes: [],
+    };
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    const preservedResponse: QboPurchaseSnapshot = {
+      ...verifiedPurchase,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    };
+    fixture.source.responseSnapshot = structuredClone(preservedResponse);
+    fixture.fetchPurchaseSnapshot.mockResolvedValue(structuredClone(preservedResponse));
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+  });
+
+  it.each(['TaxInclusive', 'TaxExcluded'] as const)(
+    'prepares undo from a real %s preserve-current write with a gross-valued local split',
+    async (taxCalculation) => {
+      const fixture = postedFixture();
+      const raw = {
+        Id: 'purchase-generic', SyncToken: '7', TxnDate: '2026-07-28',
+        TotalAmt: 10.5, AccountRef: { value: 'payment-generic' },
+        GlobalTaxCalculation: taxCalculation,
+        TxnTaxDetail: { TotalTax: 0.5 },
+        Line: [{
+          Id: 'line-holding', Amount: 10, DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: 'holding-generic' }, TaxCodeRef: { value: 'tax-generic' },
+            TaxAmount: 0.5,
+            ...(taxCalculation === 'TaxInclusive' ? { TaxInclusiveAmt: 10.5 } : {}),
+          },
+        }],
+      };
+      const staged: StagedCategorization = {
+        transactionId: DURABLE_TRANSACTION_ID, revision: 1, taxDisposition: 'preserve_current',
+        taxCalculation, totals: { subtotalCents: -1000, taxCents: -50, totalCents: -1050 },
+        lines: [{ idx: 0, subtotalCents: -1000, taxCents: -50, totalCents: -1050,
+          categoryQboId: 'expense-generic', taxCodeQboId: 'tax-generic', memo: null, tagIds: [] }],
+        tagIds: [],
+      };
+      const source = preparePurchaseRecategorization({
+        current: raw, before: mapPurchaseTaxSnapshot(raw),
+        holdingAccountQboIds: ['holding-generic'], staged, requestId: 'source-operation',
+      });
+      fixture.db.transactionRow.amount = -10;
+      fixture.db.transactionRow.rawData = structuredClone(raw);
+      fixture.db.transactionRow.taxCalculation = taxCalculation;
+      fixture.db.transactionRow.splitLines = [{ idx: 0, amount: -10.5,
+        category: 'Prepared purchase', categoryQboId: 'expense-generic',
+        taxCode: 'Generic tax', taxCodeQboId: 'tax-generic', memo: null, tags: [] }];
+      fixture.db.transactionRow.txnTags = [];
+      fixture.source.requestPayload = structuredClone(source);
+      fixture.source.requestHash = source.requestHash;
+      fixture.source.beforeSnapshot = structuredClone(source.before);
+      const response = mapPurchaseTaxSnapshot({ ...source.body, SyncToken: '8' });
+      fixture.source.responseSnapshot = structuredClone(response);
+      fixture.fetchPurchaseSnapshot.mockResolvedValue(response);
+      const fresh = { ...currentQboTxn('8'), raw: { ...source.body, SyncToken: '8' } };
+      vi.mocked(fixture.client.fetchTxn!).mockResolvedValue(fresh);
+      fixture.preparePurchaseRestore.mockImplementation(async (_txn, original, requestId) =>
+        preparePurchaseRestore({ current: fresh.raw, prepared: original, requestId }));
+
+      await expect(prepareCategorizationUndo(input(), fixture.deps))
+        .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+      expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+
+      fixture.db.transactionRow.rawData = structuredClone(fresh.raw);
+      await expect(prepareCategorizationUndo(input(), fixture.deps))
+        .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+
+      fixture.db.transactionRow.splitLines[0]!.amount = -10;
+      fixture.preparePurchaseRestore.mockClear();
+      await expect(prepareCategorizationUndo(input(), fixture.deps))
+        .rejects.toMatchObject({ code: 'STALE_STAGE' });
+      expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a preserve-current undo whose recorded source tax mode is corrupt', async () => {
+    const fixture = postedFixture();
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.body.Line![0]!.AccountBasedExpenseLineDetail = {
+      AccountRef: { value: 'expense-generic' },
+      TaxCodeRef: { value: 'NON' },
+    };
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: null,
+      totalTaxCents: 0,
+      preservedHash: 'preserved-corrupt-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1050,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+        rawHash: 'preserved-corrupt-target',
+        categoryOnlyHash: 'preserved-corrupt-category-only',
+      }],
+      untouchedLineHashes: [],
+    } as unknown as QboPurchasePreparedWrite['expected'];
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    fixture.source.responseSnapshot = {
+      ...verifiedPurchase,
+      globalTaxCalculation: null,
+      totalTaxCents: 0,
+      preservedHash: 'preserved-corrupt-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    } as unknown as QboPurchaseSnapshot;
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .rejects.toMatchObject({
+        code: 'ATTEMPT_CORRUPT',
+        message: 'Verified preserved Purchase source is incomplete.',
+      });
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('hashes the complete source and restore bindings while excluding only the throwaway request ID', async () => {
     expect(hashPreparedWriteBinding(preparedWrite('request-a')))
       .toBe(hashPreparedWriteBinding(preparedWrite('request-b')));
@@ -3571,11 +4642,11 @@ describe('undoCategorization', () => {
     expect(fixture.db.transactionRow.status).toBe('REVERTED');
   });
 
-  it('blocks a reconciled transaction before a prepared undo can enter COMMITTING', async () => {
+  it('blocks a closed-period transaction before a prepared undo can enter COMMITTING', async () => {
     const fixture = postedFixture();
     fixture.fetchWriteSafety.mockResolvedValueOnce({
-      bookCloseDate: null,
-      cleared: true,
+      bookCloseDate: '2026-07-28',
+      cleared: false,
       reconciled: false,
     });
 
@@ -3584,11 +4655,105 @@ describe('undoCategorization', () => {
       companyId: DURABLE_COMPANY_ID,
       requestId: 'request-undo-locked',
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
-    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
 
     expect(fixture.db.attempts).toHaveLength(1);
     expect(fixture.prepareRestore).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock discovered after fresh restore preparation before sending', async () => {
+    const fixture = postedFixture();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: '2026-07-28',
+        cleared: false,
+        reconciled: false,
+      });
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo-final-lock',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a period lock when resuming a persisted PREPARED restore', async () => {
+    const fixture = postedFixture();
+    seedAttempt(fixture.db, 'PREPARED', 'request-undo', 'restore');
+    fixture.fetchWriteSafety.mockResolvedValueOnce({
+      bookCloseDate: '2026-07-28',
+      cleared: false,
+      reconciled: false,
+    });
+
+    await expect(
+      undoCategorization({
+        transactionId: DURABLE_TRANSACTION_ID,
+        companyId: DURABLE_COMPANY_ID,
+        requestId: 'request-undo',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      status: 'RETRYABLE',
+      errorCode: 'QBO_PERIOD_CLOSED',
+    });
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('verifies undo on a reconciled transaction in an open period', async () => {
+    const fixture = postedFixture();
+    resetForVerifiedRestore(fixture);
+    fixture.fetchWriteSafety.mockResolvedValue({
+      bookCloseDate: null,
+      cleared: true,
+      reconciled: true,
+    });
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo-reconciled',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps)).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.db.attempts.at(-1)).toMatchObject({ operation: 'restore', status: 'VERIFIED' });
   });
 
   it('prepares and verifies undo from persisted proof when current references are unavailable', async () => {
@@ -3969,6 +5134,52 @@ describe.each(['Purchase', 'Deposit'] as const)(
       );
     });
 
+    it('allows two prepared lines to reuse the same active tax code', async () => {
+      const db = new FakeDurableDb(qboType);
+      const deposit = qboType === 'Deposit';
+      db.transactionRow.amount = 210;
+      db.transactionRow.taxCalculation = 'TaxExcluded';
+      db.transactionRow.splitLines = [
+        {
+          idx: 0,
+          amount: 105,
+          category: 'Prepared first line',
+          categoryQboId: deposit ? 'income-generic-a' : 'expense-generic-a',
+          taxCode: 'Shared tax',
+          taxCodeQboId: 'tax-shared',
+          memo: 'Prepared first line',
+        },
+        {
+          idx: 1,
+          amount: 105,
+          category: 'Prepared second line',
+          categoryQboId: deposit ? 'income-generic-b' : 'expense-generic-b',
+          taxCode: 'Shared tax',
+          taxCodeQboId: 'tax-shared',
+          memo: 'Prepared second line',
+        },
+      ];
+      const fixture = durableDeps(db);
+      fixture.db.qboAccount.findMany.mockResolvedValue([
+        { qboId: deposit ? 'income-generic-a' : 'expense-generic-a', active: true },
+        { qboId: deposit ? 'income-generic-b' : 'expense-generic-b', active: true },
+      ]);
+      fixture.db.qboTaxCode.findMany.mockResolvedValue([{
+        qboId: 'tax-shared',
+        name: 'Shared tax',
+        active: true,
+        taxable: true,
+        purchaseTaxRateList: [{ taxRateQboId: 'rate-generic', taxTypeApplicable: 'TaxOnAmount' }],
+        salesTaxRateList: [{ taxRateQboId: 'rate-generic', taxTypeApplicable: 'TaxOnAmount' }],
+        combinedSalesRate: 5,
+      }]);
+
+      await expect(commitStagedCategorization(commitInput(), fixture.deps)).resolves.toMatchObject({
+        ok: true,
+        outcome: 'VERIFIED',
+      });
+    });
+
     it('fails closed when no exact tax-exclusive inverse exists', async () => {
       const db = new FakeDurableDb(qboType);
       db.transactionRow.amount = 0.01;
@@ -4072,6 +5283,55 @@ describe.each(['Purchase', 'Deposit'] as const)(
     });
   },
 );
+
+describe('fresh prepared snapshot source', () => {
+  it('derives the Purchase before-image from the same live entity used to prepare the write', async () => {
+    const fixture = durableDeps();
+    const fresh = currentQboTxn();
+    fresh.raw = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 10.5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+        },
+      }],
+    };
+    fixture.client.fetchTxn = vi.fn(async () => fresh);
+    fixture.fetchPreparedSnapshot.mockReset().mockResolvedValue(
+      structuredClone(verifiedPurchase),
+    );
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).resolves.toMatchObject({ ok: true, status: 'POSTED', outcome: 'VERIFIED' });
+
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      fresh,
+      expect.objectContaining({
+        transactionId: stagedPurchase.transactionId,
+        revision: stagedPurchase.revision,
+        taxCalculation: stagedPurchase.taxCalculation,
+        totals: stagedPurchase.totals,
+      }),
+      expect.objectContaining({
+        qboId: 'purchase-generic',
+        syncToken: '7',
+        preservedHash: expect.any(String),
+        lines: [expect.objectContaining({ rawHash: expect.any(String) })],
+      }),
+      'request-generic',
+    );
+    expect(fixture.fetchPreparedSnapshot).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('Deposit durable lifecycle matrix', () => {
   it('persists the Deposit union member before send and fences the Deposit entity', async () => {

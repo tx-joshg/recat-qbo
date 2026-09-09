@@ -13,6 +13,8 @@ import {
   MOCK_REALM_HARBOR,
   resetMockRealms,
 } from './mock.js';
+import { verifyPreparedResult } from '../../services/tax/verify.js';
+import { mapPurchaseTaxSnapshot } from './purchaseTax.js';
 import { mapDepositSnapshot } from './depositTax.js';
 import type { StagedCategorization } from '@recat/shared';
 import {
@@ -593,7 +595,7 @@ describe('MockQboClient tax fixtures', () => {
   it('returns signed purchase and refund snapshots with complete account-expense detail', async () => {
     const bluebird = new MockQboClient(MOCK_REALM_BLUEBIRD, ['3', '4']);
 
-    await expect(bluebird.fetchPurchaseSnapshot('14')).resolves.toEqual({
+    await expect(bluebird.fetchPurchaseSnapshot('14')).resolves.toMatchObject({
       qboId: '14',
       syncToken: '0',
       totalCents: -21430,
@@ -1191,20 +1193,19 @@ describe('MockQboClient prepared Purchase writes', () => {
       ok: true,
       newSyncToken: '8',
     });
-    await expect(c.fetchPurchaseSnapshot('PURCHASE_GENERIC')).resolves.toEqual({
+    const readback = await c.fetchPurchaseSnapshot('PURCHASE_GENERIC');
+    expect(readback).toMatchObject({
       qboId: prepared.expected.qboId,
       syncToken: '8',
       totalCents: prepared.expected.totalCents,
-      accountQboId: prepared.expected.accountQboId,
-      date: prepared.expected.date,
-      direction: prepared.expected.direction,
-      globalTaxCalculation: prepared.expected.globalTaxCalculation,
       totalTaxCents: prepared.expected.totalTaxCents,
       lines: [
-        before.lines[1],
-        { ...prepared.expected.targetLines[0], id: '1001' },
+        mapPurchaseTaxSnapshot(raw).lines[1],
+        prepared.expected.targetLines[0],
       ],
     });
+    if (!readback) throw new Error('generic readback missing');
+    expect(verifyPreparedResult(prepared, readback)).toEqual({ ok: true });
 
     const posted = await c.fetchTxn('Purchase', 'PURCHASE_GENERIC');
     if (!posted) throw new Error('generic posted fixture missing');
@@ -1213,7 +1214,7 @@ describe('MockQboClient prepared Purchase writes', () => {
       SyncToken: '8',
       Line: [
         prepared.body.Line![0]!,
-        { ...prepared.body.Line![1]!, Id: '1001' },
+        prepared.body.Line![1]!,
       ],
     };
     expect(posted.raw).toEqual(expectedPostedRaw);
@@ -1227,11 +1228,56 @@ describe('MockQboClient prepared Purchase writes', () => {
     ).toEqual(expectedPostedRaw);
     const restore = await c.preparePurchaseRestore(posted, prepared, 'REQUEST_RESTORE_GENERIC');
     await expect(c.sendPreparedWrite(restore)).resolves.toEqual({ ok: true, newSyncToken: '9' });
-    await expect(c.fetchPurchaseSnapshot('PURCHASE_GENERIC')).resolves.toEqual({
-      ...before,
-      syncToken: '9',
-    });
+    const restored = await c.fetchPurchaseSnapshot('PURCHASE_GENERIC');
+    expect(restored).toMatchObject({ ...before, syncToken: '9' });
+    expect(restored).toEqual({ ...mapPurchaseTaxSnapshot(restore.body), syncToken: '9' });
+    if (!restored) throw new Error('generic restore missing');
+    expect(verifyPreparedResult(restore, restored)).toEqual({ ok: true });
   });
+
+  it.each(['set', 'preserve_current'] as const)(
+    'verifies mock Purchase %s writes with untouched lines and their undo',
+    async (taxDisposition) => {
+      addCategorizedLine();
+      const c = client();
+      const seed = await c.fetchTxn('Purchase', '2');
+      if (!seed) throw new Error('fixture missing');
+      const raw = structuredClone(seed.raw) as RawPurchase;
+      raw.GlobalTaxCalculation = 'NotApplicable';
+      raw.TxnTaxDetail = { TotalTax: 0 };
+      raw.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef = { value: 'NON' };
+      raw.Line![1]!.CustomField = [{ Name: 'Retained detail', StringValue: 'Generic value' }];
+      const realm = getMockRealm(MOCK_REALM_HARBOR);
+      realm.rawPurchases = realm.rawPurchases.filter((item) => item.Id !== raw.Id);
+      realm.rawPurchases.push(raw);
+      const current = await c.fetchTxn('Purchase', '2');
+      if (!current) throw new Error('fixture missing');
+      const before = await c.fetchPreparedSnapshot('Purchase', '2');
+      if (!before) throw new Error('snapshot missing');
+      const staged: StagedCategorization = {
+        transactionId: '00000000-0000-4000-8000-000000000001',
+        revision: 1,
+        taxDisposition,
+        taxCalculation: 'NotApplicable',
+        totals: { subtotalCents: -48612, taxCents: 0, totalCents: -48612 },
+        lines: [{ idx: 0, subtotalCents: -48612, taxCents: 0, totalCents: -48612,
+          categoryQboId: '10', taxCodeQboId: 'NON', memo: null }],
+        tagIds: [],
+      };
+      const prepared = await c.prepareRecategorization(current, staged, before, 'request-mock-verified');
+      await expect(c.sendPreparedWrite(prepared)).resolves.toMatchObject({ ok: true });
+      const actual = await c.fetchPreparedSnapshot('Purchase', '2');
+      if (!actual) throw new Error('readback missing');
+      expect(verifyPreparedResult(prepared, actual)).toEqual({ ok: true });
+      const posted = await c.fetchTxn('Purchase', '2');
+      if (!posted) throw new Error('posted fixture missing');
+      const restore = await c.preparePurchaseRestore(posted, prepared, 'request-mock-undo');
+      await expect(c.sendPreparedWrite(restore)).resolves.toMatchObject({ ok: true });
+      const restored = await c.fetchPreparedSnapshot('Purchase', '2');
+      if (!restored) throw new Error('restore readback missing');
+      expect(verifyPreparedResult(restore, restored)).toEqual({ ok: true });
+    },
+  );
 
   it('rejects a stale prepared body before mutating mock state', async () => {
     const realm = getMockRealm(MOCK_REALM_HARBOR);

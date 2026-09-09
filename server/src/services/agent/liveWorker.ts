@@ -847,6 +847,7 @@ export async function isClaimedLiveJobAuthorized(
     || config.liveAcceptedPolicyVersion !== LIVE_POLICY_VERSION
     || config.liveAcceptedConfigVersion !== job.configVersion
   ) return false;
+  if (job.schedulingGeneration !== config.schedulingGeneration) return false;
   const readiness = await evaluateLiveGates(job.companyId);
   const failed = readiness.gates.filter((gate) => !gate.ok);
   if (failed.length === 0) return true;

@@ -32,6 +32,7 @@ export interface AgentJob {
   transactionId: string;
   revision: number;
   configVersion: string;
+  schedulingGeneration: number;
   status: AgentJobStatus;
   dueAt: Date;
   lockOwner: string | null;
@@ -80,8 +81,10 @@ export class AgentJobError extends Error {
 
 /**
  * Enqueues each current pending transaction once for the company's immutable
- * configuration version. The database unique index makes repeated schedulers
- * and concurrent discovery calls idempotent.
+ * configuration version and scheduling intent. The unique index makes repeated
+ * schedulers and concurrent discovery calls idempotent. Generation zero retains
+ * existing discovery; explicit new intent only schedules unstaged, unattempted
+ * revisions and cannot override terminal work or an administrator's cancellation.
  */
 export async function discoverShadowJobs(
   companyId: string,
@@ -91,10 +94,10 @@ export async function discoverShadowJobs(
   const now = await currentTime(deps.db, deps);
   return deps.db.$queryRawUnsafe<AgentJob[]>(
     `INSERT INTO "AgentJob" (
-       "id", "companyId", "transactionId", "revision", "configVersion",
+       "id", "companyId", "transactionId", "revision", "configVersion", "schedulingGeneration",
        "status", "dueAt", "createdAt", "updatedAt"
      )
-     SELECT gen_random_uuid(), txn."companyId", txn."id", txn."revision", config."configVersion",
+     SELECT gen_random_uuid(), txn."companyId", txn."id", txn."revision", config."configVersion", config."schedulingGeneration",
        'queued', $1, $1, $1
      FROM "Transaction" AS txn
      JOIN "AgentCompanyConfig" AS config ON config."companyId" = txn."companyId"
@@ -103,7 +106,26 @@ export async function discoverShadowJobs(
        AND txn."status" = 'PENDING'
        AND config."mode" = 'shadow'
        AND company."disconnectedAt" IS NULL
-     ON CONFLICT ("companyId", "transactionId", "revision", "configVersion") DO NOTHING
+       AND (
+         config."schedulingGeneration" = 0
+         OR (
+           txn."category" IS NULL AND txn."categoryQboId" IS NULL
+           AND txn."taxCalculation" IS NULL AND txn."taxCode" IS NULL AND txn."taxCodeQboId" IS NULL
+           AND NOT EXISTS (SELECT 1 FROM "SplitLine" line WHERE line."txnId" = txn."id")
+           AND NOT EXISTS (SELECT 1 FROM "TxnTag" tag WHERE tag."txnId" = txn."id")
+           AND NOT EXISTS (
+             SELECT 1 FROM "QboMutationAttempt" attempt
+             WHERE attempt."transactionId" = txn."id" AND attempt."expectedRevision" >= txn."revision"
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM "AgentJob" previous
+             WHERE previous."companyId" = txn."companyId" AND previous."transactionId" = txn."id"
+               AND previous."revision" = txn."revision"
+               AND (previous."status" = 'terminal' OR previous."lastErrorCode" = 'AGENT_CANCELLED_BY_ADMIN')
+           )
+         )
+       )
+     ON CONFLICT ("companyId", "transactionId", "revision", "configVersion", "schedulingGeneration") DO NOTHING
      RETURNING ${returningColumns()}`,
     now,
     companyId,
@@ -199,6 +221,7 @@ export async function claimShadowJobs(
                  config."companyId" IS NULL
                  OR config."mode" <> 'shadow'
                  OR config."configVersion" <> job."configVersion"
+                 OR config."schedulingGeneration" <> job."schedulingGeneration"
                  OR company."disconnectedAt" IS NOT NULL
                )
                AND NOT (
@@ -313,6 +336,7 @@ export async function claimShadowJobs(
              (
                config."mode" = 'shadow'
                AND config."configVersion" = job."configVersion"
+               AND config."schedulingGeneration" = job."schedulingGeneration"
                AND company."disconnectedAt" IS NULL
              )
              OR txn."revision" = job."revision" + 1
@@ -493,6 +517,7 @@ export async function cancelSupersededAgentJob(
                OR config."companyId" IS NULL
                OR config."mode" <> 'shadow'
                OR config."configVersion" <> job."configVersion"
+               OR config."schedulingGeneration" <> job."schedulingGeneration"
                OR company."disconnectedAt" IS NOT NULL
              )
          )
@@ -624,7 +649,7 @@ export function retryDelayMs(attempt: number): number {
 function returningColumns(alias?: string): string {
   const prefix = alias === undefined ? '' : `${alias}.`;
   return `${prefix}"id", ${prefix}"companyId", ${prefix}"transactionId", ${prefix}"revision",
-    ${prefix}"configVersion", ${prefix}"status", ${prefix}"dueAt", ${prefix}"lockOwner",
+    ${prefix}"configVersion", ${prefix}"schedulingGeneration", ${prefix}"status", ${prefix}"dueAt", ${prefix}"lockOwner",
     ${prefix}"leaseExpiresAt", ${prefix}"attemptCount", ${prefix}"lastErrorCode",
     ${prefix}"createdAt", ${prefix}"updatedAt"`;
 }

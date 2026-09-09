@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   getInstanceSettings: vi.fn(),
@@ -100,5 +100,57 @@ describe('completeCategory', () => {
     else mocks.fetch.mockResolvedValueOnce(value);
 
     await expect(completeCategory('choose one')).resolves.toBeNull();
+  });
+});
+
+describe('category completion deadline', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ['custom', 'headers'],
+    ['custom', 'body'],
+    ['openrouter', 'headers'],
+    ['openrouter', 'body'],
+  ])('bounds a stalled %s response at %s', async (provider, stage) => {
+    const settings = await mocks.getInstanceSettings();
+    mocks.getInstanceSettings.mockResolvedValue({ ...settings, suggestionProvider: provider });
+    mocks.fetch.mockImplementation((_url: string, init: RequestInit) => {
+      const stalled = () => new Promise<never>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+      return stage === 'headers' ? stalled() : Promise.resolve({ ok: true, json: stalled });
+    });
+    let result: string | null | undefined;
+    const completion = completeCategory('choose one').then((value) => { result = value; });
+
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(result).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(result).toBeNull();
+    await completion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['success', 'http error', 'body error'])('cleans up the deadline after %s', async (outcome) => {
+    let signal: AbortSignal | null | undefined;
+    mocks.fetch.mockImplementation(async (_url: string, init: RequestInit) => {
+      signal = init.signal;
+      return {
+        ok: outcome !== 'http error',
+        json: async () => {
+          if (outcome === 'body error') throw new Error('invalid JSON');
+          return { choices: [{ message: { content: 'Office supplies' } }] };
+        },
+      };
+    });
+
+    expect(await completeCategory('choose one')).toBe(outcome === 'success' ? 'Office supplies' : null);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(signal?.aborted).not.toBe(true);
   });
 });

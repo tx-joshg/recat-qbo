@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 import type { AuditEntryDto } from '@recat/shared';
 import {
   AUDIT_CSV_HEADER,
@@ -68,6 +69,126 @@ describe('buildAuditCsv', () => {
     // Quoted newline stays inside the quoted field; naive line count is header + 2
     // but a CSV parser sees exactly one record. Assert the quoting is present.
     expect(csv).toContain('"Split:\nOffice / Meals"');
+  });
+});
+
+describe('writeAudit legacy payload redaction', () => {
+  const auditFields = {
+    companyId: 'company-example',
+    actorLabel: 'Example operator',
+    payee: 'Example supplier',
+    amount: -12.34,
+    action: 'posted' as const,
+    before: 'Holding',
+    after: 'Office supplies',
+  };
+
+  it('redacts nested credential keys before persistence without mutating the caller payload', async () => {
+    const payload = Object.freeze({
+      qbo: Object.freeze({ Id: 'purchase-example', SyncToken: '7', authorization: 'synthetic-authorization' }),
+      syncToken: '7',
+      accessToken: 'synthetic-access',
+      nested: Object.freeze([
+        Object.freeze({ refresh_token: 'synthetic-refresh', amount: 12.34, active: true }),
+        null,
+        'ordinary accounting note',
+      ]),
+    });
+    const create = vi.fn(async (_args: { data: Record<string, unknown> }) => undefined);
+
+    await writeAudit({ auditEntry: { create } } as never, { ...auditFields, payload });
+
+    expect(create.mock.calls[0]?.[0].data).toEqual({
+      ...auditFields,
+      actorId: null,
+      txnId: null,
+      payload: {
+        qbo: { Id: 'purchase-example', SyncToken: '7', authorization: '[REDACTED]' },
+        syncToken: '7',
+        accessToken: '[REDACTED]',
+        nested: [{ refresh_token: '[REDACTED]', amount: 12.34, active: true }, null, 'ordinary accounting note'],
+      },
+    });
+    expect(payload.qbo.authorization).toBe('synthetic-authorization');
+    expect(payload.accessToken).toBe('synthetic-access');
+    expect(payload.nested[0]).toEqual({ refresh_token: 'synthetic-refresh', amount: 12.34, active: true });
+  });
+
+  it('redacts credential spelling variants inside a top-level array', async () => {
+    const payload = [{
+      Authorization: 'synthetic-authorization',
+      clientSecret: 'synthetic-client-secret',
+      client_secret: 'synthetic-client-secret',
+      'client-secret': 'synthetic-client-secret',
+      apiKey: 'synthetic-api-key',
+      api_key: 'synthetic-api-key',
+      'api-key': 'synthetic-api-key',
+      password: 'synthetic-password',
+      sessionToken: 'synthetic-session',
+      Line: [{ Amount: 12.34, AccountRef: { value: 'expense-example' } }],
+    }];
+    const create = vi.fn(async (_args: { data: Record<string, unknown> }) => undefined);
+
+    await writeAudit({ auditEntry: { create } } as never, { ...auditFields, payload });
+
+    expect(create.mock.calls[0]?.[0].data.payload).toEqual([{
+      Authorization: '[REDACTED]',
+      clientSecret: '[REDACTED]',
+      client_secret: '[REDACTED]',
+      'client-secret': '[REDACTED]',
+      apiKey: '[REDACTED]',
+      api_key: '[REDACTED]',
+      'api-key': '[REDACTED]',
+      password: '[REDACTED]',
+      sessionToken: '[REDACTED]',
+      Line: [{ Amount: 12.34, AccountRef: { value: 'expense-example' } }],
+    }]);
+  });
+
+  it('preserves Date and Decimal JSON values without changing the caller payload', async () => {
+    const date = Object.freeze(new Date('2026-01-02T03:04:05.000Z'));
+    const amount = Object.freeze(new Prisma.Decimal('12.34'));
+    const payload = Object.freeze({ at: date, nested: Object.freeze([amount]) });
+    const create = vi.fn(async (_args: { data: Record<string, unknown> }) => undefined);
+
+    await writeAudit({ auditEntry: { create } } as never, { ...auditFields, payload });
+
+    expect(create.mock.calls[0]?.[0].data.payload).toEqual({
+      at: '2026-01-02T03:04:05.000Z', nested: ['12.34'],
+    });
+    expect(payload.at).toBe(date);
+    expect(date.toISOString()).toBe('2026-01-02T03:04:05.000Z');
+    expect(payload.nested[0]).toBe(amount);
+    expect(amount.toString()).toBe('12.34');
+  });
+
+  it('calls custom JSON serialization once and redacts its resulting credential fields', async () => {
+    const serialized = Object.freeze({ nested: Object.freeze({ secret: 'synthetic-secret', amount: 12.34 }) });
+    const toJSON = vi.fn(() => serialized);
+    const payload = Object.freeze({ details: Object.freeze({ toJSON }) });
+    const create = vi.fn(async (_args: { data: Record<string, unknown> }) => undefined);
+
+    await writeAudit({ auditEntry: { create } } as never, { ...auditFields, payload });
+
+    expect(toJSON).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0]?.[0].data.payload).toEqual({
+      details: { nested: { secret: '[REDACTED]', amount: 12.34 } },
+    });
+    expect(serialized.nested.secret).toBe('synthetic-secret');
+  });
+
+  it.each([
+    'secret', 'secret_key', 'privateKey', 'private_key', 'accessKey',
+    'access_key', 'passwd', 'pwd', 'bearer', 'credentials', 'passphrase',
+  ])('redacts the credential field %s', async (key) => {
+    const create = vi.fn(async (_args: { data: Record<string, unknown> }) => undefined);
+    await writeAudit({ auditEntry: { create } } as never, {
+      ...auditFields,
+      payload: { nested: { [key]: 'synthetic-value', amount: 12.34 } },
+    });
+    expect(create.mock.calls[0]?.[0].data.payload).toEqual({
+      nested: { [key]: '[REDACTED]', amount: 12.34 },
+    });
   });
 });
 

@@ -1,7 +1,7 @@
 // Settings — "Category suggestions" card (Recat.dc.html lines 830–852).
 // Source select (built-in / AI / off); when AI, endpoint + key saved on blur.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { InstanceSettingsDto, SuggestionProvider, SuggestionSetting } from '@recat/shared';
 import { instanceSettings } from '../../lib/api';
 import { InfoDot } from '../../components/ui';
@@ -22,7 +22,18 @@ export default function SuggestionsCard({
   const [openrouterKey, setOpenrouterKey] = useState('');
   const [openrouterReferer, setOpenrouterReferer] = useState(settings.openrouterReferer);
   const [openrouterTitle, setOpenrouterTitle] = useState(settings.openrouterTitle);
-  const [aiModel, setAiModel] = useState(settings.suggestionModel);
+  const [modelDraft, setModelDraft] = useState({
+    value: settings.suggestionModel,
+    saved: settings.suggestionModel,
+  });
+
+  useEffect(() => {
+    // Follow effective defaults and external updates only while the field is pristine.
+    setModelDraft((draft) => ({
+      value: draft.value === draft.saved ? settings.suggestionModel : draft.value,
+      saved: settings.suggestionModel,
+    }));
+  }, [settings.suggestionModel]);
 
   const setSource = (source: SuggestionSetting) => {
     instanceSettings
@@ -59,13 +70,21 @@ export default function SuggestionsCard({
   };
 
   const saveModel = () => {
-    const value = aiModel.trim();
-    if (value === '' || value === settings.suggestionModel) return;
+    const submittedDraft = modelDraft.value;
+    const value = submittedDraft.trim();
+    if (value === '') return;
+    if (value === settings.suggestionModel) {
+      setModelDraft({ value, saved: settings.suggestionModel });
+      return;
+    }
     instanceSettings
       .patch({ suggestionModel: value })
       .then((updated) => {
         onSettings(updated);
-        setAiModel(updated.suggestionModel);
+        setModelDraft((draft) => ({
+          value: draft.value === submittedDraft ? updated.suggestionModel : draft.value,
+          saved: updated.suggestionModel,
+        }));
       })
       .catch((err) => toast(errMsg(err)));
   };
@@ -240,8 +259,8 @@ export default function SuggestionsCard({
               </label>
               <input
                 className="input"
-                value={aiModel}
-                onChange={(e) => setAiModel(e.target.value)}
+                value={modelDraft.value}
+                onChange={(e) => setModelDraft({ ...modelDraft, value: e.target.value })}
                 onBlur={saveModel}
                 placeholder={settings.suggestionProvider === 'openrouter' ? 'openai/gpt-4o-mini' : 'gpt-4o-mini'}
                 style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}

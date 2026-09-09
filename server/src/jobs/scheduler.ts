@@ -18,6 +18,7 @@ import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 import { resolvePublicUrl } from '../services/publicUrl.js';
+import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -170,6 +171,11 @@ export async function runReceiptTick(): Promise<void> {
 async function tick(): Promise<void> {
   const now = new Date();
   try {
+    await sweepQboTokenRevocations();
+  } catch {
+    console.error('[jobs] disconnect revocation recovery failed');
+  }
+  try {
     await recoverStuckAttachmentOperations({ now });
   } catch {
     console.error('[jobs] attachment recovery failed');
@@ -202,6 +208,7 @@ async function tick(): Promise<void> {
 export function startJobs(): void {
   if (ticker !== null) return;
   startAgentScheduler();
+  sweepQboTokenRevocations().catch(() => console.error('[jobs] boot disconnect revocation recovery failed'));
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));
   recoverStuckAttachmentOperations()

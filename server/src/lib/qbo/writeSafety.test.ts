@@ -36,14 +36,25 @@ describe('QuickBooks write safety', () => {
     })).not.toThrow();
   });
 
-  it.each([
-    [{ cleared: true, reconciled: false }, 'cleared'],
-    [{ cleared: false, reconciled: true }, 'reconciled'],
-  ])('blocks a %s bank line', (status) => {
-    expect(() => assertQboWriteAllowed({ ...purchase, qboType: 'Deposit' }, {
-      bookCloseDate: null,
-      ...status,
-    })).toThrow(expect.objectContaining({ code: 'QBO_TRANSACTION_LOCKED' }));
+  describe.each(['Purchase', 'Deposit'] as const)('%s category and tax writes', (qboType) => {
+    it.each([
+      { cleared: true, reconciled: false },
+      { cleared: false, reconciled: true },
+      { cleared: true, reconciled: true },
+    ])('allows an open-period bank line with %j', (status) => {
+      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, {
+        bookCloseDate: null,
+        ...status,
+      })).not.toThrow();
+    });
+
+    it('still blocks a reconciled transaction in closed books', () => {
+      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, {
+        bookCloseDate: '2026-08-01',
+        cleared: true,
+        reconciled: true,
+      })).toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
+    });
   });
 
   it.each([

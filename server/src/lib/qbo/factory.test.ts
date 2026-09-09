@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   company: {
     findUnique: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   },
   appConfig: {
     findMany: vi.fn(),
@@ -79,6 +80,7 @@ beforeEach(() => {
   mocks.appConfig.findMany.mockResolvedValue([]);
   mocks.appConfig.findUnique.mockResolvedValue(null);
   mocks.company.update.mockResolvedValue(undefined);
+  mocks.company.updateMany.mockResolvedValue({ count: 1 });
 });
 
 afterEach(() => {
@@ -107,6 +109,72 @@ describe('revokeCapturedQboToken', () => {
     await expect(revoking).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({ token: 'refresh' }));
+  });
+});
+
+describe('refresh credential generation', () => {
+  it.each(['disconnect', 'reconnect'] as const)(
+    'rejects a stale refresh after %s and cannot use its unpersisted token', async (transition) => {
+      const current = { ...companyRow(REAL_REALM), tokenExpiresAt: new Date(Date.now() - 1) };
+      mocks.company.findUnique.mockImplementation(async () => ({ ...current }));
+      mocks.company.updateMany.mockImplementation(async ({ where, data }) => {
+        if (current.disconnectedAt !== null || current.accessToken !== where.accessToken
+          || current.refreshToken !== where.refreshToken) return { count: 0 };
+        Object.assign(current, data);
+        return { count: 1 };
+      });
+      let release!: (response: Response) => void;
+      const grant = new Promise<Response>((resolve) => { release = resolve; });
+      const fetchMock = vi.fn(async (url: string | URL | Request) => {
+        if (String(url).includes('/tokens/bearer')) return grant.then((response) => response.clone());
+        return new Response(JSON.stringify({ CompanyInfo: { LegalName: 'Synthetic ledger' } }), { status: 200 });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const client = await qboFactory.forCompany(current.id);
+      const request = client.getCompanyInfo();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const replacement = transition === 'disconnect' ? null : encrypt('synthetic-new-session-refresh');
+      current.disconnectedAt = transition === 'disconnect' ? new Date() : null;
+      current.accessToken = transition === 'disconnect' ? null : encrypt('synthetic-new-session-access');
+      current.refreshToken = replacement;
+      release(new Response(JSON.stringify({
+        access_token: 'synthetic-stale-access', refresh_token: 'synthetic-stale-refresh', expires_in: 3600,
+      }), { status: 200 }));
+      await expect(request).rejects.toMatchObject({ code: 'QBO_AUTH' });
+      await expect(client.getCompanyInfo()).rejects.toMatchObject({ code: 'QBO_AUTH' });
+      expect(current.refreshToken).toBe(replacement);
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/companyinfo/'))).toHaveLength(0);
+    },
+  );
+});
+
+describe('successive credential rotations', () => {
+  it('advances the persisted generation after each successful refresh', async () => {
+    const current = { ...companyRow(REAL_REALM), tokenExpiresAt: new Date(Date.now() - 1) };
+    mocks.company.findUnique.mockImplementation(async () => ({ ...current }));
+    mocks.company.updateMany.mockImplementation(async ({ where, data }) => {
+      if (current.accessToken !== where.accessToken || current.refreshToken !== where.refreshToken) return { count: 0 };
+      Object.assign(current, data);
+      return { count: 1 };
+    });
+    let grants = 0;
+    let reads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes('/tokens/bearer')) {
+        grants += 1;
+        return new Response(JSON.stringify({ access_token: `synthetic-access-${grants}`,
+          refresh_token: `synthetic-refresh-${grants}`, expires_in: 3600 }), { status: 200 });
+      }
+      reads += 1;
+      return reads === 2
+        ? new Response('{}', { status: 401 })
+        : new Response(JSON.stringify({ CompanyInfo: { LegalName: 'Synthetic ledger' } }), { status: 200 });
+    }));
+    const client = await qboFactory.forCompany(current.id);
+    await expect(client.getCompanyInfo()).resolves.toMatchObject({ legalName: 'Synthetic ledger' });
+    await expect(client.getCompanyInfo()).resolves.toMatchObject({ legalName: 'Synthetic ledger' });
+    expect(grants).toBe(2);
+    expect(decrypt(current.refreshToken)).toBe('synthetic-refresh-2');
   });
 });
 
@@ -348,8 +416,8 @@ describe('testCompanyConnection', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/tokens/bearer');
     expect(String(fetchMock.mock.calls[1]?.[0])).toContain('/companyinfo/');
-    expect(mocks.company.update).toHaveBeenCalledTimes(1);
-    const data = mocks.company.update.mock.calls[0]?.[0].data;
+    expect(mocks.company.updateMany).toHaveBeenCalledTimes(1);
+    const data = mocks.company.updateMany.mock.calls[0]?.[0].data;
     expect(decrypt(data.accessToken)).toBe('rotated-access');
     expect(decrypt(data.refreshToken)).toBe('rotated-refresh');
   });
@@ -388,8 +456,8 @@ describe('testCompanyConnection', () => {
 
     expect(getCompanyInfo).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(mocks.company.update).toHaveBeenCalledTimes(1);
-    const data = mocks.company.update.mock.calls[0]?.[0].data;
+    expect(mocks.company.updateMany).toHaveBeenCalledTimes(1);
+    const data = mocks.company.updateMany.mock.calls[0]?.[0].data;
     expect(decrypt(data.accessToken)).toBe('retry-access');
     expect(decrypt(data.refreshToken)).toBe('retry-refresh');
   });

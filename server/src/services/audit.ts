@@ -88,7 +88,7 @@ export interface AuditInput {
   before: string;
   /** full category path, or split summary */
   after: string;
-  /** exact QBO request body (dry-run keeps it too) */
+  /** QBO write details (dry-run keeps them too); credential fields are redacted. */
   payload?: unknown;
   /**
    * Tax-aware durable writes use a strict metadata allowlist. When present,
@@ -153,9 +153,24 @@ export function normalizeMutationAuditMetadata(entry: MutationAuditInput): {
   };
 }
 
+const CREDENTIAL_KEY = /token|authorization|secret|credential|(?:api|access|private)[_-]?key|password|passwd|passphrase|pwd|bearer/i;
+const QBO_REVISION_KEY = /^sync[_-]?token$/i;
+
+/** Copy legacy JSON payloads so redaction cannot alter a caller's write evidence. */
+function redactAuditPayload(value: unknown): unknown {
+  // JSON's normal serialization preserves Date/Decimal and calls each toJSON
+  // once. The replacer also visits fields produced by those serializers.
+  const serialized = JSON.stringify(value, (key, nested: unknown) => (
+    CREDENTIAL_KEY.test(key) && !QBO_REVISION_KEY.test(key)
+      ? '[REDACTED]'
+      : nested
+  ));
+  return serialized === undefined ? undefined : JSON.parse(serialized) as unknown;
+}
+
 export async function writeAudit(tx: PrismaTransactionClientOrPrisma, entry: AuditInput): Promise<void> {
   const payload = entry.mutation === undefined
-    ? entry.payload
+    ? redactAuditPayload(entry.payload)
     : normalizeMutationAuditMetadata(entry.mutation);
   await tx.auditEntry.create({
     data: {

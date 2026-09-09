@@ -1,4 +1,9 @@
 import type { CallToolResult, JSONObject } from '@modelcontextprotocol/server';
+import {
+  QboRateLimitError,
+  QBO_RATE_LIMIT_MIN_RETRY_SECONDS,
+  QBO_RATE_LIMIT_MAX_RETRY_SECONDS,
+} from '../lib/qbo/types.js';
 import { HttpError } from '../lib/http.js';
 import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { CategorizationError } from '../services/categorization.js';
@@ -20,6 +25,7 @@ export type SafeToolErrorCode =
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
+  | 'RESPONSE_TOO_LARGE'
   | 'COMPANY_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
   | 'QBO_PERIOD_CLOSED'
@@ -31,6 +37,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   FORBIDDEN: 'This token does not have access to the requested data. Check its company role and try again.',
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
+  RESPONSE_TOO_LARGE: 'The response exceeds the size limit. For list tools, request fewer items with limit. For single records, use the web app. For mutations, inspect the operation status before retrying.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
   QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
@@ -53,6 +60,12 @@ const CATEGORIZATION_INVALID_CODES = new Set([
   'INVALID_INPUT',
   'INVALID_TAG',
   'INVALID_TRANSACTION_AMOUNT',
+  'INVALID_TAX_CODE',
+  'PRESERVE_SOURCE_ID_INVALID',
+  'PRESERVE_SOURCE_SHAPE_INVALID',
+  'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
+  'PRESERVE_SOURCE_TAX_CALCULATION_INVALID',
+  'PRESERVE_SOURCE_TOTAL_INVALID',
   'STALE_REVISION',
   'TAX_NOT_READY',
   'TAX_REQUIRES_PURCHASE',
@@ -216,7 +229,12 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
 }
 
 function safeCode(error: unknown): SafeToolErrorCode {
-  if (error instanceof McpSchemaBoundsError) return 'INVALID_INPUT';
+  if (error instanceof QboRateLimitError) return 'RATE_LIMITED';
+  if (error instanceof McpSchemaBoundsError) {
+    if (error.code === 'OUTPUT_BYTES') return 'RESPONSE_TOO_LARGE';
+    if (error.code === 'OUTPUT_SERIALIZATION') return 'COMPANY_UNAVAILABLE';
+    return 'INVALID_INPUT';
+  }
   if (error instanceof QboWriteSafetyError) return error.code;
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;
@@ -242,10 +260,14 @@ export function safeToolFailure(
   requestId: string,
 ): CallToolResult {
   const code = safeCode(error);
+  const retryAfterSeconds = error instanceof QboRateLimitError
+    ? safeRetryAfterSeconds(error.retryAfterSeconds)
+    : undefined;
   const value = {
     error: {
       code,
       message: SAFE_MESSAGES[code],
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
       requestId: requestId.slice(0, MAX_REQUEST_ID_LENGTH),
     },
   };
@@ -254,6 +276,11 @@ export function safeToolFailure(
     content: [{ type: 'text', text: JSON.stringify(value) }],
     structuredContent: value,
   };
+}
+
+function safeRetryAfterSeconds(value: number): number | undefined {
+  if (!Number.isFinite(value) || !Number.isInteger(value)) return undefined;
+  return Math.min(QBO_RATE_LIMIT_MAX_RETRY_SECONDS, Math.max(QBO_RATE_LIMIT_MIN_RETRY_SECONDS, value));
 }
 
 export function safeInvalidToolFailure(requestId: string): CallToolResult {

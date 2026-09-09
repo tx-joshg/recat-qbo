@@ -8,12 +8,14 @@ import type { ApiError } from '@recat/shared';
 export class HttpError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly requestId?: string;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, requestId?: string) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
-    if (code !== undefined) this.code = code;
+    this.code = code;
+    this.requestId = requestId;
   }
 }
 
@@ -29,7 +31,11 @@ export function asyncHandler(
 /** Central error handler: HttpError → its status + {error, code}; anything else → 500. */
 export const errorMiddleware: ErrorRequestHandler = (err, _req, res, _next) => {
   if (err instanceof HttpError) {
-    const body: ApiError = err.code !== undefined ? { error: err.message, code: err.code } : { error: err.message };
+    const body: ApiError = {
+      error: err.message,
+      ...(err.code !== undefined ? { code: err.code } : {}),
+      ...(err.requestId !== undefined ? { requestId: err.requestId } : {}),
+    };
     res.status(err.status).json(body);
     return;
   }
