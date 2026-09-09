@@ -50,6 +50,7 @@ import {
   type RawJournalEntryLine,
   type QboTaxCodeInfo,
   type QboTaxProfile,
+  type QboTaxRefundCapability,
   type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
@@ -196,6 +197,7 @@ interface RawAccount {
   FullyQualifiedName?: string;
   Classification?: string; // Asset | Liability | Equity | Revenue | Expense
   AccountType?: string; // Bank | Credit Card | Cost of Goods Sold | Expense | Income | ...
+  AccountSubType?: string;
   Active?: boolean;
 }
 
@@ -631,6 +633,7 @@ function mapAccount(raw: RawAccount): QboAccountInfo {
     fullName: raw.FullyQualifiedName ?? raw.Name,
     classification: normalizeClassification(raw.AccountType, raw.Classification),
     accountType: raw.AccountType ?? '',
+    accountSubType: firstNonEmpty(raw.AccountSubType) ?? null,
     active: raw.Active !== false,
   };
 }
@@ -1472,6 +1475,19 @@ export class RealQboClient implements QboClient {
   async getTaxProfile(): Promise<QboTaxProfile> {
     const rows = await this.queryAll('select * from Preferences', 'Preferences');
     return mapTaxProfile(rows[0]);
+  }
+
+  async probeTaxRefundCapability(): Promise<QboTaxRefundCapability> {
+    // Intuit's current public Accounting API does not document a creatable and
+    // readable Canadian Tax Credit Refund resource. An old SDK entity enum is
+    // not a supported write contract, so never probe an undocumented endpoint
+    // against a connected company's books.
+    return {
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: MINOR_VERSION,
+    };
   }
 
   async fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence> {

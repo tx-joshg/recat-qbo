@@ -35,6 +35,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTaxCodeInfo,
   type QboTaxProfile,
+  type QboTaxRefundCapability,
   type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
@@ -85,6 +86,7 @@ interface MockAccount {
   /** normalized bucket (Income | COGS | Expenses | Bank | CreditCard) */
   classification: string;
   accountType: string;
+  accountSubType?: string;
   /** colon path, per QBO FullyQualifiedName convention */
   fullName: string;
 }
@@ -162,7 +164,13 @@ export interface MockRealm {
   nextId: number;
 }
 
-function acct(qboId: string, name: string, classification: string, accountType: string): MockAccount {
+function acct(
+  qboId: string,
+  name: string,
+  classification: string,
+  accountType: string,
+  accountSubType?: string,
+): MockAccount {
   // Bank/credit-card/holding accounts are top-level in QBO, so their
   // FullyQualifiedName is just the name; category accounts get a group path.
   const grouped = classification === 'Income' || classification === 'COGS' || classification === 'Expenses';
@@ -172,6 +180,7 @@ function acct(qboId: string, name: string, classification: string, accountType: 
     name,
     classification,
     accountType,
+    accountSubType,
     fullName: grouped && !holding ? `${classification}:${name}` : name,
   };
 }
@@ -232,6 +241,7 @@ function buildHarborRealm(): MockRealm {
     acct('25', 'Software subscriptions', 'Expenses', 'Expense'),
     acct('26', 'Utilities', 'Expenses', 'Expense'),
     acct('27', 'Vehicle fuel', 'Expenses', 'Expense'),
+    acct('28', 'GST/HST Suspense', 'Liability', 'Other Current Liabilities', 'GlobalTaxSuspense'),
   ];
   const HOLDING = '4'; // Ask My Accountant
   const seeds: TxnSeed[] = [
@@ -291,6 +301,7 @@ function buildBluebirdRealm(): MockRealm {
     acct('16', 'Rent', 'Expenses', 'Expense'),
     acct('17', 'Software subscriptions', 'Expenses', 'Expense'),
     acct('18', 'Utilities', 'Expenses', 'Expense'),
+    acct('19', 'GST/HST Suspense', 'Liability', 'Other Current Liabilities', 'GlobalTaxSuspense'),
   ];
   const HOLDING = '3'; // Ask My Accountant
   const seeds: TxnSeed[] = [
@@ -1311,6 +1322,7 @@ export class MockQboClient implements QboClient {
       fullName: a.fullName,
       classification: a.classification,
       accountType: a.accountType,
+      accountSubType: a.accountSubType ?? null,
       active: true,
     }));
   }
@@ -1318,6 +1330,15 @@ export class MockQboClient implements QboClient {
   async getTaxProfile(): Promise<QboTaxProfile> {
     await ensureMockRealmsHydrated();
     return { ...this.realm.taxProfile };
+  }
+
+  async probeTaxRefundCapability(): Promise<QboTaxRefundCapability> {
+    return {
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: '75',
+    };
   }
 
   async fetchWriteSafety(

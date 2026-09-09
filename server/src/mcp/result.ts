@@ -10,6 +10,7 @@ import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
+import { McpTaxRefundError } from '../services/mcp/taxRefund.js';
 import { McpUndoError } from '../services/mcp/undo.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
@@ -23,6 +24,9 @@ const MAX_REQUEST_ID_LENGTH = 128;
 
 export type SafeToolErrorCode =
   | 'FORBIDDEN'
+  | 'TAX_REFUND_ALREADY_PREPARED'
+  | 'TAX_REFUND_PREPARATION_CANCELLED'
+  | 'TAX_REFUND_ALREADY_RECORDED'
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
   | 'OPERATION_RECONCILIATION_REQUIRED'
@@ -36,6 +40,9 @@ export type SafeToolErrorCode =
 
 const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   FORBIDDEN: 'This token does not have access to the requested data. Check its company role and try again.',
+  TAX_REFUND_ALREADY_PREPARED: 'A tax refund preparation already reserves this source. Review the existing operation before preparing another.',
+  TAX_REFUND_PREPARATION_CANCELLED: 'This tax refund preparation was cancelled and cannot be used. Review its state before creating a new preparation.',
+  TAX_REFUND_ALREADY_RECORDED: 'This refund is already marked as recorded. Review the existing operation; only an administrator can correct that attestation.',
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
   OPERATION_RECONCILIATION_REQUIRED: 'This operation requires reconciliation before it can continue.',
@@ -118,6 +125,13 @@ const WRITEBACK_INVALID_CODES = new Set([
 ]);
 
 function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof McpTaxRefundError) {
+    if (error.code === 'SOURCE_ALREADY_PREPARED') return 'TAX_REFUND_ALREADY_PREPARED';
+    if (error.code === 'SOURCE_PREPARATION_CANCELLED') return 'TAX_REFUND_PREPARATION_CANCELLED';
+    if (error.code === 'SOURCE_ALREADY_RECORDED') return 'TAX_REFUND_ALREADY_RECORDED';
+    return error.code === 'SOURCE_NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
+
   if (error instanceof ReceiptError) {
     if (error.code === 'RECEIPT_FORBIDDEN') return 'FORBIDDEN';
     if (error.code === 'RECEIPT_NOT_FOUND') return 'NOT_FOUND';

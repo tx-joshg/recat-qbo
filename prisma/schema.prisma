@@ -954,6 +954,7 @@ model McpOperation {
   expiresAt        DateTime
   retryOfId        String?   @unique
   cancelledAt      DateTime?
+  manualRecordedAt DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 

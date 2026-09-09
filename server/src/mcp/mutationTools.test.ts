@@ -118,6 +118,43 @@ const transferOperation = {
   },
 };
 
+const preparedTaxRefund = {
+  operationId: '77777777-7777-4777-8777-777777777777',
+  expiresAt: '2026-09-04T22:15:00.000Z',
+  capability: 'manual_required' as const,
+  preview: {
+    action: 'record_gst_hst_refund' as const,
+    operatorPath: 'Sales Tax > Filed > Record refund' as const,
+    sourceDepositQboId: 'TEST-DEPOSIT-1',
+    taxAgencyQboId: 'CRA',
+    filedReturnRef: '2025-Q4',
+    filingEvidenceSha256: 'a'.repeat(64),
+    suspenseAccountQboId: '55',
+    bankAccountQboId: 'BANK-1',
+    refundDate: '2026-01-15',
+    principalCents: 123_456,
+    interestCents: 0,
+    interestAccountQboId: null,
+    totalBankCreditCents: 123_456,
+    existingDepositTreatment: 'replace_or_match_before_verification' as const,
+  },
+  warnings: [
+    'Manual QuickBooks Tax Centre action required; preparation does not post the refund.',
+  ],
+};
+
+const cancelledTaxRefund = {
+  operationId: preparedTaxRefund.operationId,
+  state: 'cancelled' as const,
+  cancelledAt: '2026-09-04T22:05:00.000Z',
+};
+
+const acknowledgedTaxRefund = {
+  operationId: preparedTaxRefund.operationId,
+  state: 'reconciliation_required' as const,
+  manualRecordedAt: '2026-09-04T22:06:00.000Z',
+};
+
 function mutations(
   overrides: Partial<McpMutationOperations> = {},
 ): McpMutationOperations {
@@ -135,6 +172,9 @@ function mutations(
     }),
     prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
     commitTransfer: vi.fn().mockResolvedValue(transferOperation),
+    prepareTaxRefund: vi.fn().mockResolvedValue(preparedTaxRefund),
+    cancelTaxRefund: vi.fn().mockResolvedValue(cancelledTaxRefund),
+    acknowledgeTaxRefundRecorded: vi.fn().mockResolvedValue(acknowledgedTaxRefund),
     ...overrides,
   };
 }
@@ -176,6 +216,59 @@ function handler(
 }
 
 describe('Recat MCP mutation tools', () => {
+  it('exposes a strict manual-required GST/HST refund preparation', async () => {
+    const operations = mutations();
+    const server = handler(operations);
+    const request = {
+      companyId,
+      transactionId,
+      expectedRevision: 0,
+      idempotencyKey: 'example-refund',
+      taxAgencyQboId: 'CRA',
+      filedReturnRef: '2025-Q4',
+      filingEvidenceSha256: 'a'.repeat(64),
+      suspenseAccountQboId: '55',
+      bankAccountQboId: 'BANK-1',
+      refundDate: '2026-01-15',
+      principalCents: 123_456,
+    };
+
+    const response = await legacy(server, 'tools/call', {
+      name: 'prepare_tax_refund',
+      arguments: request,
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareTaxRefund).toHaveBeenCalledWith(principal, request);
+    expect(MUTATION_TOOL_NAMES).toContain('prepare_tax_refund');
+
+    const cancelRequest = {
+      operationId: preparedTaxRefund.operationId,
+      confirmNoQuickBooksAction: true,
+    } as const;
+    const cancelled = await legacy(server, 'tools/call', {
+      name: 'cancel_tax_refund',
+      arguments: cancelRequest,
+    });
+    expect(cancelled.result.isError).not.toBe(true);
+    expect(operations.cancelTaxRefund).toHaveBeenCalledWith(principal, cancelRequest);
+    expect(MUTATION_TOOL_NAMES).toContain('cancel_tax_refund');
+
+    const acknowledgeRequest = {
+      operationId: preparedTaxRefund.operationId,
+      confirmQuickBooksActionPerformed: true,
+    } as const;
+    const acknowledged = await legacy(server, 'tools/call', {
+      name: 'acknowledge_tax_refund_recorded',
+      arguments: acknowledgeRequest,
+    });
+    expect(acknowledged.result.isError).not.toBe(true);
+    expect(operations.acknowledgeTaxRefundRecorded).toHaveBeenCalledWith(
+      principal,
+      acknowledgeRequest,
+    );
+  });
+
   it('routes exact prepared-categorization recovery to its owner-scoped operation', async () => {
     const operations = mutations();
     const server = handler(operations);

@@ -399,7 +399,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers thirteen core reads and twenty-one conservatively annotated action tools', async () => {
+  it('registers thirteen core reads and twenty-four conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -418,6 +418,9 @@ describe('Recat MCP read tools', () => {
       'commit_undo',
       'prepare_transfer',
       'commit_transfer',
+      'prepare_tax_refund',
+      'cancel_tax_refund',
+      'acknowledge_tax_refund_recorded',
       'create_attachment_upload',
       'attach_transaction_files',
       'list_transaction_attachments',
@@ -431,7 +434,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(34);
+    expect(tools).toHaveLength(37);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: !['sync_company', 'refresh_transaction_mirror', 'get_write_safety', 'refresh_provider_actionability'].includes(tool.name),
@@ -525,6 +528,18 @@ describe('Recat MCP read tools', () => {
           idempotentHint: true,
           openWorldHint: true,
         },
+      },
+      {
+        name: 'prepare_tax_refund',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      },
+      {
+        name: 'cancel_tax_refund',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      },
+      {
+        name: 'acknowledge_tax_refund_recorded',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
       {
         name: 'create_attachment_upload',

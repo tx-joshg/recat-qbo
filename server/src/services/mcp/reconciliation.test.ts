@@ -120,6 +120,42 @@ function undoOperation(
   });
 }
 
+function taxRefundOperation(
+  overrides: Partial<McpOperationRecord> = {},
+): McpOperationRecord {
+  return operation({
+    toolName: 'prepare_tax_refund',
+    kind: 'tax_refund',
+    idempotencyKey: 'example-refund',
+    qboType: 'Deposit',
+    qboId: 'TEST-DEPOSIT-1',
+    qboSyncToken: '0',
+    sourceRevision: 0,
+    preparedRevision: 0,
+    payload: {
+      capability: 'manual_required',
+      preview: {
+        action: 'record_gst_hst_refund',
+        operatorPath: 'Sales Tax > Filed > Record refund',
+        sourceDepositQboId: 'TEST-DEPOSIT-1',
+        taxAgencyQboId: 'CRA',
+        filedReturnRef: '2025-Q4',
+        filingEvidenceSha256: 'a'.repeat(64),
+        suspenseAccountQboId: '55',
+        bankAccountQboId: 'BANK-1',
+        refundDate: '2026-01-15',
+        principalCents: 123_456,
+        interestCents: 0,
+        interestAccountQboId: null,
+        totalBankCreditCents: 123_456,
+        existingDepositTreatment: 'replace_or_match_before_verification',
+      },
+      warnings: [],
+    },
+    ...overrides,
+  });
+}
+
 function fixture(status: string | null = null) {
   const operations = [operation()];
   const attempts: Array<{
@@ -453,6 +489,113 @@ describe('MCP attachment operation dispatch', () => {
       },
     };
   }
+
+  it('projects a manual tax refund without offering commit or retry', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'awaiting_commit',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
+  });
+
+  it('hides another creator manual refund from an authorized company categorizer', async () => {
+    const value = fixture();
+    const foreign = taxRefundOperation({ userId: 'other-company-member' });
+    value.operations.splice(0, 1, foreign);
+    await expect(getMcpOperation(principal, { operationId: foreign.id }, value.deps))
+      .rejects.toMatchObject({ code: 'OPERATION_NOT_FOUND' });
+    expect(value.commit).not.toHaveBeenCalled();
+  });
+
+  it('keeps a manual refund visible after the creating MCP token rotates', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      tokenId: 'retired-token',
+      tokenPrefix: 'rct_retired',
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      error: { code: 'MANUAL_QBO_TAX_REFUND_REQUIRED' },
+    });
+  });
+
+  it('preserves a disconnected-company error when reading a manual refund', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+    vi.mocked(value.deps.store!.company.findUnique).mockResolvedValue({
+      disconnectedAt: new Date('2026-09-04T22:00:00.000Z'),
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+  });
+
+  it('projects an acknowledged manual refund as awaiting verification, not another QBO action', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      manualRecordedAt: new Date('2026-09-04T22:06:00.000Z'),
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_VERIFICATION_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+  });
+
+  it('rejects a hash-valid but incomplete tax refund envelope', async () => {
+    const value = fixture();
+    const payload = structuredClone(taxRefundOperation().payload) as Record<string, any>;
+    delete payload.preview.filingEvidenceSha256;
+    value.operations.splice(0, 1, taxRefundOperation({ payload }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
+  });
 
   it('falls back only to an operation owned by the exact MCP actor key', async () => {
     const value = fixture();

@@ -21,9 +21,10 @@ const OPERATION_KINDS = new Set<McpOperationKind>([
   'categorization',
   'transfer',
   'undo',
+  'tax_refund',
 ]);
 
-export type McpOperationKind = 'categorization' | 'transfer' | 'undo';
+export type McpOperationKind = 'categorization' | 'transfer' | 'undo' | 'tax_refund';
 
 export type McpOperationJsonValue =
   | null
@@ -58,6 +59,7 @@ export interface McpOperationRecord {
   expiresAt: Date;
   retryOfId: string | null;
   cancelledAt: Date | null;
+  manualRecordedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -111,6 +113,7 @@ export type McpOperationPersistence =
 export interface McpOperationDependencies {
   store?: McpOperationPersistence;
   now?: () => Date;
+  expiresAt?: () => Date;
 }
 
 export interface CreatePreparedOperationInput {
@@ -227,8 +230,9 @@ export async function createPreparedOperation(
     qboSyncToken,
     retryOfId,
   });
-  const expiresAt = new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
-  if (!isValidDate(expiresAt)) invalidInput();
+  const expiresAt = dependencies.expiresAt?.()
+    ?? new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
+  if (!isValidDate(expiresAt) || expiresAt.getTime() <= now.getTime()) invalidInput();
 
   const data: McpOperationCreateData = {
     tokenId,
@@ -250,6 +254,7 @@ export async function createPreparedOperation(
     expiresAt,
     retryOfId,
     cancelledAt: null,
+    manualRecordedAt: null,
   };
 
   await assertValidRetryParent(store, data);

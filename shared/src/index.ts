@@ -381,7 +381,10 @@ export type AuditAction =
   | 'attachment_reconciled'
   | 'attachment_local_copy_deleted'
   | 'attachment_deleted_everywhere'
-  | 'attachment_error';
+  | 'attachment_error'
+  | 'tax-refund-cancelled'
+  | 'tax-refund-recorded'
+  | 'tax-refund-recording-corrected';
 
 export interface MembershipDto {
   companyId: string;

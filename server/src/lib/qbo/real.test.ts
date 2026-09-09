@@ -2669,3 +2669,41 @@ describe('getCompanyInfo — country', () => {
     expect(info.country).toBeNull();
   });
 });
+
+describe('Canadian tax-refund capability', () => {
+  it('fails closed without probing an undocumented production endpoint', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.probeTaxRefundCapability()).resolves.toEqual({
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: '75',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('retains the system account subtype needed to identify GST/HST Suspense', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      QueryResponse: {
+        Account: [{
+          Id: '55',
+          Name: 'GST/HST Suspense',
+          Classification: 'Liability',
+          AccountType: 'Other Current Liabilities',
+          AccountSubType: 'GlobalTaxSuspense',
+          Active: true,
+        }],
+        startPosition: 1,
+        maxResults: 1,
+        totalCount: 1,
+      },
+    }))));
+
+    await expect(realClient().client.listAccounts()).resolves.toEqual([expect.objectContaining({
+      qboId: '55',
+      accountSubType: 'GlobalTaxSuspense',
+    })]);
+  });
+});

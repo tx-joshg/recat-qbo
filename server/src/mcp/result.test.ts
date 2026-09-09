@@ -5,6 +5,7 @@ import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
+import { McpTaxRefundError } from '../services/mcp/taxRefund.js';
 import { McpUndoError } from '../services/mcp/undo.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
@@ -16,6 +17,20 @@ import { safeToolFailure, toolSuccess } from './result.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
 describe('MCP tool results', () => {
+  it.each([
+    ['SOURCE_ALREADY_PREPARED', 'TAX_REFUND_ALREADY_PREPARED',
+      'A tax refund preparation already reserves this source. Review the existing operation before preparing another.'],
+    ['SOURCE_PREPARATION_CANCELLED', 'TAX_REFUND_PREPARATION_CANCELLED',
+      'This tax refund preparation was cancelled and cannot be used. Review its state before creating a new preparation.'],
+    ['SOURCE_ALREADY_RECORDED', 'TAX_REFUND_ALREADY_RECORDED',
+      'This refund is already marked as recorded. Review the existing operation; only an administrator can correct that attestation.'],
+  ] as const)('gives actionable safe guidance for refund state %s', (sourceCode, code, message) => {
+    const result = safeToolFailure(new McpTaxRefundError(sourceCode), 'request-refund-state');
+    expect(result.structuredContent).toEqual({
+      error: { code, message, requestId: 'request-refund-state' },
+    });
+  });
+
   it.each([
     new McpOperationExecutionError('OPERATION_CORRUPT'),
     new McpTransferExecutionError('OPERATION_CORRUPT'),

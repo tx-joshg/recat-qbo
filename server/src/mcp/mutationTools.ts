@@ -22,6 +22,14 @@ import {
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
 import {
+  acknowledgeMcpTaxRefundRecorded,
+  cancelMcpTaxRefund,
+  prepareMcpTaxRefund,
+  type AcknowledgeMcpTaxRefundRecordedInput,
+  type CancelMcpTaxRefundInput,
+  type PrepareMcpTaxRefundInput,
+} from '../services/mcp/taxRefund.js';
+import {
   commitMcpTransfer,
   prepareMcpTransfer,
   type PrepareMcpTransferInput,
@@ -54,6 +62,9 @@ const CORE_MUTATION_TOOL_NAMES = [
   'commit_undo',
   'prepare_transfer',
   'commit_transfer',
+  'prepare_tax_refund',
+  'cancel_tax_refund',
+  'acknowledge_tax_refund_recorded',
 ] as const;
 
 export const MUTATION_TOOL_NAMES = [
@@ -100,6 +111,18 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: { operationId: string; idempotencyKey?: string },
   ): ReturnType<typeof commitMcpTransfer>;
+  prepareTaxRefund(
+    principal: McpPrincipal,
+    input: PrepareMcpTaxRefundInput,
+  ): ReturnType<typeof prepareMcpTaxRefund>;
+  cancelTaxRefund(
+    principal: McpPrincipal,
+    input: CancelMcpTaxRefundInput,
+  ): ReturnType<typeof cancelMcpTaxRefund>;
+  acknowledgeTaxRefundRecorded(
+    principal: McpPrincipal,
+    input: AcknowledgeMcpTaxRefundRecordedInput,
+  ): ReturnType<typeof acknowledgeMcpTaxRefundRecorded>;
 }
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
@@ -114,6 +137,9 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   commitUndo: commitMcpUndo,
   prepareTransfer: prepareMcpTransfer,
   commitTransfer: commitMcpTransfer,
+  prepareTaxRefund: prepareMcpTaxRefund,
+  cancelTaxRefund: cancelMcpTaxRefund,
+  acknowledgeTaxRefundRecorded: acknowledgeMcpTaxRefundRecorded,
 });
 
 interface McpMutationToolDefinition {
@@ -280,6 +306,39 @@ const prepareTransferInput = z.strictObject({
   idempotencyKey: idempotencyKey.optional(),
 });
 
+const prepareTaxRefundInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey,
+  taxAgencyQboId: qboReference,
+  filedReturnRef: qboReference,
+  filingEvidenceSha256: z.string().regex(SHA256),
+  suspenseAccountQboId: qboReference,
+  bankAccountQboId: qboReference,
+  refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+  principalCents: safeInteger.refine((value) => value > 0),
+  interestCents: safeInteger.refine((value) => value >= 0).optional(),
+  interestAccountQboId: qboReference.optional(),
+}).superRefine((value, context) => {
+  const interestCents = value.interestCents ?? 0;
+  if ((interestCents > 0) !== (value.interestAccountQboId !== undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['interestAccountQboId'],
+      message: 'An interest account is required exactly when CRA interest is present.',
+    });
+  }
+});
+const cancelTaxRefundInput = z.strictObject({
+  operationId: uuid,
+  confirmNoQuickBooksAction: z.literal(true),
+});
+const acknowledgeTaxRefundRecordedInput = z.strictObject({
+  operationId: uuid,
+  confirmQuickBooksActionPerformed: z.literal(true),
+});
+
 const warnings = z.array(
   z.string().max(MAX_WARNING_LENGTH),
 ).max(MAX_WARNINGS);
@@ -345,7 +404,7 @@ const attachmentOperationResult = z.strictObject({
 });
 const operationOutput = z.strictObject({
   operationId: uuid,
-  kind: z.enum(['categorization', 'transfer', 'undo', 'attachment']),
+  kind: z.enum(['categorization', 'transfer', 'undo', 'tax_refund', 'attachment']),
   companyId: uuid.optional(),
   transactionId: uuid.optional(),
   sourceRevision: revision.optional(),
@@ -519,6 +578,39 @@ const preparedTransferOutput = z.strictObject({
   }),
 });
 
+const preparedTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  expiresAt: z.iso.datetime(),
+  capability: z.literal('manual_required'),
+  preview: z.strictObject({
+    action: z.literal('record_gst_hst_refund'),
+    operatorPath: z.literal('Sales Tax > Filed > Record refund'),
+    sourceDepositQboId: qboReference,
+    taxAgencyQboId: qboReference,
+    filedReturnRef: qboReference,
+    filingEvidenceSha256: z.string().regex(SHA256),
+    suspenseAccountQboId: qboReference,
+    bankAccountQboId: qboReference,
+    refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+    principalCents: safeInteger,
+    interestCents: safeInteger,
+    interestAccountQboId: qboReference.nullable(),
+    totalBankCreditCents: safeInteger,
+    existingDepositTreatment: z.literal('replace_or_match_before_verification'),
+  }),
+  warnings,
+});
+const cancelledTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('cancelled'),
+  cancelledAt: z.iso.datetime(),
+});
+const acknowledgedTaxRefundRecordedOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('reconciliation_required'),
+  manualRecordedAt: z.iso.datetime(),
+});
+
 const prepareCategorizationAnnotations: ToolAnnotations = Object.freeze({
   readOnlyHint: false,
   destructiveHint: true,
@@ -645,6 +737,52 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.commitTransfer(
         principal,
         input as { operationId: string; idempotencyKey?: string },
+      ),
+  },
+  {
+    name: 'prepare_tax_refund',
+    description: 'Prepare a reviewed Canadian GST/HST refund. Returns the exact manual QuickBooks Tax Centre action when the public API cannot post it; it never recategorizes the source Deposit.',
+    inputSchema: prepareTaxRefundInput,
+    outputSchema: preparedTaxRefundOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareTaxRefund(
+        principal,
+        input as PrepareMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'cancel_tax_refund',
+    description: 'Cancel an unposted GST/HST refund preparation so corrected inputs can be prepared. Requires confirmation that no QuickBooks Tax Centre action occurred.',
+    inputSchema: cancelTaxRefundInput,
+    outputSchema: cancelledTaxRefundOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.cancelTaxRefund(
+        principal,
+        input as CancelMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'acknowledge_tax_refund_recorded',
+    description: 'Record that the manual QuickBooks Tax Centre refund action was performed. The operation remains reconciliation-required until exact readback is available.',
+    inputSchema: acknowledgeTaxRefundRecordedInput,
+    outputSchema: acknowledgedTaxRefundRecordedOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.acknowledgeTaxRefundRecorded(
+        principal,
+        input as AcknowledgeMcpTaxRefundRecordedInput,
       ),
   },
   ...attachmentToolDefinitions.map((definition) => ({

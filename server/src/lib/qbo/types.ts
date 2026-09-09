@@ -24,6 +24,8 @@ export interface QboAccountInfo {
   /** normalized bucket: Income | COGS | Expenses | Asset | Liability | Equity | Bank | CreditCard | Other */
   classification: string;
   accountType: string;
+  /** QBO system subtype, such as GlobalTaxSuspense, when the API returns it. */
+  accountSubType?: string | null;
   active: boolean;
 }
 
@@ -72,6 +74,13 @@ export interface QboCompanyInfo {
 export interface QboTaxProfile {
   usingSalesTax: boolean | null;
   partnerTaxEnabled: boolean | null;
+}
+
+export interface QboTaxRefundCapability {
+  mode: 'manual_required';
+  reason: 'UNSUPPORTED_PUBLIC_API';
+  api: 'intuit-accounting-v3';
+  minorVersion: '75';
 }
 
 export interface QboTaxRateInfo {
@@ -515,6 +524,7 @@ export interface QboClient {
   getCompanyInfo(): Promise<QboCompanyInfo>;
   listAccounts(): Promise<QboAccountInfo[]>;
   getTaxProfile(): Promise<QboTaxProfile>;
+  probeTaxRefundCapability(): Promise<QboTaxRefundCapability>;
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
   uploadAttachments(
