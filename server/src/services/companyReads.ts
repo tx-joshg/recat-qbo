@@ -4,6 +4,11 @@ import { categorizationSourceGrossCents } from './tax/sourceGross.js';
 import { CategorizationError } from './categorizationError.js';
 import type {
   ClassificationCase,
+  ClassificationActionSummary,
+  ClassificationCasePastDecision,
+  ClassificationPastDecisionPageDto,
+  HistoricalObservationPastDecision,
+  PastDecisionFilter,
   CanonicalSuggestionDto,
   CompanyDto,
   ProviderActionabilityDisposition,
@@ -413,6 +418,61 @@ function nullableIso(value: unknown): string | null {
 
 function nullableString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function pastDecisionActionSummary(row: Row): ClassificationActionSummary {
+  const taxCalculation = row.taxCalculation;
+  if (taxCalculation !== 'TaxInclusive' && taxCalculation !== 'TaxExcluded' && taxCalculation !== 'NotApplicable') {
+    throw new HttpError(503, 'Past-decision data is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  const categoryName = typeof row.categoryName === 'string' && row.categoryName.trim() !== ''
+    ? row.categoryName
+    : 'Category unavailable';
+  const taxCodeName = nullableString(row.taxCodeName);
+  if ((taxCalculation === 'NotApplicable') !== (taxCodeName === null)) {
+    throw new HttpError(503, 'Past-decision data is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  return { categoryName, taxCalculation, taxCodeName, tagNames: stringArray(row.tagNames) };
+}
+
+function observationPastDecision(row: Row): HistoricalObservationPastDecision {
+  const qboType = row.qboType;
+  if (qboType !== 'Purchase' && qboType !== 'Deposit' && qboType !== 'JournalEntry') {
+    throw new HttpError(503, 'Historical observation is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  return {
+    kind: 'historical_observation',
+    id: String(row.id), companyId: String(row.companyId), transactionId: String(row.transactionId),
+    qboType, qboId: String(row.qboId), payee: String(row.payee), memo: nullableString(row.memo),
+    actionSummary: pastDecisionActionSummary(row), sourceStatus: nullableString(row.sourceStatus),
+    observedRecatRevision: Number(row.observedRecatRevision), observedQboRevision: String(row.observedQboRevision),
+    observedAt: iso(row.observedAt), supersededByCaseId: nullableString(row.supersededByCaseId),
+    advisory: true, executable: false,
+  };
+}
+
+function casePastDecision(row: Row): ClassificationCasePastDecision {
+  return {
+    kind: 'classification_case',
+    id: String(row.id), companyId: String(row.companyId), transactionId: String(row.transactionId),
+    payee: String(row.payee), memo: nullableString(row.memo), actionSummary: pastDecisionActionSummary(row),
+    rationale: String(row.rationale), verifiedAt: iso(row.verifiedAt),
+    invalidatedAt: nullableIso(row.invalidatedAt), invalidationReason: nullableString(row.invalidationReason),
+    advisory: false, executable: false,
+  };
+}
+
+async function latestClassificationCorpusRevision(
+  tx: Pick<CompanyReadDb, 'classificationCorpusRevision'>,
+  companyId: string,
+): Promise<string> {
+  if (tx.classificationCorpusRevision === undefined) {
+    throw new HttpError(503, 'Classification corpus is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  const row = await tx.classificationCorpusRevision.findFirst({
+    where: { companyId }, orderBy: { revision: 'desc' }, select: { revision: true },
+  }) as Row | null;
+  return row === null ? '0' : String(row.revision);
 }
 
 function stringArray(value: unknown): string[] {
@@ -1612,6 +1672,182 @@ export function createCompanyReadService(
     });
   }
 
+  async function listPastDecisionsForUser(
+    userId: string,
+    companyId: string,
+    input: { kind?: PastDecisionFilter; limit?: number; cursor?: string } = {},
+  ): Promise<ClassificationPastDecisionPageDto> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    const kind = input.kind ?? 'all';
+    if (kind !== 'all' && kind !== 'classification_case' && kind !== 'historical_observation') {
+      badRequest('Invalid past-decision kind');
+    }
+    const requestedLimit = readLimit(input.limit);
+    const filter = canonicalFilter({ kind, limit: requestedLimit });
+    const expected = { resource: 'classification-past-decisions', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const decisionAt = position === null ? null : new Date(String(position.decisionAt));
+    const positionKind = position === null ? null : position.kind;
+    const positionId = position === null ? null : position.id;
+    const cursorRevision = position === null ? null : position.revision;
+    if (position !== null && (
+      decisionAt === null || Number.isNaN(decisionAt.getTime())
+      || (positionKind !== 'classification_case' && positionKind !== 'historical_observation')
+      || typeof positionId !== 'string'
+      || typeof cursorRevision !== 'string'
+    )) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+
+    return db.$transaction(async (tx) => {
+      const revision = await latestClassificationCorpusRevision(tx, companyId);
+      if (cursorRevision !== null && cursorRevision !== revision) {
+        badRequest('Past-decision population changed; restart pagination', 'INVALID_CURSOR');
+      }
+      // Bound each indexed source before projecting display fields or merging the feed.
+      const branchCursor = (dateColumn: Prisma.Sql, branchKind: PastDecisionFilter) => decisionAt === null
+        ? Prisma.empty
+        : Prisma.sql`AND (${dateColumn} < ${decisionAt} OR (${dateColumn} = ${decisionAt}
+          AND (${branchKind} > ${positionKind as string}
+            OR (${branchKind} = ${positionKind as string} AND "id" > ${positionId as string}))))`;
+      const rows = await tx.$queryRaw<Row[]>(Prisma.sql`
+        WITH case_page AS (
+          SELECT * FROM "ClassificationCase"
+          WHERE "companyId" = ${companyId} AND ${kind !== 'historical_observation'}
+            ${branchCursor(Prisma.sql`"verifiedAt"`, 'classification_case')}
+          ORDER BY "verifiedAt" DESC, "id" ASC
+          LIMIT ${requestedLimit + 1}
+        ), observation_page AS (
+          SELECT * FROM "HistoricalClassificationObservation"
+          WHERE "companyId" = ${companyId} AND ${kind !== 'classification_case'}
+            ${branchCursor(Prisma.sql`"observedAt"`, 'historical_observation')}
+          ORDER BY "observedAt" DESC, "id" ASC
+          LIMIT ${requestedLimit + 1}
+        ), decisions AS (
+          SELECT
+            'classification_case'::text AS "kind",
+            classification_case."id"::text AS "id",
+            classification_case."companyId"::text AS "companyId",
+            classification_case."transactionId"::text AS "transactionId",
+            COALESCE(classification_case."transactionSnapshot"->>'payee', 'Payee unavailable')::text AS "payee",
+            (classification_case."transactionSnapshot"->>'memo')::text AS "memo",
+            classification_case."rationale"::text AS "rationale",
+            classification_case."verifiedAt" AS "verifiedAt",
+            classification_case."verifiedAt" AS "decisionAt",
+            invalidation."invalidatedAt" AS "invalidatedAt",
+            invalidation."reason"::text AS "invalidationReason",
+            COALESCE(account."name", 'Category unavailable')::text AS "categoryName",
+            COALESCE(classification_case."action"->>'taxCalculation', 'NotApplicable')::text AS "taxCalculation",
+            CASE WHEN classification_case."action"->>'taxCalculation' = 'NotApplicable' THEN NULL
+              ELSE COALESCE(tax_code."name", 'Tax code unavailable') END::text AS "taxCodeName",
+            COALESCE((
+              SELECT jsonb_agg(tag."name" ORDER BY tag."name")
+              FROM "Tag" tag
+              WHERE tag."companyId" = classification_case."companyId"
+                AND tag."id" IN (
+                  SELECT jsonb_array_elements_text(COALESCE(classification_case."action"->'tagIds', '[]'::jsonb))
+                )
+            ), '[]'::jsonb) AS "tagNames",
+            NULL::text AS "qboType", NULL::text AS "qboId", NULL::text AS "sourceStatus",
+            NULL::integer AS "observedRecatRevision", NULL::text AS "observedQboRevision",
+            NULL::timestamptz AS "observedAt", NULL::text AS "supersededByCaseId"
+          FROM case_page classification_case
+          LEFT JOIN "ClassificationCaseInvalidation" invalidation
+            ON invalidation."companyId" = classification_case."companyId"
+            AND invalidation."classificationCaseId" = classification_case."id"
+          LEFT JOIN "QboAccount" account
+            ON account."companyId" = classification_case."companyId"
+            AND account."qboId" = classification_case."action"->>'categoryQboId'
+          LEFT JOIN "QboTaxCode" tax_code
+            ON tax_code."companyId" = classification_case."companyId"
+            AND tax_code."qboId" = classification_case."action"->>'taxCodeQboId'
+          WHERE classification_case."companyId" = ${companyId}
+            AND ${kind !== 'historical_observation'}
+
+          UNION ALL
+
+          SELECT
+            'historical_observation'::text AS "kind",
+            observation."id"::text AS "id",
+            observation."companyId"::text AS "companyId",
+            observation."sourceTransactionId"::text AS "transactionId",
+            observation."payee"::text AS "payee",
+            observation."memo"::text AS "memo",
+            NULL::text AS "rationale", NULL::timestamptz AS "verifiedAt",
+            observation."observedAt" AS "decisionAt", NULL::timestamptz AS "invalidatedAt",
+            NULL::text AS "invalidationReason", observation."categoryName"::text AS "categoryName",
+            observation."taxCalculation"::text AS "taxCalculation", observation."taxCodeName"::text AS "taxCodeName",
+            CASE WHEN jsonb_typeof(observation."tagNames") = 'array' THEN observation."tagNames" ELSE '[]'::jsonb END AS "tagNames",
+            observation."sourceQboType"::text AS "qboType", observation."sourceQboId"::text AS "qboId",
+            observation."sourceStatus"::text AS "sourceStatus",
+            observation."sourceTransactionRevision"::integer AS "observedRecatRevision",
+            observation."sourceQboSyncToken"::text AS "observedQboRevision",
+            observation."observedAt" AS "observedAt", superseding_case."id"::text AS "supersededByCaseId"
+          FROM observation_page observation
+          LEFT JOIN LATERAL (
+            SELECT classification_case."id"
+            FROM "ClassificationCase" classification_case
+            LEFT JOIN "ClassificationCaseInvalidation" invalidation
+              ON invalidation."companyId" = classification_case."companyId"
+              AND invalidation."classificationCaseId" = classification_case."id"
+            WHERE classification_case."companyId" = observation."companyId"
+              AND classification_case."transactionId" = observation."sourceTransactionId"
+              AND invalidation."id" IS NULL
+            ORDER BY classification_case."verifiedAt" DESC, classification_case."id" ASC
+            LIMIT 1
+          ) superseding_case ON true
+          WHERE observation."companyId" = ${companyId}
+            AND ${kind !== 'classification_case'}
+        )
+        SELECT * FROM decisions
+        ORDER BY "decisionAt" DESC, "kind" ASC, "id" ASC
+        LIMIT ${requestedLimit + 1}
+      `);
+      const page = pageRows(rows, requestedLimit, (row) => encodeCursor(cursorSecret, {
+        v: 1, ...expected, position: {
+          decisionAt: iso(row.decisionAt), kind: String(row.kind), id: String(row.id), revision,
+        },
+      }));
+      return {
+        items: page.rows.map((row) => row.kind === 'classification_case'
+          ? casePastDecision(row)
+          : observationPastDecision(row)),
+        nextCursor: page.nextCursor,
+      };
+    }, { isolationLevel: 'RepeatableRead' });
+  }
+
+  async function getHistoricalObservationForUser(
+    userId: string,
+    companyId: string,
+    observationId: string,
+  ): Promise<HistoricalObservationPastDecision> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(observationId, 'observationId');
+    if (db.historicalClassificationObservation === undefined) {
+      throw new HttpError(503, 'Historical observations are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const row = await db.historicalClassificationObservation.findFirst({
+      where: { id: observationId, companyId },
+      select: {
+        id: true, companyId: true, sourceTransactionId: true, sourceQboType: true, sourceQboId: true,
+        sourceTransactionRevision: true, sourceQboSyncToken: true, sourceStatus: true, observedAt: true,
+        payee: true, memo: true, categoryName: true, taxCalculation: true, taxCodeName: true, tagNames: true,
+      },
+    }) as Row | null;
+    if (row === null) throw new HttpError(404, 'Historical observation not found', 'OBSERVATION_NOT_FOUND');
+    const superseding = db.classificationCase === undefined ? null : await db.classificationCase.findFirst({
+      where: { companyId, transactionId: row.sourceTransactionId, invalidation: null },
+      orderBy: [{ verifiedAt: 'desc' }, { id: 'asc' }], select: { id: true },
+    }) as Row | null;
+    return observationPastDecision({
+      ...row,
+      transactionId: row.sourceTransactionId, qboType: row.sourceQboType, qboId: row.sourceQboId,
+      observedRecatRevision: row.sourceTransactionRevision, observedQboRevision: row.sourceQboSyncToken,
+      supersededByCaseId: superseding?.id ?? null,
+    });
+  }
+
   async function getCurrentClassificationCaseForUser(
     userId: string,
     companyId: string,
@@ -2322,6 +2558,8 @@ export function createCompanyReadService(
     listRuleCandidates: listRuleCandidatesForUser,
     getRuleCandidate: getRuleCandidateForUser,
     getClassificationCase: getClassificationCaseForUser,
+    listPastDecisions: listPastDecisionsForUser,
+    getHistoricalObservation: getHistoricalObservationForUser,
     getCurrentClassificationCase: getCurrentClassificationCaseForUser,
     listTransferCandidates: listTransferCandidatesForUser,
   };
@@ -2350,3 +2588,6 @@ export const getRuleCandidate = defaultService.getRuleCandidate;
 export const getClassificationCase = defaultService.getClassificationCase;
 export const getCurrentClassificationCase = defaultService.getCurrentClassificationCase;
 export const listTransferCandidates = defaultService.listTransferCandidates;
+
+export const listPastDecisions = defaultService.listPastDecisions;
+export const getHistoricalObservation = defaultService.getHistoricalObservation;

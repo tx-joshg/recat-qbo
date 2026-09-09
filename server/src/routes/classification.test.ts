@@ -6,7 +6,7 @@ import { errorMiddleware, HttpError } from '../lib/http.js';
 
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(),
-  caseDetail: vi.fn(), currentCase: vi.fn(),
+  caseDetail: vi.fn(), currentCase: vi.fn(), pastDecisions: vi.fn(), observation: vi.fn(),
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: {
@@ -16,6 +16,7 @@ vi.mock('../lib/prisma.js', () => ({ prisma: {
 vi.mock('../services/companyReads.js', () => ({
   getClassificationCase: mocks.caseDetail,
   getCurrentClassificationCase: mocks.currentCase,
+  listPastDecisions: mocks.pastDecisions, getHistoricalObservation: mocks.observation,
 }));
 
 import { classificationRouter } from './classification.js';
@@ -69,4 +70,36 @@ describe('session classification reads', () => {
     expect(mocks.currentCase).not.toHaveBeenCalled();
   });
 
+});
+
+
+describe('advisory historical observation routes', () => {
+  it('exposes bounded past decisions and non-executable observation detail', async () => {
+    const observation = { kind: 'historical_observation', id: 'observation-a', advisory: true, executable: false };
+    mocks.pastDecisions.mockResolvedValue({ items: [observation], nextCursor: null });
+    mocks.observation.mockResolvedValue(observation);
+    const page = await request(app()).get('/api/companies/company-a/classification/past-decisions')
+      .query({ kind: 'historical_observation', limit: 5 }).set('Cookie', 'recat_session=test');
+    expect(page.status).toBe(200);
+    expect(page.body.items).toEqual([observation]);
+    expect(mocks.pastDecisions).toHaveBeenCalledWith('user-a', 'company-a', { kind: 'historical_observation', limit: 5 });
+    const detail = await request(app()).get('/api/companies/company-a/classification/observations/observation-a')
+      .set('Cookie', 'recat_session=test');
+    expect(detail.status).toBe(200);
+    expect(detail.body).toEqual(observation);
+    expect(mocks.observation).toHaveBeenCalledWith('user-a', 'company-a', 'observation-a');
+  });
+
+  it('denies anonymous and nonmember reads and rejects invalid page bounds', async () => {
+    await request(app()).get('/api/companies/company-a/classification/past-decisions').expect(401);
+    await request(app()).get('/api/companies/company-a/classification/past-decisions')
+      .query({ limit: 101 }).set('Cookie', 'recat_session=test').expect(400);
+    await request(app()).get('/api/companies/company-a/classification/past-decisions')
+      .query({ kind: 'other' }).set('Cookie', 'recat_session=test').expect(400);
+    mocks.membership.mockResolvedValue(null);
+    await request(app()).get('/api/companies/company-a/classification/observations/observation-a')
+      .set('Cookie', 'recat_session=test').expect(403);
+    expect(mocks.pastDecisions).not.toHaveBeenCalled();
+    expect(mocks.observation).not.toHaveBeenCalled();
+  });
 });

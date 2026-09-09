@@ -13,7 +13,8 @@
     "test:unit": "vitest run",
     "test:pg": "vitest run --config vitest.pg.config.ts",
     "rules:canonical-backfill": "node dist/cli/backfillCanonicalRules.js",
-    "rules:rollback-guard": "node dist/cli/prepareRuleRollback.js"
+    "rules:rollback-guard": "node dist/cli/prepareRuleRollback.js",
+    "classification:observations:backfill": "node dist/cli/backfillHistoricalClassificationObservations.js"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
