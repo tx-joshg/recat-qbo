@@ -135,6 +135,46 @@ describe('pairTransfers', () => {
 });
 
 describe('transferCandidates', () => {
+  it.each([['BLOCKED_CLEARED', true], ['BLOCKED_RECONCILED', true], ['BLOCKED_PERIOD_CLOSED', false], ['UNKNOWN', false], ['UNAVAILABLE', false]])('pairs only effective writable rows (%s)', async (disposition, eligible) => {
+    const now = new Date();
+    const row = (id: string, amount: number, bankAccount: string, disposition: string) => ({
+      id,
+      companyId: 'company-1',
+      revision: 0,
+      qboSyncToken: '1',
+      qboType: 'Purchase',
+      qboId: id,
+      amount,
+      bankAccount,
+      date: now,
+      providerActionability: {
+        companyId: 'company-1',
+        transactionId: id,
+        disposition,
+        checkedAt: now,
+        revision: 0,
+        qboSyncToken: '1',
+        qboType: 'Purchase',
+        qboId: id,
+        txnDate: now,
+      },
+    });
+    const db = {
+      transactionActionability: {},
+      transaction: {
+        findMany: vi.fn(async () => [
+          row('blocked', -10, 'Checking', String(disposition)),
+          row('writable', 10, 'Visa', 'WRITABLE'),
+        ]),
+      },
+    };
+
+    await expect(transferCandidates('company-1', db as never)).resolves.toEqual(new Map(eligible ? [
+      ['blocked', 'writable'],
+      ['writable', 'blocked'],
+    ] : []));
+  });
+
   it('queries one row beyond the fixed discovery cap and fails closed on overflow', async () => {
     const rows = Array.from(
       { length: MAX_TRANSFER_DISCOVERY_TRANSACTIONS + 1 },

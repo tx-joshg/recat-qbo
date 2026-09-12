@@ -29,12 +29,25 @@ const standardProposal: CategorizationProposal = {
   tagIds: ['00000000-0000-4000-8000-000000000001'],
 };
 
+const preserveCurrentProposal: CategorizationProposal = {
+  taxDisposition: 'preserve_current',
+  taxCalculation: 'NotApplicable',
+  lines: [{
+    grossCents: -84_000,
+    categoryQboId: '42',
+    taxCodeQboId: 'NON',
+    tagIds: [],
+  }],
+  tagIds: [],
+};
+
 interface TransactionRow {
   id: string;
   companyId: string;
   qboType: string;
   qboId: string;
   qboSyncToken: string;
+  date: Date;
   amount: number;
   status: string;
   revision: number;
@@ -43,6 +56,7 @@ interface TransactionRow {
   taxCalculation: string | null;
   taxCode: string | null;
   taxCodeQboId: string | null;
+  rawData: unknown;
 }
 
 interface SplitRow {
@@ -80,6 +94,7 @@ interface FakeState {
   }[];
   companies: {
     id: string;
+    holdingAccountIds: string[];
     taxSupportStatus: string;
     taxSupportReason: string | null;
     taxUsingSalesTax: boolean | null;
@@ -291,6 +306,7 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       qboType: 'Purchase',
       qboId: 'QBO_PURCHASE_30',
       qboSyncToken: '7',
+      date: new Date('2026-07-29T00:00:00.000Z'),
       amount: -10.5,
       status: 'PENDING',
       revision: 0,
@@ -299,6 +315,25 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       taxCalculation: null,
       taxCode: null,
       taxCodeQboId: null,
+      rawData: {
+        Id: 'QBO_PURCHASE_30',
+        SyncToken: '7',
+        TxnDate: '2026-07-29',
+        TotalAmt: 10.5,
+        GlobalTaxCalculation: 'TaxInclusive',
+        AccountRef: { value: 'BANK_ACCOUNT' },
+        Line: [{
+          Id: '1',
+          Amount: 10.5,
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: '2' },
+            TaxCodeRef: { value: 'SOURCE_TAX_CODE' },
+            TaxInclusiveAmt: 10.5,
+          },
+        }],
+        TxnTaxDetail: { TotalTax: 0 },
+      },
     }],
     accounts: [{
       companyId: COMPANY_ID,
@@ -342,6 +377,7 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
     }],
     companies: [{
       id: COMPANY_ID,
+      holdingAccountIds: ['2'],
       taxSupportStatus: 'ready',
       taxSupportReason: null,
       taxUsingSalesTax: true,
@@ -366,6 +402,60 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
     attempts: [],
     ...overrides,
   };
+}
+
+function configureValidPreserveSource(db: FakeCategorizationDb): void {
+  db.state.splits = [];
+  db.state.splitTags = [];
+  db.state.txnTags = [];
+  Object.assign(db.state.transactions[0]!, {
+    amount: -840,
+    categoryQboId: 'STALE_LOCAL_CATEGORY',
+    taxCalculation: 'NotApplicable',
+    taxCode: 'Stale local tax',
+    taxCodeQboId: 'STALE_LOCAL_TAX',
+    rawData: {
+      Id: 'QBO_PURCHASE_30',
+      SyncToken: '7',
+      TotalAmt: 840,
+      GlobalTaxCalculation: 'NotApplicable',
+      Line: [{
+        Id: '1',
+        Amount: 840,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: 'NON' },
+        },
+      }],
+    },
+  });
+  db.state.accounts.push(
+    {
+      companyId: COMPANY_ID,
+      qboId: '42',
+      name: 'Bank Charges',
+      fullName: 'Expenses · Bank Charges',
+      active: true,
+    },
+    {
+      companyId: COMPANY_ID,
+      qboId: '2',
+      name: 'Uncategorized Expense',
+      fullName: 'Expenses · Uncategorized Expense',
+      active: true,
+    },
+  );
+  db.state.taxCodes.push({
+    companyId: COMPANY_ID,
+    qboId: 'NON',
+    name: 'Non-taxable',
+    active: true,
+    taxable: false,
+    purchaseTaxRateList: [],
+    salesTaxRateList: [],
+    combinedSalesRate: null,
+  });
 }
 
 function input(proposal: CategorizationProposal = standardProposal): StageCategorizationInput {
@@ -549,7 +639,10 @@ describe('stageCategorization', () => {
       {
         beforeValidation: async (transaction, normalizedInput) => {
           expect(transaction).toBe(db);
-          expect(normalizedInput).toEqual(input());
+          expect(normalizedInput).toEqual(input({
+            ...standardProposal,
+            taxDisposition: 'set',
+          }));
           events.push('before-validation');
           return { kind: 'return', value: 'exact-replay' };
         },
@@ -643,6 +736,7 @@ describe('stageCategorization', () => {
     expect(staged).toEqual({
       transactionId: TRANSACTION_ID,
       revision: 1,
+      taxDisposition: 'set',
       taxCalculation: 'TaxInclusive',
       totals: { subtotalCents: -1000, taxCents: -50, totalCents: -1050 },
       lines: [{
@@ -799,6 +893,13 @@ describe('stageCategorization', () => {
 
   it('stages balanced signed splits and per-line totals', async () => {
     db.state.transactions[0]!.amount = -21;
+    const raw = db.state.transactions[0]!.rawData as {
+      TotalAmt: number;
+      Line: { Amount: number; AccountBasedExpenseLineDetail: { TaxInclusiveAmt: number } }[];
+    };
+    raw.TotalAmt = 21;
+    raw.Line[0]!.Amount = 21;
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxInclusiveAmt = 21;
     const staged = await stageCategorization(input({
       ...standardProposal,
       lines: [
@@ -887,16 +988,71 @@ describe('stageCategorization', () => {
 
   it.each([
     ['inactive', () => { db.state.taxCodes[0]!.active = false; }, 'TAX_CODE_INACTIVE'],
-    ['unsupported', () => {
-      db.state.taxCodes[0]!.purchaseTaxRateList = [
-        { taxRateQboId: 'TAX_RATE_STANDARD', taxTypeApplicable: 'TaxOnAmount' },
-        { taxRateQboId: 'TAX_RATE_SECONDARY', taxTypeApplicable: 'TaxOnAmount' },
-      ];
-    }, 'TAX_RATE_UNSUPPORTED'],
   ] as const)('rejects an %s tax code', async (_kind, mutate, code) => {
     mutate();
     await expectCode(stageCategorization(input(), testDeps(db)), code);
     expect(db.transactionCalls).toBe(1);
+  });
+
+  it('stages a receipt-proven tax-inclusive composite purchase code', async () => {
+    db.state.transactions[0]!.amount = -224;
+    const raw = db.state.transactions[0]!.rawData as {
+      TotalAmt: number;
+      Line: { Amount: number; AccountBasedExpenseLineDetail: { TaxInclusiveAmt: number } }[];
+    };
+    raw.TotalAmt = 224;
+    raw.Line[0]!.Amount = 224;
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxInclusiveAmt = 224;
+    db.state.taxCodes[0]!.qboId = '7';
+    db.state.taxCodes[0]!.name = 'GST/PST BC';
+    db.state.taxCodes[0]!.purchaseTaxRateList = [
+      { taxRateQboId: '3', taxTypeApplicable: 'TaxOnAmount' },
+      { taxRateQboId: '15', taxTypeApplicable: 'TaxOnAmount' },
+    ];
+    db.state.taxRates = [{
+      companyId: COMPANY_ID,
+      qboId: '3',
+      name: 'GST (ITC)',
+      active: true,
+      rateValue: 5,
+    }, {
+      companyId: COMPANY_ID,
+      qboId: '15',
+      name: 'PST (BC) Purchase',
+      active: true,
+      rateValue: 7,
+    }];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -22_400,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -20_000, taxCents: -2_400, totalCents: -22_400 },
+      lines: [{
+        subtotalCents: -20_000,
+        taxCents: -2_400,
+        totalCents: -22_400,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: '7',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      revision: 1,
+      taxCalculation: 'TaxInclusive',
+      taxCode: 'GST/PST BC',
+      taxCodeQboId: '7',
+    });
   });
 
   it('rejects an explicit non-tax code in taxed mode without inventing its treatment', async () => {
@@ -934,6 +1090,404 @@ describe('stageCategorization', () => {
       taxCodeQboId: null,
     });
     expect(db.state.splits[0]).toMatchObject({ taxCode: null, taxCodeQboId: null });
+  });
+
+  it('stages an explicit NON on every set NotApplicable Purchase split line', async () => {
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [
+        {
+          grossCents: -500,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+        {
+          grossCents: -550,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged.lines.map((line) => line.taxCodeQboId)).toEqual(['NON', 'NON']);
+    expect(db.state.splits.map((line) => line.taxCodeQboId)).toEqual(['NON', 'NON']);
+  });
+
+  it('stages explicit NON against the source gross when removing tax from a TaxInclusive Purchase', async () => {
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = 'PURCHASE_SYNTHETIC_5';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -1_080.87;
+    transaction.rawData = {
+      Id: 'PURCHASE_SYNTHETIC_5',
+      SyncToken: '1',
+      TxnDate: '2024-03-14',
+      TotalAmt: 1_210.57,
+      GlobalTaxCalculation: 'TaxInclusive',
+      AccountRef: { value: 'BANK_CAD' },
+      Line: [{
+        Id: '1',
+        Amount: 1_080.87,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '18' },
+          TaxInclusiveAmt: 1_210.57,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 129.70 },
+    };
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: -121_057,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged.totals).toEqual({
+      subtotalCents: -121_057,
+      taxCents: 0,
+      totalCents: -121_057,
+    });
+  });
+
+  it('rejects explicit NON staging for a non-Purchase transaction', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 10.5;
+
+    await expectCode(stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: 1_050,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db)), 'TAX_REQUIRES_PURCHASE');
+  });
+
+  it('stages one Purchase category change with its literal current tax code intact', async () => {
+    configureValidPreserveSource(db);
+
+    const staged = await stageCategorization(
+      input(preserveCurrentProposal),
+      testDeps(db),
+    );
+
+    expect(staged).toMatchObject({
+      transactionId: TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: {
+        subtotalCents: -84_000,
+        taxCents: 0,
+        totalCents: -84_000,
+      },
+      lines: [{
+        idx: 0,
+        subtotalCents: -84_000,
+        taxCents: 0,
+        totalCents: -84_000,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      revision: 1,
+      taxCalculation: 'NotApplicable',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+    });
+    expect(db.state.splits[0]).toMatchObject({
+      amount: -840,
+      categoryQboId: '42',
+      taxCodeQboId: 'NON',
+    });
+  });
+
+  it('stages a tax-inclusive preserve-current category change from exact source facts', async () => {
+    configureValidPreserveSource(db);
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = 'PURCHASE_SYNTHETIC_2';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -40;
+    transaction.rawData = {
+      Id: 'PURCHASE_SYNTHETIC_2',
+      SyncToken: '1',
+      TxnDate: '2024-03-14',
+      TotalAmt: 44.80,
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: '1',
+        Amount: 40,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '7' },
+          TaxInclusiveAmt: 44.80,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 4.80 },
+    };
+    db.state.taxCodes = [];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -4_480,
+        categoryQboId: '42',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -4_000, taxCents: -480, totalCents: -4_480 },
+      lines: [{
+        subtotalCents: -4_000,
+        taxCents: -480,
+        totalCents: -4_480,
+        categoryQboId: '42',
+        taxCodeQboId: '7',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      taxCalculation: 'TaxInclusive',
+      taxCode: '7',
+      taxCodeQboId: '7',
+    });
+  });
+
+  it('reports a bounded preserve-source diagnostic when the stored sync token is stale', async () => {
+    configureValidPreserveSource(db);
+    const raw = db.state.transactions[0]!.rawData as { SyncToken: string };
+    raw.SyncToken = 'stale';
+
+    await expectCode(
+      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
+      'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
+    );
+  });
+
+  it('stages a tax correction against the tax-inclusive holding gross instead of its old net', async () => {
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = 'PURCHASE_SYNTHETIC_5';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -1_080.87;
+    transaction.rawData = {
+      Id: 'PURCHASE_SYNTHETIC_5',
+      SyncToken: '1',
+      TxnDate: '2024-03-14',
+      TotalAmt: 1_210.57,
+      GlobalTaxCalculation: 'TaxInclusive',
+      AccountRef: { value: 'BANK_CAD' },
+      Line: [{
+        Id: '1',
+        Amount: 1_080.87,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '18' },
+          TaxInclusiveAmt: 1_210.57,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 129.70 },
+    };
+    db.state.accounts.push({
+      companyId: COMPANY_ID,
+      qboId: 'SYNTHETIC_RESALABLE_GOODS',
+      name: 'Cost of Goods Sold - GST/PST Refundable',
+      fullName: 'Cost of Goods Sold - GST/PST Refundable',
+      active: true,
+    });
+    db.state.taxCodes = [{
+      companyId: COMPANY_ID,
+      qboId: '19',
+      name: 'HST ON',
+      active: true,
+      taxable: true,
+      purchaseTaxRateList: [{
+        taxRateQboId: 'HST_ON_13',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+      salesTaxRateList: [],
+      combinedSalesRate: null,
+    }];
+    db.state.taxRates = [{
+      companyId: COMPANY_ID,
+      qboId: 'HST_ON_13',
+      name: 'HST ON 13%',
+      active: true,
+      rateValue: 13,
+    }];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -121_057,
+        categoryQboId: 'SYNTHETIC_RESALABLE_GOODS',
+        taxCodeQboId: '19',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -107_130, taxCents: -13_927, totalCents: -121_057 },
+      lines: [{
+        subtotalCents: -107_130,
+        taxCents: -13_927,
+        totalCents: -121_057,
+        categoryQboId: 'SYNTHETIC_RESALABLE_GOODS',
+        taxCodeQboId: '19',
+      }],
+    });
+  });
+
+  it('preserves the authoritative NON sentinel when QBO omits it from tax-code inventory', async () => {
+    configureValidPreserveSource(db);
+    db.state.taxCodes = [];
+
+    const staged = await stageCategorization(
+      input(preserveCurrentProposal),
+      testDeps(db),
+    );
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        totalCents: -84_000,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      taxCode: 'NON',
+      taxCodeQboId: 'NON',
+    });
+    expect(db.state.splits[0]).toMatchObject({
+      taxCode: 'NON',
+      taxCodeQboId: 'NON',
+    });
+  });
+
+  it('preserves an exact source tax code even when it is absent from selectable inventory', async () => {
+    configureValidPreserveSource(db);
+    db.state.taxCodes = [];
+    const raw = db.state.transactions[0]!.rawData as {
+      Line: Array<{
+        AccountBasedExpenseLineDetail: { TaxCodeRef: { value: string } };
+      }>;
+    };
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxCodeRef.value = 'UNLISTED';
+    const proposal = {
+      ...preserveCurrentProposal,
+      lines: [{
+        ...preserveCurrentProposal.lines[0]!,
+        taxCodeQboId: 'UNLISTED',
+      }],
+    };
+
+    await expect(stageCategorization(input(proposal), testDeps(db))).resolves.toMatchObject({
+      taxDisposition: 'preserve_current',
+      lines: [{ taxCodeQboId: 'UNLISTED' }],
+    });
+  });
+
+  it('preserves an exact inactive source tax code without treating it as a new selection', async () => {
+    configureValidPreserveSource(db);
+    const non = db.state.taxCodes.find((code) => code.qboId === 'NON')!;
+    non.active = false;
+
+    await expect(stageCategorization(input(preserveCurrentProposal), testDeps(db))).resolves.toMatchObject({
+      taxDisposition: 'preserve_current',
+      lines: [{ taxCodeQboId: 'NON' }],
+    });
+  });
+
+  it('rejects preserve-current before mutation when existing Recat tags would be lost', async () => {
+    configureValidPreserveSource(db);
+    db.state.txnTags.push({ txnId: TRANSACTION_ID, tagId: TAG_ID });
+    const before = structuredClone(db.state);
+
+    await expectCode(
+      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
+      'INVALID_INPUT',
+    );
+
+    expect(db.state).toEqual(before);
+  });
+
+  it.each([
+    ['a non-Purchase transaction', () => {
+      db.state.transactions[0]!.qboType = 'Deposit';
+      db.state.transactions[0]!.amount = 840;
+      return {
+        ...preserveCurrentProposal,
+        lines: [{ ...preserveCurrentProposal.lines[0]!, grossCents: 84_000 }],
+      };
+    }],
+    ['an unchanged target category', () => {
+      return {
+        ...preserveCurrentProposal,
+        lines: [{ ...preserveCurrentProposal.lines[0]!, categoryQboId: '2' }],
+      };
+    }],
+    ['a split proposal', () => ({
+      ...preserveCurrentProposal,
+      lines: [
+        { ...preserveCurrentProposal.lines[0]!, grossCents: -37_500 },
+        { ...preserveCurrentProposal.lines[0]!, grossCents: -37_500 },
+      ],
+    })],
+    ['a memo edit', () => ({
+      ...preserveCurrentProposal,
+      lines: [{ ...preserveCurrentProposal.lines[0]!, memo: 'changed' }],
+    })],
+    ['a transaction tag edit', () => ({
+      ...preserveCurrentProposal,
+      tagIds: [TAG_ID],
+    })],
+    ['a line tag edit', () => ({
+      ...preserveCurrentProposal,
+      lines: [{ ...preserveCurrentProposal.lines[0]!, tagIds: [LINE_TAG_ID] }],
+    })],
+  ])('rejects preserve-current with %s before replacing staged rows', async (_name, proposal) => {
+    db.state.transactions[0]!.amount = -840;
+    configureValidPreserveSource(db);
+    const proposed = proposal();
+    const before = structuredClone(db.state);
+
+    await expectCode(
+      stageCategorization(input(proposed), testDeps(db)),
+      'INVALID_INPUT',
+    );
+
+    expect(db.state).toEqual(before);
   });
 
   it('stages positive Deposit sales tax from sales rate references', async () => {
@@ -1025,18 +1579,30 @@ describe('stageCategorization', () => {
     }), testDeps(db)), 'TAX_NOT_READY');
   });
 
-  it.each([
-    ['missing', null],
-    ['malformed', 'not-a-rate'],
-  ] as const)('rejects a Deposit when cached combined sales rate is %s', async (_case, combinedSalesRate) => {
+  it('derives Deposit readiness when a legacy cached combined sales rate is missing', async () => {
     db.state.transactions[0]!.qboType = 'Deposit';
     db.state.transactions[0]!.amount = 107;
-    db.state.taxCodes[0]!.combinedSalesRate = combinedSalesRate;
+    db.state.taxCodes[0]!.combinedSalesRate = null;
 
-    await expectCode(stageCategorization(input({
+    await expect(stageCategorization(input({
       ...standardProposal,
       lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
-    }), testDeps(db)), 'TAX_NOT_READY');
+    }), testDeps(db))).resolves.toMatchObject({
+      totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
+    });
+  });
+
+  it('ignores a malformed denormalized sales rate when valid component rows can be derived', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.taxCodes[0]!.combinedSalesRate = 'not-a-rate';
+
+    await expect(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db))).resolves.toMatchObject({
+      totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
+    });
   });
 
   it('rejects cached Deposit tax references after a recorded refresh failure', async () => {

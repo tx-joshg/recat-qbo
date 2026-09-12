@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
+  companies,
+  classificationMemory,
   attachments,
   autopilot,
   createCategorizationRequestId,
@@ -45,13 +47,13 @@ describe('createCategorizationRequestId', () => {
 });
 
 describe('structured mutation failures', () => {
-  it('preserves only the bounded mutation result on ApiError', async () => {
+  it.each(['RETRYABLE', 'REJECTED'] as const)('preserves only the bounded %s mutation result on ApiError', async (outcome) => {
     const responseBody = {
       transactionId: '00000000-0000-4000-8000-000000000030',
       requestId: '00000000-0000-4000-8000-000000000040',
       ok: false,
       status: 'PENDING',
-      outcome: 'RETRYABLE',
+      outcome,
       error: {
         code: 'RETRYABLE',
         message: 'The prepared write was not sent.',
@@ -79,7 +81,7 @@ describe('structured mutation failures', () => {
           requestId: '00000000-0000-4000-8000-000000000040',
           ok: false,
           status: 'PENDING',
-          outcome: 'RETRYABLE',
+          outcome,
           error: {
             code: 'RETRYABLE',
             message: 'The prepared write was not sent.',
@@ -301,5 +303,61 @@ describe('receipt workspace requests', () => {
       ),
       expect.objectContaining({ method: 'GET' }),
     );
+  });
+});
+
+it('requests one scoped provider status check and encodes its continuation', async () => {
+  const fetcher=vi.fn(async()=>new Response(JSON.stringify({companyId:'company-a',processed:0,persisted:0,failed:0,nextCursor:null,partial:false,complete:true,items:[]}),{status:200,headers:{'Content-Type':'application/json'}}));
+  vi.stubGlobal('fetch',fetcher);
+  await transactions.refreshProviderStatus('company-a','cursor/example');
+  expect(fetcher).toHaveBeenCalledWith('/api/companies/company-a/transactions/actionability/refresh?limit=1&cursor=cursor%2Fexample',expect.objectContaining({method:'POST',body:'{}'}));
+});
+
+it('keeps safe request reference but ignores provider fields', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    error: 'QuickBooks could not provide this report right now.',
+    code: 'QBO_REPORT_UNAVAILABLE',
+    requestId: '8c9ed2fd-f3e0-4f6c-8784-41464977d558',
+    providerBody: 'RAW_QBO_BODY_SENTINEL',
+  }), { status: 502 })));
+
+  await expect(companies.dashboard('company-1')).rejects.toMatchObject({
+    status: 502,
+    code: 'QBO_REPORT_UNAVAILABLE',
+    requestId: '8c9ed2fd-f3e0-4f6c-8784-41464977d558',
+  });
+});
+
+it('omits malformed request references from API errors', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    error: 'Report unavailable.', requestId: 'UNTRUSTED_REFERENCE_SENTINEL',
+  }), { status: 502 })));
+  await expect(companies.dashboard('company-1')).rejects.toMatchObject({ requestId: undefined });
+});
+
+
+describe('classification memory reads', () => {
+  it('preserves search context and encodes cursors using company-scoped read routes', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ items: [], nextCursor: null }), {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await classificationMemory.search('company-a', { query: 'Example & supplier', mode: 'lexical',
+      scope: 'current_company', transactionId: 'transaction-a', limit: 20, cursor: 'cursor+/=' });
+    await classificationMemory.pastDecisions('company-a', { kind: 'all', limit: 20, cursor: 'cursor+/=' });
+    await classificationMemory.getObservation('company-a', 'observation-a');
+    await classificationMemory.getCase('company-a', 'case-a');
+    await classificationMemory.health('company-a');
+    const urls = fetchMock.mock.calls.map(call => new URL(String(call[0]), 'http://localhost'));
+    expect(urls[0]!.pathname).toBe('/api/companies/company-a/classification/search');
+    expect(Object.fromEntries(urls[0]!.searchParams)).toEqual({ query: 'Example & supplier', mode: 'lexical',
+      scope: 'current_company', transactionId: 'transaction-a', limit: '20', cursor: 'cursor+/=' });
+    expect(urls[1]!.searchParams.get('cursor')).toBe('cursor+/=');
+    expect(urls.slice(1).map(url => url.pathname)).toEqual([
+      '/api/companies/company-a/classification/past-decisions',
+      '/api/companies/company-a/classification/observations/observation-a',
+      '/api/companies/company-a/classification/cases/case-a',
+      '/api/companies/company-a/health/classification-search',
+    ]);
   });
 });

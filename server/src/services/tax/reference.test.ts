@@ -158,15 +158,134 @@ describe('refreshTaxReference', () => {
     ]));
   });
 
+  it('publishes an active composite purchase code with its combined rate', async () => {
+    const composite = {
+      ...code('GST_PST'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+
+    const result = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [composite]),
+    );
+
+    expect(cache.taxCode('company-1', 'GST_PST')).toMatchObject({
+      combinedPurchaseRate: 12,
+    });
+    expect(result.readiness).toMatchObject({ status: 'ready' });
+    expect(result.readiness.taxCodes).toEqual([
+      expect.objectContaining({ qboId: 'GST_PST', combinedPurchaseRate: 12 }),
+    ]);
+  });
+
+  it('re-derives a composite rate when an older cache left the denormalized rate null', async () => {
+    const composite = {
+      ...code('GST_PST'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const deps = depsWith(cache, [composite]);
+    await refreshTaxReference('company-1', { force: true }, deps);
+    Object.assign(cache.taxCode('company-1', 'GST_PST')!, {
+      combinedPurchaseRate: null,
+    });
+
+    const readiness = await getTaxReadiness('company-1', deps);
+
+    expect(readiness.taxCodes).toEqual([
+      expect.objectContaining({ qboId: 'GST_PST', combinedPurchaseRate: 12 }),
+    ]);
+  });
+
+  it('does not coerce a legacy null cached rate into a zero-rate component', async () => {
+    const composite = {
+      ...code('GST_PST'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const deps = depsWith(cache, [composite]);
+    await refreshTaxReference('company-1', { force: true }, deps);
+    Object.assign(cache.taxRate('company-1', 'RATE7')!, { rateValue: null });
+
+    const readiness = await getTaxReadiness('company-1', deps);
+
+    expect(readiness.taxCodes).toEqual([]);
+  });
+
+  it('does not publish a composite code that repeats the same rate component', async () => {
+    const duplicate = {
+      ...code('DUPLICATE'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+
+    const result = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [duplicate]),
+    );
+
+    expect(cache.taxCode('company-1', 'DUPLICATE')).toMatchObject({
+      combinedPurchaseRate: null,
+    });
+    expect(result.readiness).toMatchObject({ status: 'needs_setup', taxCodes: [] });
+  });
+
+  it('publishes a composite sales code and rejects duplicate sales components', async () => {
+    const composite = {
+      ...code('SALES_COMPOSITE'),
+      purchaseRates: [],
+      salesRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const result = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [composite]),
+    );
+
+    expect(result.readiness).toMatchObject({ salesStatus: 'ready' });
+    expect(result.readiness.salesTaxCodes).toEqual([
+      expect.objectContaining({ qboId: 'SALES_COMPOSITE', combinedSalesRate: 12 }),
+    ]);
+
+    const duplicate = {
+      ...composite,
+      qboId: 'SALES_DUPLICATE',
+      salesRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const duplicateResult = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [duplicate]),
+    );
+
+    expect(duplicateResult.readiness).toMatchObject({
+      salesStatus: 'needs_setup',
+      salesTaxCodes: [],
+    });
+  });
+
   it.each([
     ['inactive sales rate', { ...code('SALES'), purchaseRates: [], salesRates: [{ taxRateQboId: 'OLD', taxTypeApplicable: 'TaxOnAmount' }] }, [
       ...rates,
       { qboId: 'OLD', name: 'Old rate', description: null, active: false, rateValue: 7, sourceUpdatedAt: null },
     ]],
-    ['multiple sales components', { ...code('SALES'), purchaseRates: [], salesRates: [
-      { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
-      { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
-    ] }, rates],
   ] as const)('does not declare sales readiness for %s', async (_case, salesCode, taxRates) => {
     const result = await refreshTaxReference('company-1', { force: true }, depsWith(cache, [salesCode], undefined, taxRates));
 
@@ -322,13 +441,6 @@ describe('refreshTaxReference', () => {
 
   it('keeps unsupported tax-code shapes normalized but not ready', async () => {
     const unsupportedCodes = [
-      {
-        ...code('COMPOUND'),
-        purchaseRates: [
-          { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
-          { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
-        ],
-      },
       { ...code('TAX_ON_TAX'), purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnTax' }] },
       { ...code('SALES_ONLY'), purchaseRates: [] },
       { ...code('INACTIVE_RATE'), purchaseRates: [{ taxRateQboId: 'OLD', taxTypeApplicable: 'TaxOnAmount' }] },
@@ -353,10 +465,6 @@ describe('refreshTaxReference', () => {
     ['positive rate marked non-taxable', { taxable: false }],
     ['sales-only code', { purchaseRates: [] }],
     ['inactive code', { active: false }],
-    ['compound code', { purchaseRates: [
-      { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
-      { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
-    ] }],
     ['non-amount component', { purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnTax' }] }],
   ] as const)('does not declare readiness for %s', async (_case, changes) => {
     const result = await refreshTaxReference(

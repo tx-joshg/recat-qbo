@@ -1,3 +1,4 @@
+import { runClassificationEmbeddingTick } from '../services/classification/embedding/reconciler.js';
 // Background jobs: polling sync loop, nightly reconcile, daily digest, and the
 // stuck-POSTING sweep (boot + every tick).
 // A single 60-second ticker drives them; per-company syncs never overlap
@@ -18,7 +19,14 @@ import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 import { resolvePublicUrl } from '../services/publicUrl.js';
+import { runClassificationOutcomeRecoveryTick } from '../services/classification/recovery.js';
+import { recoverRulePreparationRetries } from '../services/rulePreparationRetry.js';
+import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
+import { recoverRuleAutoPosts } from '../services/ruleAutoPost.js';
 
+const CLASSIFICATION_EMBEDDING_TICK_MS = 10 * 60 * 1000;
+let classificationEmbeddingTickInFlight = false;
+let lastClassificationEmbeddingTickAt = Number.NEGATIVE_INFINITY;
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
 const STUCK_POSTING_MS = 5 * 60 * 1000;
@@ -28,6 +36,7 @@ const inFlight = new Set<string>();
 let lastNightlyDate = '';
 let lastDigestDate = '';
 let receiptTickInFlight = false;
+let ruleAutoPostRecoveryInFlight = false;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
@@ -167,8 +176,56 @@ export async function runReceiptTick(): Promise<void> {
   }
 }
 
+export async function runClassificationSearchEmbeddingTick(
+  now: Date = new Date(),
+): Promise<void> {
+  if (
+    classificationEmbeddingTickInFlight
+    || now.getTime() - lastClassificationEmbeddingTickAt < CLASSIFICATION_EMBEDDING_TICK_MS
+  ) {
+    return;
+  }
+  classificationEmbeddingTickInFlight = true;
+  lastClassificationEmbeddingTickAt = now.getTime();
+  try {
+    await runClassificationEmbeddingTick();
+  } finally {
+    classificationEmbeddingTickInFlight = false;
+  }
+}
+
+export async function runRuleAutoPostRecoveryTick(): Promise<void> {
+  if (ruleAutoPostRecoveryInFlight) return;
+  ruleAutoPostRecoveryInFlight = true;
+  try {
+    await recoverRuleAutoPosts();
+    await recoverRulePreparationRetries();
+  } finally {
+    ruleAutoPostRecoveryInFlight = false;
+  }
+}
+
 async function tick(): Promise<void> {
   const now = new Date();
+  try {
+    await sweepQboTokenRevocations();
+  } catch {
+    console.error('[jobs] disconnect revocation recovery failed');
+  }
+  try {
+    // Drain or classify durable preparations before any sync can discover new
+    // canonical auto-post work. Paused runtime prevents fresh sends while the
+    // recovery service still permits reconciliation-only readback.
+    await runRuleAutoPostRecoveryTick();
+  } catch {
+    console.error('[jobs] rule auto-post recovery failed');
+  }
+  try {
+    const report = await runClassificationOutcomeRecoveryTick();
+    if (report.failed > 0) console.error('[jobs] classification outcome recovery incomplete');
+  } catch {
+    console.error('[jobs] classification outcome recovery failed');
+  }
   try {
     await recoverStuckAttachmentOperations({ now });
   } catch {
@@ -193,6 +250,11 @@ async function tick(): Promise<void> {
     console.error('[jobs] agent scheduler tick failed');
   }
   try {
+    await runClassificationSearchEmbeddingTick(now);
+  } catch {
+    console.error('[jobs] classification embedding tick failed');
+  }
+  try {
     await runReceiptTick();
   } catch {
     console.error('[jobs] receipt scheduler tick failed');
@@ -202,6 +264,8 @@ async function tick(): Promise<void> {
 export function startJobs(): void {
   if (ticker !== null) return;
   startAgentScheduler();
+  runClassificationSearchEmbeddingTick().catch(() => console.error('[jobs] boot classification embedding tick failed'));
+  sweepQboTokenRevocations().catch(() => console.error('[jobs] boot disconnect revocation recovery failed'));
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));
   recoverStuckAttachmentOperations()
@@ -209,6 +273,10 @@ export function startJobs(): void {
   runAttachmentCleanup().catch(() => console.error('[jobs] attachment cleanup failed'));
   runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
   runReceiptTick().catch(() => console.error('[jobs] boot receipt scheduler tick failed'));
+  runRuleAutoPostRecoveryTick()
+    .catch(() => console.error('[jobs] boot rule auto-post recovery failed'));
+  runClassificationOutcomeRecoveryTick()
+    .catch(() => console.error('[jobs] boot classification outcome recovery failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();

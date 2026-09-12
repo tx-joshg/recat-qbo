@@ -20,6 +20,12 @@ import {
   type McpOperationRecord,
   type McpOperationStore,
 } from './operations.js';
+import {
+  assertProviderActionabilityAllowsPrepare,
+  actionabilityObservationFromRow,
+  type ActionabilityTransactionIdentity,
+  type ProviderActionabilityObservation,
+} from '../providerActionability.js';
 
 const TOOL_NAME = 'prepare_categorization';
 const MAX_WARNINGS = 20;
@@ -38,6 +44,16 @@ export interface PrepareMcpCategorizationInput {
   proposal: CategorizationProposal;
 }
 
+/**
+ * Read-only recovery input for an exact prepare that was accepted by a
+ * transport but whose response was lost before the caller received its ID.
+ */
+export interface GetPreparedMcpCategorizationInput {
+  companyId: string;
+  transactionId: string;
+  idempotencyKey: string;
+}
+
 export interface PreparedMcpCategorizationDto {
   operationId: string;
   expiresAt: string;
@@ -46,11 +62,17 @@ export interface PreparedMcpCategorizationDto {
   preview: {
     transactionId: string;
     revision: number;
+    taxDisposition: NonNullable<StagedCategorization['taxDisposition']>;
     taxCalculation: StagedCategorization['taxCalculation'];
     totals: StagedCategorization['totals'];
     lines: Array<Pick<
       StagedCategorization['lines'][number],
-      'idx' | 'subtotalCents' | 'taxCents' | 'totalCents'
+      | 'idx'
+      | 'subtotalCents'
+      | 'taxCents'
+      | 'totalCents'
+      | 'categoryQboId'
+      | 'taxCodeQboId'
     >>;
     transactionTagCount: number;
     lineTagCount: number;
@@ -65,6 +87,7 @@ export interface McpCategorizationDeps {
   stage?: StageWithWorkflow;
   categorization?: CategorizationDeps;
   authorizationStore?: McpCategorizationAuthorizationStore;
+  operationStore?: McpOperationStore;
   createOperation?: CreateOperation;
   now?: () => Date;
 }
@@ -109,7 +132,17 @@ export interface McpCategorizationAuthorizationStore {
 }
 
 interface McpCategorizationTransaction
-  extends McpOperationStore, McpCategorizationAuthorizationStore {}
+  extends McpOperationStore, McpCategorizationAuthorizationStore {
+  /** Optional after the provider-actionability migration. */
+  transaction?: {
+    findFirst(args: {
+      where: { id: string; companyId: string };
+    }): Promise<ActionabilityTransactionIdentity | null>;
+  };
+  transactionActionability?: {
+    findUnique(args: { where: { transactionId: string } }): Promise<ProviderActionabilityObservation | null>;
+  };
+}
 
 export type McpCategorizationErrorCode =
   | 'MCP_UNAUTHORIZED'
@@ -137,6 +170,7 @@ const boundedTagIds = z.array(z.string().uuid()).max(MAX_TAGS)
 const previewSchema = z.object({
   transactionId: z.string().uuid(),
   revision: z.number().int().min(1).max(MAX_PRISMA_INT),
+  taxDisposition: z.enum(['set', 'preserve_current']).optional(),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   totals: z.object({
     subtotalCents: safeCents,
@@ -220,6 +254,8 @@ export async function prepareMcpCategorization(
         authorizedAt,
       );
 
+      // A byte-identical replay returns the already prepared durable
+      // operation. It must not depend on a later-expiring actionability cache.
       const existing = await transaction.mcpOperation.findFirst({
         where: {
           tokenId: principal.tokenId,
@@ -228,9 +264,34 @@ export async function prepareMcpCategorization(
           idempotencyKey,
         },
       });
-      if (existing === null) return { kind: 'continue' };
-      assertExactPrepareReplay(existing, principal, normalizedInput, idempotencyKey);
-      return { kind: 'return', value: toPreparedDto(existing) };
+      if (existing !== null) {
+        assertExactPrepareReplay(existing, principal, normalizedInput, idempotencyKey);
+        return { kind: 'return', value: toPreparedDto(existing) };
+      }
+
+      // Once the provider-actionability migration is present, reject known
+      // blocked/unknown transactions before staging changes or creating a new
+      // MCP operation. Commit still performs its independent fresh QBO check.
+      if (transaction.transaction && transaction.transactionActionability) {
+        const current = await transaction.transaction.findFirst({
+          where: {
+            id: normalizedInput.transactionId,
+            companyId: normalizedInput.companyId,
+          },
+        });
+        if (current !== null) {
+          const observation = await transaction.transactionActionability.findUnique({
+            where: { transactionId: normalizedInput.transactionId },
+          });
+          assertProviderActionabilityAllowsPrepare(
+            actionabilityObservationFromRow(observation),
+            current,
+            authorizedAt,
+          );
+        }
+      }
+
+      return { kind: 'continue' };
     },
     afterStage: async (rawTransaction, receipt) => {
       const transaction = rawTransaction as unknown as McpCategorizationTransaction;
@@ -268,6 +329,54 @@ export async function prepareMcpCategorization(
     if (isEntityBusy(caught)) throw new McpCategorizationError('ENTITY_BUSY');
     throw caught;
   }
+}
+
+/**
+ * Recover only the caller's exact durable preparation envelope. This is a
+ * read path: it neither stages a revision nor reaches QuickBooks.
+ */
+export async function getPreparedMcpCategorization(
+  principal: McpPrincipal,
+  input: GetPreparedMcpCategorizationInput,
+  dependencies: McpCategorizationDeps = {},
+): Promise<PreparedMcpCategorizationDto> {
+  const idempotencyKey = normalizeMcpOperationIdempotencyKey(input.idempotencyKey);
+  if (idempotencyKey === null) throw new McpOperationError('OPERATION_INVALID_INPUT');
+
+  const currentTime = dependencies.now ?? (() => new Date());
+  const checkedAt = currentTime();
+  if (!isValidDate(checkedAt)) throw new McpOperationError('OPERATION_INVALID_INPUT');
+
+  const authorizationStore = dependencies.authorizationStore
+    ?? prisma as unknown as McpCategorizationAuthorizationStore;
+  await assertCurrentMcpCategorizationAuthorization(
+    authorizationStore,
+    principal,
+    input.companyId,
+    checkedAt,
+  );
+
+  const operationStore = dependencies.operationStore
+    ?? prisma as unknown as McpOperationStore;
+  const operation = await operationStore.mcpOperation.findFirst({
+    where: {
+      tokenId: principal.tokenId,
+      toolName: TOOL_NAME,
+      transactionId: input.transactionId,
+      idempotencyKey,
+    },
+  });
+  if (
+    operation === null
+    || operation.tokenPrefix !== principal.tokenPrefix
+    || operation.userId !== principal.userId
+    || operation.companyId !== input.companyId
+    || operation.kind !== 'categorization'
+    || operation.cancelledAt !== null
+    || operation.retryOfId !== null
+  ) throw new McpOperationError('OPERATION_NOT_FOUND');
+
+  return toPreparedDto(operation);
 }
 
 export async function assertCurrentMcpCategorizationAuthorization(
@@ -362,6 +471,7 @@ function toPreparedDto(operation: McpOperationRecord): PreparedMcpCategorization
     preview: {
       transactionId: staged.transactionId,
       revision: staged.revision,
+      taxDisposition: staged.taxDisposition ?? 'set',
       taxCalculation: staged.taxCalculation,
       totals: staged.totals,
       lines: staged.lines.map((line) => ({
@@ -369,6 +479,8 @@ function toPreparedDto(operation: McpOperationRecord): PreparedMcpCategorization
         subtotalCents: line.subtotalCents,
         taxCents: line.taxCents,
         totalCents: line.totalCents,
+        categoryQboId: line.categoryQboId,
+        taxCodeQboId: line.taxCodeQboId,
       })),
       transactionTagCount: staged.tagIds.length,
       lineTagCount: staged.lines.reduce(

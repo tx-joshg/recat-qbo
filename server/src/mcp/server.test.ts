@@ -99,7 +99,7 @@ function mockReads(overrides: Partial<CompanyReadOperations> = {}): CompanyReadO
       nextCursor: null,
     }),
     listTags: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
-    listRules: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listRules: vi.fn().mockResolvedValue({ runtimeMode: 'canonical', items: [], nextCursor: null }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     ...overrides,
   };
@@ -695,36 +695,35 @@ describe('stateless MCP handler', () => {
     expectSafeInvalidToolFailure(payload!, 'PRIVATE_STREAM_SENTINEL');
   });
 
-  it('passes through a schema-valid Unicode legacy success larger than one MiB', async () => {
-    const largeUnicodeText = '😀'.repeat(1_024);
+  it.each([
+    { era: 'legacy', mirroredOnly: false },
+    { era: 'modern', mirroredOnly: false },
+    { era: 'legacy', mirroredOnly: true },
+    { era: 'modern', mirroredOnly: true },
+  ])('bounds Unicode $era output (mirrored-only overflow: $mirroredOnly)', async ({ era, mirroredOnly }) => {
+    const largeUnicodeText = '😀'.repeat(mirroredOnly ? 36 : 1_024);
     const largeRules = Array.from({ length: 100 }, (_, index) => ({
-      id: `rule-${index}`,
-      companyId: 'company-a',
-      priority: index,
-      matchField: 'payee' as const,
-      matchText: largeUnicodeText,
-      category: largeUnicodeText,
-      categoryQboId: largeUnicodeText,
-      taxCalculation: 'TaxExcluded' as const,
-      taxCode: largeUnicodeText,
-      taxCodeQboId: largeUnicodeText,
-      tagIds: Array.from(
-        { length: 100 },
-        (_, tagIndex) => `tag-${tagIndex}`.padEnd(128, 'x'),
-      ),
-      autoPost: false,
-      createdAt: '2026-07-28T00:00:00.000Z',
-      reviewRequiredAt: null,
-      reviewReason: null,
-      origin: null,
-      valid: false,
-      invalidReasons: Array.from(
-        { length: 4 },
-        () => largeUnicodeText,
-      ),
+      state: 'disabled', reviewRequiredAt: null, reviewReason: null, repairReason: null,
+      revision: {
+        id: `revision-${index}`, ruleId: `rule-${index}`, companyId: 'company-a',
+        revision: 1, state: 'disabled',
+        condition: { matchField: 'payee', matchText: largeUnicodeText },
+        direction: null, action: null, taxCodeName: largeUnicodeText,
+        autoPost: false, originIntent: null, sourceCaseId: null, sourceCandidateId: null,
+        changedBy: null, createdAt: '2026-07-28T00:00:00.000Z', repairReason: null,
+        affectedJournalEntryCount: 0, valid: false,
+        invalidReasons: Array.from({ length: 4 }, () => largeUnicodeText),
+      },
     }));
+    const value = { items: largeRules, nextCursor: null };
+    if (mirroredOnly) {
+      expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThan(256 * 1_024);
+      const wireValue = { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value };
+      expect(Buffer.byteLength(JSON.stringify(wireValue))).toBeGreaterThan(256 * 1_024);
+    }
     const operations = mockReads({
       listRules: vi.fn().mockResolvedValue({
+        runtimeMode: 'canonical',
         items: largeRules,
         nextCursor: null,
       }),
@@ -735,12 +734,18 @@ describe('stateless MCP handler', () => {
       headers: {
         accept: 'application/json, text/event-stream',
         'content-type': 'application/json',
+        ...(era === 'modern' ? {
+          'mcp-protocol-version': MODERN_VERSION,
+          'mcp-method': 'tools/call',
+          'mcp-name': 'list_rules',
+        } : {}),
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: 'large-valid-output',
         method: 'tools/call',
         params: {
+          ...(era === 'modern' ? { _meta: META } : {}),
           name: 'list_rules',
           arguments: { companyId: 'company-a' },
         },
@@ -748,16 +753,39 @@ describe('stateless MCP handler', () => {
     }), { authInfo: auth('one') });
     const text = await response.text();
 
-    expect(Buffer.byteLength(text)).toBeGreaterThan(1_024 * 1_024);
+    expect(Buffer.byteLength(text)).toBeLessThan(16 * 1_024);
     expect(text.includes('\uFFFD')).toBe(false);
     const [payload] = await legacyPayload(
       new Response(text, { headers: response.headers }),
     );
     expect(payload?.id).toBe('large-valid-output');
-    expect(payload?.result.isError).not.toBe(true);
-    expect(payload?.result.structuredContent.items).toHaveLength(100);
-    expect(payload?.result.structuredContent.items[99].invalidReasons[3])
-      .toBe(largeUnicodeText);
+    expect(payload?.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'RESPONSE_TOO_LARGE', message: expect.stringContaining('limit') } },
+    });
+    expect(text).not.toContain(largeUnicodeText);
+  });
+
+  it('returns a bounded explicit failure for a single oversized transaction', async () => {
+    const transaction = {
+      id: 'transaction-size', companyId: 'company-a', qboId: 'qbo-size', qboType: 'Purchase',
+      date: '2001-01-01', payee: 'Example vendor', memo: null, amount: -100,
+      bankAccount: 'Example bank', status: 'PENDING', revision: 0,
+      category: null, categoryQboId: null, taxCalculation: null, taxCode: null, taxCodeQboId: null,
+      splits: Array.from({ length: 100 }, () => ({ amount: 1, category: 'Example', tagIds: [], memo: 'x'.repeat(2048) })),
+      tagIds: [], suggestion: null, error: null, postedAt: null, postedBy: null,
+      activeCategorizationAttempt: null,
+      verification: { status: 'unknown', outcome: null, summary: 'Not yet verified' },
+    };
+    const reads = mockReads({ getTransaction: vi.fn().mockResolvedValue(transaction) });
+    const { body } = await modern(createRecatMcpHandler(reads), 'tools/call', {
+      name: 'get_transaction', arguments: { companyId: 'company-a', transactionId: 'transaction-size' },
+    });
+    expect(body.result).toMatchObject({ isError: true, structuredContent: { error: {
+      code: 'RESPONSE_TOO_LARGE', message: expect.stringContaining('web app'),
+    } } });
+    expect(Buffer.byteLength(JSON.stringify(body))).toBeLessThan(16 * 1024);
+    expect(reads.getTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('rejects modern legacy-handshake methods and routing binding mismatches', async () => {

@@ -1,3 +1,4 @@
+import { healthRouter } from './routes/health.js';
 // Recat server entrypoint — wires middleware, routers, static client serving
 // (production), the error middleware, and the background job scheduler.
 
@@ -28,6 +29,8 @@ import { qboOauthRouter } from './routes/qboOauth.js';
 import { reportsRouter } from './routes/reports.js';
 import { ruleCandidatesRouter } from './routes/ruleCandidates.js';
 import { rulesRouter } from './routes/rules.js';
+import { ruleOperationsRouter } from './routes/ruleOperations.js';
+import { classificationRouter } from './routes/classification.js';
 import { tagsRouter } from './routes/tags.js';
 import { taxRouter } from './routes/tax.js';
 import {
@@ -129,6 +132,9 @@ app.use('/api/companies/:companyId/tags', tagsRouter);
 app.use('/api/companies/:companyId/tax', taxRouter);
 app.use('/api/companies/:companyId/rule-candidates', ruleCandidatesRouter);
 app.use('/api/companies/:companyId/rules', rulesRouter);
+app.use('/api/companies/:companyId/rule-operations', ruleOperationsRouter);
+app.use('/api/companies/:companyId/classification', classificationRouter);
+app.use('/api/companies/:companyId/health', healthRouter);
 app.use('/api/companies/:companyId/reports', reportsRouter);
 app.use('/api/companies/:companyId/dashboard', dashboardRouter);
 app.use('/api/companies/:companyId/audit', auditRouter);

@@ -37,6 +37,7 @@ export interface VerifiedCategorizationOutcome {
     configVersion: string;
     source: 'user' | 'autopilot' | 'mcp';
   } | null;
+  decisionContext?: import('../categorizationEvidence.js').NormalizedCategorizationDecisionContext;
 }
 
 export interface EvaluationRunRow {
@@ -246,7 +247,7 @@ export async function evaluateShadowRunAgainstOutcome(
         status: true,
       },
     });
-    const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'REVERTED';
+    const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'PENDING';
     if (
       transaction === null
       || transaction.companyId !== outcome.companyId

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   companyFindUnique: vi.fn(),
   getIntuitCredentialPreflight: vi.fn(),
   testCompanyConnection: vi.fn(),
+  hasIntuitCredentials: vi.fn(),
+  authorizeUrl: vi.fn(),
 }));
 
 vi.mock('../lib/prisma.js', () => ({
@@ -30,10 +32,10 @@ vi.mock('../lib/prisma.js', () => ({
 
 vi.mock('../lib/qbo/factory.js', () => ({
   getIntuitCredentialPreflight: mocks.getIntuitCredentialPreflight,
-  hasIntuitCredentials: vi.fn().mockResolvedValue(true),
+  hasIntuitCredentials: mocks.hasIntuitCredentials,
   isMockRealmId: vi.fn().mockReturnValue(false),
   qboFactory: {
-    authorizeUrl: vi.fn(),
+    authorizeUrl: mocks.authorizeUrl,
     forCompany: vi.fn(),
   },
   revokeCapturedQboToken: vi.fn(),
@@ -100,6 +102,9 @@ async function request(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.hasIntuitCredentials.mockResolvedValue(true);
+  mocks.authorizeUrl.mockImplementation(async (_state: string, mode: string) => mode === 'demo'
+    ? '/auth/qbo/mock-consent?state=synthetic-state' : 'https://appcenter.intuit.com/synthetic-authorize');
   mocks.getIntuitCredentialPreflight.mockResolvedValue({
     ok: true,
     clientIdConfigured: true,
@@ -119,6 +124,63 @@ beforeEach(() => {
     environment: 'production',
     mode: 'quickbooks',
     checkedAt: new Date().toISOString(),
+  });
+});
+
+describe('connect flow credential failures', () => {
+  it.each([
+    { mode: 'Demo' }, { mode: 'unknown' }, { mode: ['real', 'demo'] },
+    { mode: 'real', env: 'unknown' },
+  ])('rejects malformed choices before a failing credential read', async (body) => {
+    mocks.hasIntuitCredentials.mockRejectedValue(new Error('synthetic-settings-failure'));
+    const response = await request(testApp(), '/api/companies/connect', {
+      headers: { 'x-test-user': 'admin', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mocks.hasIntuitCredentials).not.toHaveBeenCalled();
+    expect(mocks.authorizeUrl).not.toHaveBeenCalled();
+  });
+
+  it.each(['GET', 'POST'])('keeps explicit demo setup independent of unreadable Intuit settings through %s', async (method) => {
+    mocks.hasIntuitCredentials.mockRejectedValue(new Error('synthetic-settings-failure'));
+    const response = await request(testApp(), method === 'GET'
+      ? '/api/companies/connect-url?mode=demo' : '/api/companies/connect', {
+      method, headers: { 'x-test-user': 'admin', 'content-type': 'application/json' },
+      ...(method === 'POST' ? { body: JSON.stringify({ mode: 'demo' }) } : {}),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ url: '/auth/qbo/mock-consent?state=synthetic-state' });
+    expect(mocks.hasIntuitCredentials).not.toHaveBeenCalled();
+    expect(mocks.authorizeUrl).toHaveBeenCalledWith(expect.any(String), 'demo');
+  });
+
+  it('returns actionable bounded failure for real setup without logging or exposing settings details', async () => {
+    mocks.hasIntuitCredentials.mockRejectedValue(new Error('synthetic-sensitive-settings-detail'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await request(testApp(), '/api/companies/connect', {
+        headers: { 'x-test-user': 'admin', 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'real' }),
+      });
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({ code: 'QBO_CREDENTIALS_UNAVAILABLE',
+        error: 'Current Intuit credentials could not be loaded. Check QuickBooks API access in Settings.' });
+      expect(logged).not.toHaveBeenCalled();
+      expect(mocks.authorizeUrl).not.toHaveBeenCalled();
+    } finally { logged.mockRestore(); }
+  });
+
+  it('preserves the missing-credentials response when the current read succeeds but is empty', async () => {
+    mocks.hasIntuitCredentials.mockResolvedValue(false);
+    const response = await request(testApp(), '/api/companies/connect', {
+      headers: { 'x-test-user': 'admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'real' }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'MISSING_CREDENTIALS' });
+    expect(mocks.authorizeUrl).not.toHaveBeenCalled();
   });
 });
 

@@ -116,14 +116,24 @@ export interface InstanceSettingsPatch {
 
 async function readStored(
   db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+  strictQboCredentials = false,
 ): Promise<Partial<Record<SettingKey, string>>> {
   const rows = await db.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
   const out: Partial<Record<SettingKey, string>> = {};
   for (const row of rows) {
     const key = row.key as SettingKey;
+    // A nonempty environment value is authoritative for that field. Its
+    // obsolete stored value is not part of the configuration being tested.
+    if (strictQboCredentials && (
+      (key === 'intuitClientId' && env.QBO_CLIENT_ID !== '')
+      || (key === 'intuitClientSecret' && env.QBO_CLIENT_SECRET !== '')
+    )) continue;
     try {
       out[key] = row.encrypted ? decrypt(row.value) : row.value;
     } catch {
+      if (strictQboCredentials && (key === 'intuitClientId' || key === 'intuitClientSecret')) {
+        throw new Error('Current Intuit credentials could not be decrypted.');
+      }
       // An undecryptable value (e.g. rotated ENCRYPTION_KEY) is treated as unset
       // rather than crashing every settings read; the admin re-enters it.
       console.error(`[instanceSettings] could not decrypt AppConfig key "${row.key}" — treating as unset`);
@@ -147,16 +157,21 @@ function normalizeSmtpPort(v: string | undefined): number {
 
 export async function getInstanceSettings(
   db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+  options: { strictQboCredentials?: boolean } = {},
 ): Promise<InstanceSettings> {
-  const stored = await readStored(db);
+  const stored = await readStored(db, options.strictQboCredentials);
   // SMTP is env-managed as a block: SMTP_HOST set → all five values come from
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).
   const smtpFromEnv = env.SMTP_HOST !== '';
+  const suggestionProvider =
+    env.SUGGESTION_PROVIDER !== undefined && env.SUGGESTION_PROVIDER !== ''
+      ? normalizeSuggestionProvider(env.SUGGESTION_PROVIDER)
+      : normalizeSuggestionProvider(stored.suggestionProvider);
   const suggestionModel =
     env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
       ? env.SUGGESTION_MODEL
-      : (stored.suggestionModel || 'gpt-4o-mini');
+      : (stored.suggestionModel || (suggestionProvider === 'openrouter' ? 'openai/gpt-4o-mini' : 'gpt-4o-mini'));
   return {
     // env vars take precedence over DB values
     // APP_URL unset → the stored value wins, falling back to env's own default.
@@ -169,10 +184,7 @@ export async function getInstanceSettings(
     webhookVerifierToken:
       env.QBO_WEBHOOK_VERIFIER_TOKEN !== '' ? env.QBO_WEBHOOK_VERIFIER_TOKEN : (stored.webhookVerifierToken ?? ''),
     suggestionSource: normalizeSuggestionSource(stored.suggestionSource),
-    suggestionProvider:
-      env.SUGGESTION_PROVIDER !== undefined && env.SUGGESTION_PROVIDER !== ''
-        ? normalizeSuggestionProvider(env.SUGGESTION_PROVIDER)
-        : normalizeSuggestionProvider(stored.suggestionProvider),
+    suggestionProvider,
     suggestionModel,
     agentDecisionModel: stored.agentDecisionModel || suggestionModel,
     agentVerifierModel: stored.agentVerifierModel || suggestionModel,

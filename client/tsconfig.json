@@ -11,6 +11,7 @@
     "noUnusedLocals": false,
     "skipLibCheck": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "resolveJsonModule": true
   },

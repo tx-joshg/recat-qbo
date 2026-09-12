@@ -56,23 +56,37 @@ function snapshotSource(
     rules: [
       {
         id: RULE_ID,
+        ruleRevision: 1,
         priority: 1,
         matchField: 'payee',
         matchText: 'Generic',
-        categoryQboId: 'expense-a',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: 'tax-a',
-        tagIds: [TAG_ID],
+        action: {
+          version: 2,
+          direction: 'Purchase',
+          category: 'Expense A',
+          categoryQboId: 'expense-a',
+          taxCalculation: 'TaxExcluded',
+          taxCodeQboId: 'tax-a',
+          tagIds: [TAG_ID],
+        },
+        autoPost: false,
       },
       {
         id: RULE_TAX_B_ID,
+        ruleRevision: 1,
         priority: 2,
         matchField: 'payee',
         matchText: 'Generic tax alternative',
-        categoryQboId: 'expense-a',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: 'tax-b',
-        tagIds: [TAG_ID],
+        action: {
+          version: 2,
+          direction: 'Purchase',
+          category: 'Expense A',
+          categoryQboId: 'expense-a',
+          taxCalculation: 'TaxExcluded',
+          taxCodeQboId: 'tax-b',
+          tagIds: [TAG_ID],
+        },
+        autoPost: false,
       },
     ],
     similarVerifiedTransactions: [{
@@ -405,6 +419,49 @@ describe('runShadowDecision', () => {
       turns: 2,
       toolCalls: 1,
     });
+  });
+
+  it('executes injected canonical classification search and returns bounded evidence history to the model', async () => {
+    const classificationSearch = vi.fn(async (request) => ({
+      query: request.query,
+      companyId: 'company-a',
+      scope: 'current_company' as const,
+      mode: 'lexical' as const,
+      requestedMode: request.mode,
+      degraded: false,
+      degradedReason: null,
+      status: 'no_match' as const,
+      noMatch: true,
+      hits: [],
+      total: 0,
+    }));
+    const model = new RecordingModel([
+      {
+        kind: 'tool_calls',
+        toolCalls: [{
+          id: 'classification-search',
+          name: 'search_classification_knowledge',
+          arguments: { query: 'Generic merchant', mode: 'lexical', limit: 5 },
+        }],
+      },
+      decisionTurn(abstention()),
+    ]);
+
+    const result = await runShadowDecision(snapshot(), { model, classificationSearch });
+
+    expect(result).toMatchObject({ status: 'abstain', diagnosticCode: 'AGENT_RUN_MODEL_ABSTAIN' });
+    expect(classificationSearch).toHaveBeenCalledTimes(1);
+    expect(model.inputs[1]?.history).toEqual([
+      expect.objectContaining({ role: 'assistant' }),
+      expect.objectContaining({
+        role: 'tool',
+        name: 'search_classification_knowledge',
+        result: {
+          items: [],
+          search: expect.objectContaining({ noMatch: true, status: 'no_match' }),
+        },
+      }),
+    ]);
   });
 
   it('rejects repeated IDs across primary and review phases globally', async () => {

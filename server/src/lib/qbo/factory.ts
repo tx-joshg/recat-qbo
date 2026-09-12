@@ -55,23 +55,27 @@ let cachedCreds: IntuitCreds = { clientId: env.QBO_CLIENT_ID, clientSecret: env.
 // and the extra round trip would be pure waste.
 let cachedRedirectUri = `${env.APP_URL}/auth/qbo/callback`;
 
-async function refreshCreds(): Promise<IntuitCreds> {
-  try {
-    const { getInstanceSettings } = await import('../../services/instanceSettings.js');
-    const s = await getInstanceSettings();
-    cachedCreds = {
-      clientId: env.QBO_CLIENT_ID || s.intuitClientId || '',
-      clientSecret: env.QBO_CLIENT_SECRET || s.intuitClientSecret || '',
-    };
-    // Assigned after the credentials, and defensively: a malformed public URL
-    // must not send this through the catch and discard a good credential read.
-    if (typeof s.appUrl === 'string' && s.appUrl !== '') {
-      cachedRedirectUri = `${s.appUrl.replace(/\/+$/, '')}/auth/qbo/callback`;
-    }
-  } catch {
-    // instance settings unavailable (first boot, DB down) — keep env values
+/** Diagnostics must prove the current configuration, never a previous cache. */
+async function loadAndCacheCurrentCreds(strictQboCredentials = true): Promise<IntuitCreds> {
+  const { getInstanceSettings } = await import('../../services/instanceSettings.js');
+  const s = await getInstanceSettings(undefined, { strictQboCredentials });
+  cachedCreds = {
+    clientId: env.QBO_CLIENT_ID || s.intuitClientId || '',
+    clientSecret: env.QBO_CLIENT_SECRET || s.intuitClientSecret || '',
+  };
+  if (typeof s.appUrl === 'string' && s.appUrl !== '') {
+    cachedRedirectUri = `${s.appUrl.replace(/\/+$/, '')}/auth/qbo/callback`;
   }
   return cachedCreds;
+}
+
+async function refreshCreds(): Promise<IntuitCreds> {
+  try {
+    return await loadAndCacheCurrentCreds(false);
+  } catch {
+    // Ordinary existing connections retain the cache during settings outages.
+    return cachedCreds;
+  }
 }
 
 void refreshCreds();
@@ -79,12 +83,12 @@ void refreshCreds();
 /** Are Intuit app credentials configured (env vars or wizard-entered)? The
  * real connect flow requires them; demo connections never do. */
 export async function hasIntuitCredentials(): Promise<boolean> {
-  const creds = await refreshCreds();
+  const creds = await loadAndCacheCurrentCreds();
   return creds.clientId !== '' && creds.clientSecret !== '';
 }
 
 export async function getIntuitCredentialPreflight(): Promise<QboPreflightDto> {
-  const creds = await refreshCreds();
+  const creds = await loadAndCacheCurrentCreds();
   const clientIdConfigured = creds.clientId !== '';
   const clientSecretConfigured = creds.clientSecret !== '';
   const selectedEnvironment = await prisma.appConfig.findUnique({
@@ -122,7 +126,10 @@ function holdingIdsOf(company: { holdingAccountIds: unknown }): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
 }
 
-async function clientForCompany(company: Company): Promise<QboClient> {
+async function clientForCompany(
+  company: Company,
+  currentCreds?: IntuitCreds,
+): Promise<MockQboClient | RealQboClient> {
   if (isMockRealmId(company.realmId)) {
     return new MockQboClient(company.realmId, holdingIdsOf(company));
   }
@@ -130,13 +137,14 @@ async function clientForCompany(company: Company): Promise<QboClient> {
   if (!company.accessToken || !company.refreshToken) {
     throw new QboAuthError(`Company "${company.nickname}" has no QuickBooks tokens — reconnect required`);
   }
-  const creds = await refreshCreds();
+  const creds = currentCreds ?? await refreshCreds();
   const { decrypt, encrypt } = await import('../crypto.js');
   const tokens: QboTokenSet = {
     accessToken: decrypt(company.accessToken),
     refreshToken: decrypt(company.refreshToken),
     expiresAt: company.tokenExpiresAt?.getTime() ?? 0,
   };
+  let persistedTokens = { accessToken: company.accessToken, refreshToken: company.refreshToken };
   return new RealQboClient({
     realmId: company.realmId,
     environment: company.env as QboEnvironment,
@@ -146,16 +154,37 @@ async function clientForCompany(company: Company): Promise<QboClient> {
     tokens,
     // Refresh tokens rotate on use — persist the new set immediately.
     onTokensRefreshed: async (t) => {
-      await prisma.company.update({
-        where: { id: company.id },
-        data: {
-          accessToken: encrypt(t.accessToken),
-          refreshToken: encrypt(t.refreshToken),
-          tokenExpiresAt: new Date(t.expiresAt),
-        },
+      const rotated = {
+        accessToken: encrypt(t.accessToken),
+        refreshToken: encrypt(t.refreshToken),
+        tokenExpiresAt: new Date(t.expiresAt),
+      };
+      const stored = await prisma.company.updateMany({
+        where: { id: company.id, disconnectedAt: null, ...persistedTokens },
+        data: rotated,
       });
+      if (stored.count !== 1) {
+        throw new QboAuthError('QuickBooks connection changed during token refresh.');
+      }
+      persistedTokens = { accessToken: rotated.accessToken, refreshToken: rotated.refreshToken };
     },
   });
+}
+
+/** Rotate credentials through the ordinary persistence guards before testing a read. */
+export async function testStoredQboConnection(
+  companyId: string,
+): Promise<{ kind: 'demo' } | { kind: 'verified' }> {
+  const company = await loadCompany(companyId);
+  if (isMockRealmId(company.realmId)) return { kind: 'demo' };
+  const creds = await loadAndCacheCurrentCreds();
+  if (creds.clientId === '' || creds.clientSecret === '') {
+    throw new QboAuthError('Intuit credentials are not configured.', 'INVALID_CLIENT_CREDENTIALS');
+  }
+  const client = await clientForCompany(company, creds);
+  if (!(client instanceof RealQboClient)) return { kind: 'demo' };
+  await client.verifyConnection();
+  return { kind: 'verified' };
 }
 
 export async function testCompanyConnection(companyId: string): Promise<QboConnectionTestDto> {

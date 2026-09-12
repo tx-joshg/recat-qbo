@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AgentDecision } from './decision.js';
+import { agentDecisionSchema, type AgentDecision } from './decision.js';
 import { buildAgentSnapshot, type AgentSnapshotSource } from './snapshot.js';
 import { verifyAgentDecision } from './verifier.js';
 
@@ -40,13 +40,20 @@ function source(
     ],
     rules: [{
       id: RULE_ID,
+      ruleRevision: 1,
       priority: 1,
       matchField: 'payee',
       matchText: 'Generic',
-      categoryQboId: 'expense-a',
-      taxCalculation: 'TaxExcluded',
-      taxCodeQboId: 'tax-a',
-      tagIds: [TAG_ID],
+      action: {
+        version: 2,
+        direction: 'Purchase',
+        category: 'Expense A',
+        categoryQboId: 'expense-a',
+        taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'tax-a',
+        tagIds: [TAG_ID],
+      },
+      autoPost: false,
     }],
     similarVerifiedTransactions: [{
       transactionId: HISTORY_ID,
@@ -133,8 +140,12 @@ describe('verifyAgentDecision', () => {
       ...source().rules[0]!,
       id: RULE_B_ID,
       priority: 2,
-      categoryQboId: 'expense-b',
-      taxCodeQboId: 'tax-b',
+      action: {
+        ...source().rules[0]!.action,
+        category: 'Expense B',
+        categoryQboId: 'expense-b',
+        taxCodeQboId: 'tax-b',
+      },
     };
     const snapshot = buildAgentSnapshot(source({
       rules: [...source().rules, secondRule],
@@ -293,6 +304,15 @@ describe('verifyAgentDecision', () => {
     );
   });
 
+  it('rejects historical observations as proposal evidence before verification', () => {
+    const observationEvidence = {
+      ...proposal(),
+      evidence: [{ kind: 'historical_observation', id: HISTORY_ID }],
+    };
+
+    expect(agentDecisionSchema.safeParse({ decision: observationEvidence }).success).toBe(false);
+  });
+
   it.each([
     [
       [{ kind: 'category', qboId: 'expense-b' }],
@@ -312,8 +332,12 @@ describe('verifyAgentDecision', () => {
   it('rejects rule and history evidence inconsistent with selected category/tax references', () => {
     const mismatchingRule = {
       ...source().rules[0]!,
-      categoryQboId: 'expense-b',
-      taxCodeQboId: 'tax-b',
+      action: {
+        ...source().rules[0]!.action,
+        category: 'Expense B',
+        categoryQboId: 'expense-b',
+        taxCodeQboId: 'tax-b',
+      },
     };
     const mismatchingHistory = {
       ...source().similarVerifiedTransactions[0]!,
@@ -410,15 +434,22 @@ describe('verifyAgentDecision', () => {
     const crossedRules = [
       {
         ...source().rules[0]!,
-        categoryQboId: 'expense-a',
-        taxCodeQboId: 'tax-b',
+        action: {
+          ...source().rules[0]!.action,
+          categoryQboId: 'expense-a',
+          taxCodeQboId: 'tax-b',
+        },
       },
       {
         ...source().rules[0]!,
         id: RULE_B_ID,
         priority: 2,
-        categoryQboId: 'expense-b',
-        taxCodeQboId: 'tax-a',
+        action: {
+          ...source().rules[0]!.action,
+          category: 'Expense B',
+          categoryQboId: 'expense-b',
+          taxCodeQboId: 'tax-a',
+        },
       },
     ];
     const split = proposal({

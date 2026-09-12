@@ -1,3 +1,7 @@
+---
+last_edited: 2026-09-09
+---
+
 <p align="center">
   <img src="client/public/icon.svg" alt="Recat QBO logo" width="128" height="128">
 </p>
@@ -219,3 +223,5 @@ React (Vite) client · Express + TypeScript server · PostgreSQL via Prisma · o
 ## License
 
 AGPL-3.0 — free to use, self-host, and modify. If you offer a modified version as a network service, you must share your changes.
+
+Classification evidence search, optional semantic retrieval, and readiness diagnostics are described in [Classification search](docs/classification-search.md).

@@ -7,6 +7,7 @@ import {
 } from './operations.js';
 import {
   prepareMcpUndo,
+  parseStoredMcpUndoPayload,
   type McpUndoStore,
 } from './undo.js';
 
@@ -137,7 +138,7 @@ function preparedUndo() {
     restoreHash: 'c'.repeat(64),
     preview: {
       action: 'restore_purchase_categorization' as const,
-      resultingStatus: 'REVERTED' as const,
+      resultingStatus: 'PENDING' as const,
       direction: 'purchase' as const,
       totalCents: -1234,
       totalTaxCents: null,
@@ -148,6 +149,22 @@ function preparedUndo() {
 }
 
 describe('prepareMcpUndo', () => {
+  it('normalizes a pre-upgrade stored REVERTED preview to the PENDING queue state', () => {
+    const parsed = parseStoredMcpUndoPayload({
+      sourceOperationId: '10000000-0000-4000-8000-000000000001',
+      sourcePreparedHash: 'a'.repeat(64),
+      currentPostHash: 'b'.repeat(64),
+      restoreHash: 'c'.repeat(64),
+      preview: {
+        ...preparedUndo().preview,
+        resultingStatus: 'REVERTED',
+      },
+      warnings: [],
+    });
+
+    expect(parsed.preview.resultingStatus).toBe('PENDING');
+  });
+
   it('creates an attributed undo operation containing only hashes, a source reference, and redacted summary', async () => {
     const { store, rows } = createStore();
     const source = await seedSource(store);

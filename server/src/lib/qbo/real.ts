@@ -18,6 +18,8 @@ import { Readable } from 'node:stream';
 import {
   QboAttachmentNotFoundError,
   QboAuthError,
+  QboHttpError,
+  QboRateLimitError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
@@ -48,17 +50,27 @@ import {
   type RawJournalEntryLine,
   type QboTaxCodeInfo,
   type QboTaxProfile,
+  type QboTaxRefundCapability,
   type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
+import {
+  noteQboRateLimit,
+  qboGetGateKey,
+  retryAfterSecondsFromHeader,
+  withQboGetGate,
+} from './getGate.js';
 import type { StagedCategorization } from '@recat/shared';
 import { classifyIntuitOAuthBody } from './diagnostics.js';
 import { moneyToCents } from '../../services/tax/model.js';
 import {
   isSupportedTaxRateValue,
+  purchaseCategoryOnlyLineHash,
+  purchasePreservedHash,
+  purchaseRawLineHash,
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
@@ -104,6 +116,18 @@ export type {
 } from './types.js';
 export type QboWriteLine = QboLineWriteSplit;
 
+export {
+  QBO_GET_MIN_START_SPACING_MS,
+  QBO_RATE_LIMIT_FALLBACK_SECONDS,
+  QBO_RATE_LIMIT_MAX_RETRY_SECONDS,
+  QBO_RATE_LIMIT_MIN_RETRY_SECONDS,
+  qboGetGateKey,
+  resetQboGetGatesForTest,
+  retryAfterSecondsFromHeader,
+  withQboGetGate,
+} from './getGate.js';
+export { QboRateLimitError } from './types.js';
+
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 // Revoke lives on the developer host, not the oauth host.
@@ -119,17 +143,25 @@ const REVOKE_TIMEOUT_MS = 5_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
 
-class QboHttpNotFoundError extends Error {
+class QboHttpNotFoundError extends QboHttpError {
   constructor() {
-    super('QuickBooks resource was not found.');
+    super(404, 'QuickBooks resource was not found.');
     this.name = 'QboHttpNotFoundError';
   }
 }
 
-class QboObjectNotFoundError extends Error {
+class QboObjectNotFoundError extends QboHttpError {
   constructor(message = 'QuickBooks object was not found.') {
-    super(message);
+    super(400, message);
     this.name = 'QboObjectNotFoundError';
+  }
+}
+
+/** Internal marker used to retry a 401 only after the current GET gate turn. */
+class QboUnauthorizedError extends Error {
+  constructor() {
+    super('QuickBooks authentication expired.');
+    this.name = 'QboUnauthorizedError';
   }
 }
 
@@ -165,6 +197,7 @@ interface RawAccount {
   FullyQualifiedName?: string;
   Classification?: string; // Asset | Liability | Equity | Revenue | Expense
   AccountType?: string; // Bank | Credit Card | Cost of Goods Sold | Expense | Income | ...
+  AccountSubType?: string;
   Active?: boolean;
 }
 
@@ -259,8 +292,63 @@ export interface RawReportRow {
 }
 
 export interface RawReport {
-  Columns?: { Column?: { ColTitle?: string; ColType?: string }[] };
+  Columns?: {
+    Column?: {
+      ColTitle?: string;
+      ColType?: string;
+      MetaData?: { Name?: string; Value?: string }[];
+    }[];
+  };
   Rows?: { Row?: RawReportRow[] };
+}
+
+function reportColumnIndex(
+  columns: NonNullable<NonNullable<RawReport['Columns']>['Column']>,
+  key: string,
+  titleWord: string,
+): number {
+  const byKey = columns.findIndex((column) =>
+    column.MetaData?.some((entry) => entry.Name === 'ColKey' && entry.Value === key),
+  );
+  if (byKey >= 0) return byKey;
+  const byType = columns.findIndex((column) => column.ColType === key);
+  if (byType >= 0) return byType;
+  return columns.findIndex((column) =>
+    (column.ColTitle ?? '').toLowerCase().includes(titleWord),
+  );
+}
+
+interface ReportTransactionIdentity {
+  id?: string;
+  conflict: boolean;
+}
+
+/**
+ * Intuit places a transaction id on either the date or transaction-type cell,
+ * depending on the report shape. Treat both semantic cells as authority
+ * carriers and fail closed when they disagree. The first-cell fallback is
+ * retained only for legacy reports where neither semantic column resolves.
+ */
+function reportTransactionIdentity(
+  colData: RawReportColData[],
+  dateIndex: number,
+  typeIndex: number,
+): ReportTransactionIdentity {
+  const carrierIndexes = [...new Set([dateIndex, typeIndex].filter((index) => index >= 0))];
+  const ids = carrierIndexes
+    .map((index) => colData[index]?.id?.trim())
+    .filter((id): id is string => id !== undefined && id !== '');
+  const distinct = [...new Set(ids)];
+  if (distinct.length > 1) return { conflict: true };
+  if (distinct.length === 1) return { id: distinct[0], conflict: false };
+
+  if (carrierIndexes.length === 0) {
+    const legacyId = colData[0]?.id?.trim();
+    if (legacyId !== undefined && legacyId !== '') {
+      return { id: legacyId, conflict: false };
+    }
+  }
+  return { conflict: false };
 }
 
 /** '1,234.56' / '-45.00' / '' / undefined → number (0 on anything unparsable). */
@@ -343,16 +431,11 @@ const TXN_LIST_COLUMNS = 'tx_date,txn_type,name,memo,subt_nat_amount';
  */
 export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
   const cols = raw.Columns?.Column ?? [];
-  const colIndex = (type: string, titleWord: string): number => {
-    const byType = cols.findIndex((c) => c.ColType === type);
-    if (byType >= 0) return byType;
-    return cols.findIndex((c) => (c.ColTitle ?? '').toLowerCase().includes(titleWord));
-  };
-  const iDate = colIndex('tx_date', 'date');
-  const iType = colIndex('txn_type', 'transaction type');
-  const iName = colIndex('name', 'name');
-  const iMemo = colIndex('memo', 'memo');
-  const iAmount = colIndex('subt_nat_amount', 'amount');
+  const iDate = reportColumnIndex(cols, 'tx_date', 'date');
+  const iType = reportColumnIndex(cols, 'txn_type', 'transaction type');
+  const iName = reportColumnIndex(cols, 'name', 'name');
+  const iMemo = reportColumnIndex(cols, 'memo', 'memo');
+  const iAmount = reportColumnIndex(cols, 'subt_nat_amount', 'amount');
   const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
     i >= 0 ? colData[i] : undefined;
 
@@ -365,13 +448,17 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
       const date = at(colData, iDate)?.value ?? '';
       if (date === '') continue; // summary/blank row
       const memo = at(colData, iMemo)?.value;
+      const identity = reportTransactionIdentity(colData, iDate, iType);
+      if (identity.conflict) {
+        throw new Error('Conflicting QuickBooks report transaction identities');
+      }
       out.push({
         date,
         payee: at(colData, iName)?.value ?? '',
         ...(memo !== undefined && memo !== '' ? { memo } : {}),
         amount: reportNumber(at(colData, iAmount)?.value),
         txnType: at(colData, iType)?.value ?? '',
-        qboId: at(colData, iDate)?.id ?? colData[0]?.id ?? '',
+        qboId: identity.id ?? '',
       });
     }
   };
@@ -395,8 +482,8 @@ function canonicalSafetyReportType(value: string | undefined): 'Purchase' | 'Dep
 
 function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget): boolean {
   const columns = raw.Columns?.Column ?? [];
-  const dateIndex = columns.findIndex((column) => column.ColType === 'tx_date');
-  const typeIndex = columns.findIndex((column) => column.ColType === 'txn_type');
+  const dateIndex = reportColumnIndex(columns, 'tx_date', 'date');
+  const typeIndex = reportColumnIndex(columns, 'txn_type', 'transaction type');
   if (dateIndex < 0 || typeIndex < 0) {
     throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
   }
@@ -408,7 +495,11 @@ function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget
       const date = row.ColData[dateIndex];
       if (date?.value !== target.txnDate) continue;
       const type = canonicalSafetyReportType(row.ColData[typeIndex]?.value);
-      const id = date.id ?? row.ColData[0]?.id;
+      const identity = reportTransactionIdentity(row.ColData, dateIndex, typeIndex);
+      if (identity.conflict) {
+        throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+      }
+      const id = identity.id;
       if (id === target.qboId) {
         if (type !== target.qboType) {
           throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
@@ -453,19 +544,14 @@ const TXN_LOG_COLUMNS = 'tx_date,txn_type,doc_num,name,memo,account_name,other_a
  */
 export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
   const cols = raw.Columns?.Column ?? [];
-  const colIndex = (type: string, titleWord: string): number => {
-    const byType = cols.findIndex((c) => c.ColType === type);
-    if (byType >= 0) return byType;
-    return cols.findIndex((c) => (c.ColTitle ?? '').toLowerCase().includes(titleWord));
-  };
-  const iDate = colIndex('tx_date', 'date');
-  const iType = colIndex('txn_type', 'transaction type');
-  const iDocNum = colIndex('doc_num', 'num');
-  const iName = colIndex('name', 'name');
-  const iMemo = colIndex('memo', 'memo');
-  const iAccount = colIndex('account_name', 'account');
-  const iCategory = colIndex('other_account', 'split');
-  const iAmount = colIndex('subt_nat_amount', 'amount');
+  const iDate = reportColumnIndex(cols, 'tx_date', 'date');
+  const iType = reportColumnIndex(cols, 'txn_type', 'transaction type');
+  const iDocNum = reportColumnIndex(cols, 'doc_num', 'num');
+  const iName = reportColumnIndex(cols, 'name', 'name');
+  const iMemo = reportColumnIndex(cols, 'memo', 'memo');
+  const iAccount = reportColumnIndex(cols, 'account_name', 'account');
+  const iCategory = reportColumnIndex(cols, 'other_account', 'split');
+  const iAmount = reportColumnIndex(cols, 'subt_nat_amount', 'amount');
   const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
     i >= 0 ? colData[i] : undefined;
 
@@ -479,6 +565,10 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
       if (date === '') continue; // summary/blank row
       const memo = at(colData, iMemo)?.value;
       const docNum = at(colData, iDocNum)?.value;
+      const identity = reportTransactionIdentity(colData, iDate, iType);
+      if (identity.conflict) {
+        throw new Error('Conflicting QuickBooks report transaction identities');
+      }
       out.push({
         date,
         txnType: at(colData, iType)?.value ?? '',
@@ -488,10 +578,7 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
         account: at(colData, iAccount)?.value ?? '',
         category: at(colData, iCategory)?.value ?? '',
         amount: reportNumber(at(colData, iAmount)?.value),
-        ...((): { qboId?: string } => {
-          const id = at(colData, iDate)?.id ?? colData[0]?.id;
-          return id !== undefined && id !== '' ? { qboId: id } : {};
-        })(),
+        ...(identity.id !== undefined ? { qboId: identity.id } : {}),
       });
     }
   };
@@ -546,6 +633,7 @@ function mapAccount(raw: RawAccount): QboAccountInfo {
     fullName: raw.FullyQualifiedName ?? raw.Name,
     classification: normalizeClassification(raw.AccountType, raw.Classification),
     accountType: raw.AccountType ?? '',
+    accountSubType: firstNonEmpty(raw.AccountSubType) ?? null,
     active: raw.Active !== false,
   };
 }
@@ -642,6 +730,8 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
       taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
       taxAmountCents,
       taxInclusiveCents,
+      rawHash: purchaseRawLineHash(line),
+      categoryOnlyHash: purchaseCategoryOnlyLineHash(line),
     };
   });
   const derivedTotalTaxCents = lines.reduce<number | null>((sum, line) => {
@@ -662,6 +752,7 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
         ? derivedTotalTaxCents
         : null
       : signedCents(raw.TxnTaxDetail.TotalTax),
+    preservedHash: purchasePreservedHash(raw),
     lines,
   };
 }
@@ -983,6 +1074,7 @@ export interface RealQboClientOptions {
 export class RealQboClient implements QboClient {
   readonly realmId: string;
   private readonly base: string;
+  private readonly getGateKey: string;
   private readonly clientId: string;
   private readonly clientSecret: string;
   private readonly holdingIds: ReadonlySet<string>;
@@ -993,6 +1085,7 @@ export class RealQboClient implements QboClient {
   constructor(opts: RealQboClientOptions) {
     this.realmId = opts.realmId;
     this.base = `${apiBase(opts.environment)}/v3/company/${encodeURIComponent(opts.realmId)}`;
+    this.getGateKey = qboGetGateKey(opts.environment, opts.realmId);
     this.clientId = opts.clientId;
     this.clientSecret = opts.clientSecret;
     this.holdingIds = new Set(opts.holdingAccountQboIds);
@@ -1001,6 +1094,12 @@ export class RealQboClient implements QboClient {
   }
 
   // ---- token lifecycle ----
+
+  /** A healthy access token alone does not verify stored refresh/app credentials. */
+  async verifyConnection(): Promise<QboCompanyInfo> {
+    await this.refresh();
+    return this.getCompanyInfo();
+  }
 
   private async ensureFreshToken(): Promise<string> {
     if (this.tokens.expiresAt - Date.now() < REFRESH_MARGIN_MS) {
@@ -1018,19 +1117,48 @@ export class RealQboClient implements QboClient {
   }
 
   private async doRefresh(): Promise<void> {
-    this.tokens = await refreshTokenGrant({
+    const rotated = await refreshTokenGrant({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
       refreshToken: this.tokens.refreshToken,
     });
-    // Persist BEFORE any further API call — losing a rotated refresh token
-    // strands the connection until the admin reconnects.
-    await this.onTokensRefreshed(this.tokens);
+    // A failed persistence/authority check must never leave a usable token in
+    // this client, including for a later call after the failed refresh.
+    await this.onTokensRefreshed(rotated);
+    this.tokens = rotated;
   }
 
   // ---- HTTP ----
 
   private async request<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    retried = false,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (method === 'GET') {
+      try {
+        return await withQboGetGate(
+          this.getGateKey,
+          () => this.requestUngated<T>(method, path, body, retried, signal),
+          signal,
+        );
+      } catch (error) {
+        // A 401 retry must leave the gate before refreshing and entering a new
+        // gated turn.  Retrying from inside the gate would deadlock behind
+        // the turn that is still waiting for the recursive request.
+        if (error instanceof QboUnauthorizedError && !retried) {
+          await this.refresh();
+          return this.request<T>(method, path, body, true, signal);
+        }
+        throw error;
+      }
+    }
+    return this.requestUngated<T>(method, path, body, retried, signal);
+  }
+
+  private async requestUngated<T>(
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
@@ -1070,9 +1198,15 @@ export class RealQboClient implements QboClient {
         throw error;
       }
       if (res.status === 401 && !retried) {
+        if (method === 'GET') {
+          // The outer request wrapper refreshes only after this gated turn
+          // releases, then starts the retry as a fresh gated GET.
+          await res.body?.cancel().catch(() => undefined);
+          throw new QboUnauthorizedError();
+        }
         // Access token invalidated server-side: refresh once and retry.
         await this.refresh();
-        return this.request<T>(method, path, body, true, signal);
+        return this.requestUngated<T>(method, path, body, true, signal);
       }
       let text: string;
       try {
@@ -1088,7 +1222,7 @@ export class RealQboClient implements QboClient {
         if (method === 'POST' && res.status >= 500) {
           throw new QboRequestTimeout('QuickBooks did not confirm the request.');
         }
-        throw this.toError(res.status, text);
+        throw this.toError(res.status, text, res.headers);
       }
       try {
         return (text ? JSON.parse(text) : {}) as T;
@@ -1137,7 +1271,7 @@ export class RealQboClient implements QboClient {
         },
       );
       const text = await res.text();
-      if (!res.ok) throw this.toError(res.status, text);
+      if (!res.ok) throw this.toError(res.status, text, res.headers);
       const parsed: unknown = text ? JSON.parse(text) : {};
       return typeof parsed === 'object' &&
         parsed !== null &&
@@ -1230,7 +1364,7 @@ export class RealQboClient implements QboClient {
       }
       if (!response.ok) {
         if (response.status >= 400 && response.status < 500) {
-          throw this.toError(response.status, text);
+          throw this.toError(response.status, text, response.headers);
         }
         throw new QboRequestTimeout(
           'QuickBooks did not confirm the attachment upload.',
@@ -1262,7 +1396,16 @@ export class RealQboClient implements QboClient {
     ) as Promise<{ Purchase?: RawPurchase; Deposit?: RawDeposit }>;
   }
 
-  private toError(status: number, bodyText: string): Error {
+  private toError(status: number, bodyText: string, headers?: Headers): Error {
+    if (status === 429) {
+      const error = new QboRateLimitError(
+        retryAfterSecondsFromHeader(headers?.get('retry-after')),
+      );
+      // A rejected POST also cools down subsequent GETs for this realm.  The
+      // rejected request itself is never retried here.
+      noteQboRateLimit(this.getGateKey, error);
+      return error;
+    }
     let fault: QboFaultBody = {};
     try {
       fault = JSON.parse(bodyText) as QboFaultBody;
@@ -1286,7 +1429,7 @@ export class RealQboClient implements QboClient {
       return new QboAuthError(first?.Message ?? `QuickBooks auth error (${status})`);
     }
     const message = firstNonEmpty(first?.Detail, first?.Message) ?? `QuickBooks API error (${status})`;
-    return new Error(message);
+    return new QboHttpError(status, message);
   }
 
   private async query<T extends keyof NonNullable<QueryBody['QueryResponse']>>(
@@ -1340,6 +1483,19 @@ export class RealQboClient implements QboClient {
     return mapTaxProfile(rows[0]);
   }
 
+  async probeTaxRefundCapability(): Promise<QboTaxRefundCapability> {
+    // Intuit's current public Accounting API does not document a creatable and
+    // readable Canadian Tax Credit Refund resource. An old SDK entity enum is
+    // not a supported write contract, so never probe an undocumented endpoint
+    // against a connected company's books.
+    return {
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: MINOR_VERSION,
+    };
+  }
+
   async fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence> {
     if (
       (target.qboType !== 'Purchase' && target.qboType !== 'Deposit')
@@ -1359,11 +1515,13 @@ export class RealQboClient implements QboClient {
         });
         return this.request<RawReport>('GET', `/reports/TransactionList?${params.toString()}`);
       };
-      const [preferences, cleared, reconciled] = await Promise.all([
-        this.queryAll('select * from Preferences', 'Preferences'),
-        query('Cleared'),
-        query('Reconciled'),
-      ]);
+      // Keep the three provider reads in one explicit sequence.  The
+      // process-wide GET gate serializes them anyway; doing so here also
+      // prevents two already-queued report calls from continuing after a
+      // rate-limit failure has made this safety result unusable.
+      const preferences = await this.queryAll('select * from Preferences', 'Preferences');
+      const cleared = await query('Cleared');
+      const reconciled = await query('Reconciled');
       if (preferences.length !== 1) {
         throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
       }
@@ -1373,7 +1531,13 @@ export class RealQboClient implements QboClient {
         reconciled: reportContainsSafetyTarget(reconciled, target),
       };
     } catch (error) {
-      if (error instanceof QboWriteSafetyError) throw error;
+      // Preserve the provider's typed rate-limit signal and retry hint.  The
+      // generic safety-unavailable wrapper would otherwise erase the reason
+      // and make callers repeat the same throttled probe blindly.
+      if (
+        error instanceof QboWriteSafetyError
+        || error instanceof QboRateLimitError
+      ) throw error;
       throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
     }
   }
@@ -1473,7 +1637,7 @@ export class RealQboClient implements QboClient {
       if (response.status === 404) {
         throw new QboAttachmentNotFoundError();
       }
-      throw this.toError(response.status, text);
+      throw this.toError(response.status, text, response.headers);
     }
     if (!response.body) {
       clearTimeout(timeout);

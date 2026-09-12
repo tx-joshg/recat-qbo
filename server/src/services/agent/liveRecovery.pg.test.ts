@@ -484,6 +484,40 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
   });
 
+  it('reconciles an old generation by its original durable identity without creating another attempt', async () => {
+    const fixture = await seedRecovery();
+    const original = await prisma.qboMutationAttempt.findUniqueOrThrow({
+      where: { requestId: fixture.requestId },
+    });
+    await prisma.agentCompanyConfig.update({
+      where: { companyId: fixture.companyId },
+      data: { schedulingGeneration: { increment: 1 } },
+    });
+    const fetchPreparedSnapshot = vi.fn(async () => fixture.expected);
+    const recategorize = vi.fn();
+    vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
+      fetchPreparedSnapshot, recategorize,
+    } as unknown as QboClient);
+
+    await expect(listLiveReconciliationCandidates(fixture.companyId)).resolves.toEqual([fixture.input]);
+    await expect(reconcileScheduledLiveMutation(fixture.input)).resolves.toMatchObject({
+      outcome: 'VERIFIED', status: 'POSTED',
+    });
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
+    expect(recategorize).not.toHaveBeenCalled();
+    const attempts = await prisma.qboMutationAttempt.findMany({
+      where: { transactionId: fixture.transactionId },
+    });
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({
+      id: original.id, requestId: original.requestId, requestHash: original.requestHash,
+      requestPayload: original.requestPayload, status: 'VERIFIED',
+    });
+    await expect(prisma.agentJob.findUniqueOrThrow({
+      where: { id: fixture.requestId },
+    })).resolves.toMatchObject({ schedulingGeneration: 0, status: 'completed', attemptCount: 1 });
+  });
+
   it('discovers connected durable recovery after mutable live mode is turned off', async () => {
     const fixture = await seedRecovery();
     await prisma.agentCompanyConfig.update({

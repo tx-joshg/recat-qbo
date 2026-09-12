@@ -1,3 +1,4 @@
+import { classificationSearchForCompany, type AgentClassificationSearch } from './classificationSearch.js';
 import { agentDecisionSchemaVersion } from './core/decision.js';
 import {
   AGENT_MODEL_PROMPT_VERSION,
@@ -45,6 +46,7 @@ export interface ShadowWorkerDeps {
   readonly decisionModel: AgentModel;
   readonly reviewModel: AgentModel;
   readonly limits: Partial<AgentLimits>;
+  readonly classificationSearch?: AgentClassificationSearch;
   readonly now?: (tx: WorkerTransactionDb) => Promise<Date> | Date;
   /** Deterministic crash/race seams used by the durable PostgreSQL tests. */
   readonly afterStarted?: () => Promise<void> | void;
@@ -66,6 +68,8 @@ interface LockedJobRow {
   disconnectedAt: unknown;
   mode: unknown;
   currentConfigVersion: unknown;
+  schedulingGeneration: unknown;
+  currentSchedulingGeneration: unknown;
   provider: unknown;
   decisionModel: unknown;
   verifierModel: unknown;
@@ -104,6 +108,7 @@ export async function runClaimedShadowJob(
     model: deps.decisionModel,
     reviewModel: deps.reviewModel,
     limits: deps.limits,
+    classificationSearch: deps.classificationSearch ?? classificationSearchForCompany(job.companyId),
   });
   await deps.beforeComplete?.();
   await completeRunAndJob(job, prepared.runId, result, deps);
@@ -387,12 +392,13 @@ async function lockJob(
        FOR SHARE OF company
      )
      SELECT job."id", job."companyId", job."transactionId", job."revision",
-       job."configVersion", job."status", job."lockOwner",
+       job."configVersion", job."schedulingGeneration", job."status", job."lockOwner",
        job."leaseExpiresAt", job."attemptCount",
        txn."status" AS "transactionStatus",
        txn."revision" AS "transactionRevision",
        company."disconnectedAt",
        config."mode", config."configVersion" AS "currentConfigVersion",
+       config."schedulingGeneration" AS "currentSchedulingGeneration",
        config."provider", config."decisionModel", config."verifierModel",
        config."limits"
      FROM locked_job AS job
@@ -427,7 +433,8 @@ function isFresh(row: LockedJobRow, job: ClaimedAgentJob): boolean {
     && row.transactionRevision === job.revision
     && row.disconnectedAt === null
     && row.mode === 'shadow'
-    && row.currentConfigVersion === job.configVersion;
+    && row.currentConfigVersion === job.configVersion
+    && row.schedulingGeneration === row.currentSchedulingGeneration;
 }
 
 function configurationMatches(row: LockedJobRow, deps: ShadowWorkerDeps): boolean {

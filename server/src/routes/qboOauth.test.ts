@@ -270,6 +270,7 @@ describe('QuickBooks OAuth callback publication', () => {
         legalName: 'Example Books LLC',
         nickname: 'Example Books',
         env: 'production',
+        ruleRuntimeMode: 'canonical',
         disconnectedAt: null,
       }),
     });
@@ -314,9 +315,11 @@ describe('QuickBooks OAuth callback publication', () => {
       data: expect.objectContaining({
         legalName: 'Example Books LLC',
         disconnectedAt: null,
+        qboTokenRevocations: { deleteMany: {} },
       }),
     });
     expect(mocks.companyUpdate.mock.calls[0]?.[0].data).not.toHaveProperty('nickname');
+    expect(mocks.companyUpdate.mock.calls[0]?.[0].data).not.toHaveProperty('ruleRuntimeMode');
     const published = mocks.companyUpdate.mock.calls[0]?.[0].data;
     expect(decrypt(published.accessToken)).toBe('inspected-access-token');
     expect(decrypt(published.refreshToken)).toBe('inspected-refresh-token');
@@ -345,6 +348,7 @@ describe('QuickBooks OAuth callback publication', () => {
     expect(pendingData.disconnectedAt).toBeInstanceOf(Date);
     expect(pendingData.accessToken).toBeUndefined();
     expect(pendingData.refreshToken).toBeUndefined();
+    expect(pendingData.ruleRuntimeMode).toBe('canonical');
     expect(mocks.companyCreate.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.installDemoFinancials.mock.invocationCallOrder[0] as number,
     );
