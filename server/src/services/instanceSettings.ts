@@ -116,14 +116,24 @@ export interface InstanceSettingsPatch {
 
 async function readStored(
   db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+  strictQboCredentials = false,
 ): Promise<Partial<Record<SettingKey, string>>> {
   const rows = await db.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
   const out: Partial<Record<SettingKey, string>> = {};
   for (const row of rows) {
     const key = row.key as SettingKey;
+    // A nonempty environment value is authoritative for that field. Its
+    // obsolete stored value is not part of the configuration being tested.
+    if (strictQboCredentials && (
+      (key === 'intuitClientId' && env.QBO_CLIENT_ID !== '')
+      || (key === 'intuitClientSecret' && env.QBO_CLIENT_SECRET !== '')
+    )) continue;
     try {
       out[key] = row.encrypted ? decrypt(row.value) : row.value;
     } catch {
+      if (strictQboCredentials && (key === 'intuitClientId' || key === 'intuitClientSecret')) {
+        throw new Error('Current Intuit credentials could not be decrypted.');
+      }
       // An undecryptable value (e.g. rotated ENCRYPTION_KEY) is treated as unset
       // rather than crashing every settings read; the admin re-enters it.
       console.error(`[instanceSettings] could not decrypt AppConfig key "${row.key}" — treating as unset`);
@@ -147,8 +157,9 @@ function normalizeSmtpPort(v: string | undefined): number {
 
 export async function getInstanceSettings(
   db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+  options: { strictQboCredentials?: boolean } = {},
 ): Promise<InstanceSettings> {
-  const stored = await readStored(db);
+  const stored = await readStored(db, options.strictQboCredentials);
   // SMTP is env-managed as a block: SMTP_HOST set → all five values come from
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).

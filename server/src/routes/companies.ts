@@ -135,7 +135,21 @@ const connectHandler = asyncHandler(async (req, res) => {
     mode: body.mode ?? req.query.mode,
     env: body.env ?? req.query.env,
   };
-  const parsed = parseConnectRequest(input, await hasIntuitCredentials());
+  // Validate choices before configuration I/O can obscure an input error.
+  const choice = parseConnectRequest(input, true);
+  // Demo setup needs no Intuit credentials, even when stored real credentials
+  // are unreadable. Real setup must use current configuration and fail closed.
+  let hasCredentials = false;
+  if (choice.mode !== 'demo') {
+    try {
+      hasCredentials = await hasIntuitCredentials();
+    } catch {
+      throw new HttpError(502,
+        'Current Intuit credentials could not be loaded. Check QuickBooks API access in Settings.',
+        'QBO_CREDENTIALS_UNAVAILABLE');
+    }
+  }
+  const parsed = parseConnectRequest(choice, hasCredentials);
   const state = createOauthState({ mode: parsed.mode, env: parsed.env });
   res.json({ url: await qboFactory.authorizeUrl(state, parsed.mode) });
 });

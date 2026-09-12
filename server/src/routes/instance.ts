@@ -8,7 +8,7 @@ import { appUrlEnvManaged, attachmentPolicyEnvManaged, localAdminConfig } from '
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
-import { getIntuitCredentialPreflight } from '../lib/qbo/factory.js';
+import { getIntuitCredentialPreflight, testStoredQboConnection } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireUser } from '../middleware/auth.js';
 import { devLoginAllowed } from '../services/devLogin.js';
 import { localAdminPasswordMatches } from '../services/localAdminAuth.js';
@@ -116,7 +116,40 @@ instanceRouter.use(requireUser, requireInstanceAdmin);
 instanceRouter.post(
   '/qbo/preflight',
   asyncHandler(async (_req, res) => {
-    res.json(await getIntuitCredentialPreflight());
+    try {
+      res.json(await getIntuitCredentialPreflight());
+    } catch {
+      throw new HttpError(502, 'Current Intuit credentials could not be loaded.', 'QBO_CREDENTIALS_UNAVAILABLE');
+    }
+  }),
+);
+
+const testQboBody = z.object({ companyId: z.string().trim().min(1).max(200) }).strict();
+
+instanceRouter.post(
+  '/settings/test-qbo',
+  asyncHandler(async (req, res) => {
+    const { companyId } = validate(testQboBody)(req.body);
+    // Instance administrators have access to every company. Validate the exact
+    // selected company before any credential rotation; never infer a default.
+    let company: { id: string } | null;
+    let result: Awaited<ReturnType<typeof testStoredQboConnection>> | undefined;
+    try {
+      company = await prisma.company.findUnique({ where: { id: companyId }, select: { id: true } });
+      if (company) result = await testStoredQboConnection(company.id);
+    } catch {
+      // Provider, settings and persistence errors may contain sensitive detail.
+      throw new HttpError(
+        502,
+        'QuickBooks connection failed. Reconnect QuickBooks or verify the stored Intuit credentials.',
+        'QBO_CONNECTION_FAILED',
+      );
+    }
+    if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    if (result?.kind === 'demo') {
+      throw new HttpError(400, 'Choose a real QuickBooks company to test the stored Intuit credentials.', 'QBO_DEMO_COMPANY');
+    }
+    res.json({ ok: true });
   }),
 );
 

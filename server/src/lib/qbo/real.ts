@@ -1095,6 +1095,12 @@ export class RealQboClient implements QboClient {
 
   // ---- token lifecycle ----
 
+  /** A healthy access token alone does not verify stored refresh/app credentials. */
+  async verifyConnection(): Promise<QboCompanyInfo> {
+    await this.refresh();
+    return this.getCompanyInfo();
+  }
+
   private async ensureFreshToken(): Promise<string> {
     if (this.tokens.expiresAt - Date.now() < REFRESH_MARGIN_MS) {
       await this.refresh();

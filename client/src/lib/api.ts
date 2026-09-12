@@ -1111,6 +1111,9 @@ export const audit = {
 };
 
 export const instanceSettings = {
+  /** Refresh saved QuickBooks credentials, then verify company access. */
+  testQbo: (companyId: string) =>
+    api.post<{ ok: true }>('/api/instance/settings/test-qbo', { companyId }),
   get: () => api.get<InstanceSettingsDto>('/api/instance/settings'),
   patch: (body: InstanceSettingsPatchBody) =>
     api.patch<InstanceSettingsDto>('/api/instance/settings', body),

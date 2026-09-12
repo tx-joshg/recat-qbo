@@ -2,7 +2,8 @@
 // Instance-wide Intuit credentials, redirect URI, and (webhook mode only) the
 // webhook endpoint + verifier token. Only changed fields are PATCHed.
 
-import { useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { isDemoRealmId } from '@recat/shared';
 import type { InstanceSettingsDto, SyncMode } from '@recat/shared';
 import { instanceSettings } from '../../lib/api';
 import { InfoDot } from '../../components/ui';
@@ -62,12 +63,55 @@ export default function ApiAccessCard({
   syncMode: SyncMode;
   lastWebhookEventAt: string | null;
 }) {
-  const { toast } = useApp();
+  const { toast, activeCompany } = useApp();
 
   const [appUrl, setAppUrl] = useState(settings.appUrl);
   const [clientId, setClientId] = useState(settings.intuitClientId);
   const [clientSecret, setClientSecret] = useState('');
   const [whToken, setWhToken] = useState('');
+
+  const fieldId = useId();
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<'untested' | 'verified' | 'failed'>('untested');
+  const [saveError, setSaveError] = useState('');
+  const request = useRef(0);
+  const busy = saving || testing;
+  const credentialEdits = clientId.trim() !== settings.intuitClientId || clientSecret !== '';
+  const canTestCompany = activeCompany !== null
+    && activeCompany.disconnectedAt === null && !isDemoRealmId(activeCompany.realmId);
+  const configured = settings.intuitClientId.trim() !== '' && settings.intuitClientSecretSet;
+
+  // A response belongs to the saved settings and connection that launched it.
+  // Invalidate even when the user switches away and back before it arrives.
+  useEffect(() => {
+    request.current += 1;
+    setTesting(false);
+    setResult('untested');
+    return () => { request.current += 1; };
+  }, [settings, activeCompany?.id, activeCompany?.realmId, activeCompany?.connectedAt, activeCompany?.disconnectedAt]);
+
+  const markUntested = () => {
+    request.current += 1;
+    setResult('untested');
+    setSaveError('');
+  };
+
+  const testConnection = async () => {
+    if (busy || credentialEdits || !configured || !canTestCompany || !activeCompany) return;
+    const current = ++request.current;
+    setTesting(true);
+    setResult('untested');
+    try {
+      await instanceSettings.testQbo(activeCompany.id);
+      if (request.current === current) setResult('verified');
+    } catch {
+      // Never render arbitrary provider/transport exception text here.
+      if (request.current === current) setResult('failed');
+    } finally {
+      if (request.current === current) setTesting(false);
+    }
+  };
 
   const copy = (text: string) => {
     navigator.clipboard
@@ -77,6 +121,11 @@ export default function ApiAccessCard({
   };
 
   const save = () => {
+    if (busy) return;
+    if (clientId.trim() === '' && (settings.intuitClientId !== '' || clientSecret !== '')) {
+      setSaveError('Enter a Client ID before saving.');
+      return;
+    }
     const body: Parameters<typeof instanceSettings.patch>[0] = {};
     // Env-managed values are rejected by the server; do not even offer them.
     if (!settings.appUrlEnvManaged && appUrl.trim() !== '' && appUrl.trim() !== settings.appUrl) {
@@ -89,6 +138,8 @@ export default function ApiAccessCard({
     if (whToken !== '') body.webhookVerifierToken = whToken;
     // Nothing changed — silent no-op; only a real, successful PATCH toasts.
     if (Object.keys(body).length === 0) return;
+    markUntested();
+    setSaving(true);
     instanceSettings
       .patch(body)
       .then((updated) => {
@@ -99,7 +150,8 @@ export default function ApiAccessCard({
         setWhToken('');
         toast('API credentials saved');
       })
-      .catch((err) => toast(errMsg(err)));
+      .catch((err) => toast(errMsg(err)))
+      .finally(() => setSaving(false));
   };
 
   // From the server, not window.location: an admin configuring a Tailscale or
@@ -121,6 +173,7 @@ export default function ApiAccessCard({
         QuickBooks API access
         <InfoDot tip="The Intuit app credentials from first-run setup, shared by every company on this Recat instance. If you rotate the secret on the Intuit Developer Portal, paste the new one here." />
       </div>
+      <fieldset disabled={busy} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
       <div
         style={{
           display: 'grid',
@@ -130,24 +183,27 @@ export default function ApiAccessCard({
         }}
       >
         <div>
-          <label style={fieldLabel}>Client ID</label>
+          <label htmlFor={`${fieldId}-client-id`} style={fieldLabel}>Client ID</label>
           <input
             className="input"
+            id={`${fieldId}-client-id`}
             value={clientId}
-            onChange={(e) => setClientId(e.target.value)}
+            onChange={(e) => { setClientId(e.target.value); markUntested(); }}
             style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}
           />
         </div>
         <div>
-          <label style={fieldLabel}>Client secret</label>
+          <label htmlFor={`${fieldId}-client-secret`} style={fieldLabel}>Client secret</label>
           <input
             className="input"
             type="password"
+            id={`${fieldId}-client-secret`}
             value={clientSecret}
-            onChange={(e) => setClientSecret(e.target.value)}
+            onChange={(e) => { setClientSecret(e.target.value); markUntested(); }}
             placeholder={settings.intuitClientSecretSet ? '••••••••' : ''}
             style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', fontSize: 13.5, fontFamily: 'monospace' }}
           />
+          {settings.intuitClientSecretSet && <span style={{ fontSize: 12, color: 'var(--mut)' }}>Stored secret</span>}
         </div>
       </div>
       <div style={{ marginTop: 14 }}>
@@ -243,9 +299,29 @@ export default function ApiAccessCard({
         </div>
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+      </fieldset>
+      {saveError && <div role="alert" style={{ color: 'var(--red)', marginTop: 12 }}>{saveError}</div>}
+      <div role="status" aria-live="polite" style={{ color: 'var(--mut)', marginTop: 16, fontSize: 13.5 }}>
+        {credentialEdits ? 'Save changes before testing.'
+          : !canTestCompany ? 'Select a connected QuickBooks company to test saved credentials.'
+            : !configured ? 'Save a Client ID and client secret before testing.'
+              : testing ? 'Testing saved credentials…'
+                : result === 'verified' ? 'Credentials verified.'
+                  : result === 'failed' ? 'Connection failed. Check the saved credentials and reconnect if needed.'
+                    : 'Not tested.'}
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 10, marginTop: 12 }}>
+        <HoverButton
+          onClick={testConnection}
+          disabled={busy || credentialEdits || !configured || !canTestCompany}
+          style={copyBtn}
+          hoverStyle={{ background: 'var(--hl)' }}
+        >
+          {testing ? 'Testing…' : 'Test connection'}
+        </HoverButton>
         <HoverButton
           onClick={save}
+          disabled={busy}
           style={{
             border: '1px solid var(--bd)',
             background: 'var(--card)',
