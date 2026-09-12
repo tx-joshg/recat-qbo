@@ -194,6 +194,7 @@ input, select, button { font-family:inherit; }
     transition:none !important;
   }
 }
+.rr .audit-row > * { min-width:0; overflow-wrap:anywhere; }
 .rr .receipt-dropzone:focus-visible {
   outline:3px solid var(--acc);
   outline-offset:3px;
