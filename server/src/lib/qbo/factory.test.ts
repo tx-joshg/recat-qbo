@@ -65,9 +65,10 @@ function companyRow(realmId: string) {
     nickname: 'Test',
     env: 'sandbox',
     holdingAccountIds: ['4'],
-    disconnectedAt: null,
-    accessToken: encrypt('access'),
-    refreshToken: encrypt('refresh'),
+    // Tests reassign these to model disconnect/reconnect transitions.
+    disconnectedAt: null as Date | null,
+    accessToken: encrypt('access') as string | null,
+    refreshToken: encrypt('refresh') as string | null,
     tokenExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
   };
 }
@@ -174,7 +175,7 @@ describe('successive credential rotations', () => {
     await expect(client.getCompanyInfo()).resolves.toMatchObject({ legalName: 'Synthetic ledger' });
     await expect(client.getCompanyInfo()).resolves.toMatchObject({ legalName: 'Synthetic ledger' });
     expect(grants).toBe(2);
-    expect(decrypt(current.refreshToken)).toBe('synthetic-refresh-2');
+    expect(decrypt(current.refreshToken!)).toBe('synthetic-refresh-2');
   });
 });
 

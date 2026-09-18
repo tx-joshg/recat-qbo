@@ -9,51 +9,34 @@ const purchase: QboWriteSafetyTarget = {
 };
 
 describe('QuickBooks write safety', () => {
-  it('allows an open, uncleared transaction', () => {
-    expect(() => assertQboWriteAllowed(purchase, {
-      bookCloseDate: null,
-      cleared: false,
-      reconciled: false,
-    })).not.toThrow();
+  it('allows a transaction in an open period', () => {
+    expect(() => assertQboWriteAllowed(purchase, { bookCloseDate: null })).not.toThrow();
   });
 
   it.each([
     ['2026-08-01', 'on'],
     ['2026-08-02', 'before'],
   ])('blocks a transaction %s the closing date', (bookCloseDate) => {
-    expect(() => assertQboWriteAllowed(purchase, {
-      bookCloseDate,
-      cleared: false,
-      reconciled: false,
-    })).toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
+    expect(() => assertQboWriteAllowed(purchase, { bookCloseDate }))
+      .toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
   });
 
   it('allows the first day after the closing date', () => {
-    expect(() => assertQboWriteAllowed(purchase, {
-      bookCloseDate: '2026-07-31',
-      cleared: false,
-      reconciled: false,
-    })).not.toThrow();
+    expect(() => assertQboWriteAllowed(purchase, { bookCloseDate: '2026-07-31' }))
+      .not.toThrow();
   });
 
   describe.each(['Purchase', 'Deposit'] as const)('%s category and tax writes', (qboType) => {
-    it.each([
-      { cleared: true, reconciled: false },
-      { cleared: false, reconciled: true },
-      { cleared: true, reconciled: true },
-    ])('allows an open-period bank line with %j', (status) => {
-      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, {
-        bookCloseDate: null,
-        ...status,
-      })).not.toThrow();
+    // Cleared and reconciled status is no longer collected or consulted: a
+    // write only redistributes categories, never the reconciled amount.
+    it('allows an open-period bank line', () => {
+      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, { bookCloseDate: null }))
+        .not.toThrow();
     });
 
-    it('still blocks a reconciled transaction in closed books', () => {
-      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, {
-        bookCloseDate: '2026-08-01',
-        cleared: true,
-        reconciled: true,
-      })).toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
+    it('still blocks a transaction in closed books', () => {
+      expect(() => assertQboWriteAllowed({ ...purchase, qboType }, { bookCloseDate: '2026-08-01' }))
+        .toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
     });
   });
 
