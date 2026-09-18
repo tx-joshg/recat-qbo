@@ -148,11 +148,8 @@ class FakeCategorizationDb implements CategorizationDb {
     findMany: async () => [],
   };
 
-  qboMutationAttempt = {
-    findFirst: async (_args: {
-      where: { transactionId: string; status: { in: string[] } };
-      select: { id: true };
-    }) => null as { id: string } | null,
+  qboMutationAttempt: CategorizationDb['qboMutationAttempt'] = {
+    findFirst: async () => null,
   };
 
   splitLine: CategorizationDb['splitLine'] = {
@@ -241,7 +238,7 @@ class FakeCategorizationDb implements CategorizationDb {
       const attempt = this.state.attempts.find(
         (row) =>
           row.transactionId === where.transactionId &&
-          where.status.in.includes(row.status),
+          (where.status.in as readonly string[]).includes(row.status),
       );
       return attempt ? { id: 'active-attempt' } : null;
     };
@@ -480,7 +477,11 @@ function testDeps(
 ): CategorizationDeps {
   return {
     db,
-    lease: async (_key, _owner, callback) => callback(),
+    lease: async (
+      _key: Parameters<CategorizationDeps['lease']>[0],
+      _owner: string,
+      callback: () => Promise<unknown>,
+    ) => callback(),
     fence: async () => undefined,
     invocationId: () => 'test-stage-invocation',
     ...overrides,
@@ -516,7 +517,7 @@ describe('stageCategorization', () => {
 
     await stageCategorization(input(), {
       ...testDeps(db),
-      lease,
+      lease: lease as unknown as CategorizationDeps['lease'],
       invocationId: () => 'stage-invocation',
     });
 

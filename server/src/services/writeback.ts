@@ -774,7 +774,7 @@ export interface DurableAttempt {
   errorMessage: string | null;
 }
 
-interface DurableTransaction {
+export interface DurableTransaction {
   rawData: unknown;
   id: string;
   companyId: string;

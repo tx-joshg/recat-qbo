@@ -108,7 +108,7 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
     expect(verifyPurchaseResult(nonTaxableExpected, {
       ...normalizedByQbo,
-      lines: [{ ...normalizedByQbo.lines[0], taxAmountCents: -1 }],
+      lines: [{ ...normalizedByQbo.lines[0]!, taxAmountCents: -1 }],
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
@@ -231,7 +231,7 @@ describe('verifyPurchaseResult', () => {
       totalCents: -20_667,
       totalTaxCents: -2_215,
       lines: [{
-        ...roundedExpected.targetLines[0],
+        ...roundedExpected.targetLines[0]!,
         id: 'provider-target',
       }],
     };
@@ -243,7 +243,7 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
     expect(verifyPurchaseResult(roundedExpected, {
       ...qboRoundedReadback,
-      lines: [{ ...qboRoundedReadback.lines[0], taxInclusiveCents: -20_665 }],
+      lines: [{ ...qboRoundedReadback.lines[0]!, taxInclusiveCents: -20_665 }],
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
@@ -265,7 +265,7 @@ describe('verifyPurchaseResult', () => {
       totalCents: -20_667,
       totalTaxCents: -2_215,
       lines: [{
-        ...foreignCurrencyExpected.targetLines[0],
+        ...foreignCurrencyExpected.targetLines[0]!,
         id: 'provider-target',
       }],
     };
@@ -277,7 +277,7 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
     expect(verifyPurchaseResult(foreignCurrencyExpected, {
       ...qboRoundedReadback,
-      lines: [{ ...qboRoundedReadback.lines[0], taxInclusiveCents: -20_665 }],
+      lines: [{ ...qboRoundedReadback.lines[0]!, taxInclusiveCents: -20_665 }],
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
@@ -289,7 +289,7 @@ describe('verifyPurchaseResult', () => {
     ['direction', { direction: 'refund' }],
     ['global tax mode', { globalTaxCalculation: 'TaxExcluded' }],
     ['total tax', { totalTaxCents: -49 }],
-  ])('detects %s drift', (_name, changes) => {
+  ] as const)('detects %s drift', (_name, changes) => {
     expect(verifyPurchaseResult(expected, { ...actual, ...changes })).toMatchObject({
       ok: false,
       code: 'QBO_STATE_DRIFT',
@@ -300,7 +300,7 @@ describe('verifyPurchaseResult', () => {
     expect(
       verifyPurchaseResult(expected, {
         ...actual,
-        lines: [{ ...actual.lines[0], taxInclusiveCents: -10_49 }, actual.lines[1]],
+        lines: [{ ...actual.lines[0]!, taxInclusiveCents: -10_49 }, actual.lines[1]!],
       }),
     ).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
@@ -313,7 +313,7 @@ describe('verifyPurchaseResult', () => {
     expect(
       verifyPurchaseResult(expected, {
         ...actual,
-        lines: [{ ...actual.lines[0], ...changes }, actual.lines[1]],
+        lines: [{ ...actual.lines[0]!, ...changes }, actual.lines[1]!],
       }),
     ).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
@@ -322,7 +322,7 @@ describe('verifyPurchaseResult', () => {
     expect(
       verifyPurchaseResult(expected, {
         ...actual,
-        lines: [actual.lines[0], { ...actual.lines[1], description: 'Changed payment' }],
+        lines: [actual.lines[0]!, { ...actual.lines[1]!, description: 'Changed payment' }],
       }),
     ).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
@@ -335,13 +335,13 @@ describe('verifyPurchaseResult', () => {
     expect(
       verifyPurchaseResult(expected, {
         ...actual,
-        lines: [actual.lines[0], { ...actual.lines[1], ...changes }],
+        lines: [actual.lines[0]!, { ...actual.lines[1]!, ...changes }],
       }),
     ).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
   it('detects missing and extra Purchase lines', () => {
-    expect(verifyPurchaseResult(expected, { ...actual, lines: [actual.lines[0]] })).toMatchObject({
+    expect(verifyPurchaseResult(expected, { ...actual, lines: [actual.lines[0]!] })).toMatchObject({
       ok: false,
       code: 'QBO_STATE_DRIFT',
     });
@@ -371,7 +371,7 @@ describe('verifyPurchaseResult', () => {
       ...expected,
       untouchedLineHashes: [canonicalPurchaseLineHash(untouchedLine), canonicalPurchaseLineHash(untouchedLine)],
     };
-    const duplicateUntouchedActual = { ...actual, lines: [actual.lines[0], untouchedLine, untouchedLine] };
+    const duplicateUntouchedActual = { ...actual, lines: [actual.lines[0]!, untouchedLine, untouchedLine] };
 
     expect(verifyPurchaseResult(duplicateUntouchedExpected, duplicateUntouchedActual)).toEqual({ ok: true });
     expect(
@@ -406,6 +406,8 @@ const depositTargetLine = {
   classQboId: 'class',
   taxCodeQboId: 'sales-code',
   taxApplicableOn: 'Sales',
+  rawHash: 'deposit-target-raw',
+  targetHash: 'deposit-target-target',
 };
 
 const depositUntouchedLine = {
@@ -418,6 +420,8 @@ const depositUntouchedLine = {
   classQboId: 'other-class',
   taxCodeQboId: null,
   taxApplicableOn: null,
+  rawHash: 'deposit-untouched-raw',
+  targetHash: 'deposit-untouched-target',
 };
 
 const expectedDeposit: ExpectedDepositResult = {
@@ -429,6 +433,7 @@ const expectedDeposit: ExpectedDepositResult = {
   totalTaxCents: 700,
   targetLines: [depositTargetLine],
   untouchedLineHashes: [canonicalDepositLineHash(depositUntouchedLine)],
+  preservedHash: 'deposit-preserved',
 };
 
 const actualDeposit: QboDepositSnapshot = {
@@ -439,6 +444,7 @@ const actualDeposit: QboDepositSnapshot = {
   date: '2026-07-28',
   globalTaxCalculation: 'TaxInclusive',
   totalTaxCents: 700,
+  preservedHash: 'deposit-preserved',
   lines: [
     depositUntouchedLine,
     { ...depositTargetLine, id: 'assigned-target' },

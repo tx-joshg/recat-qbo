@@ -1,0 +1,12 @@
+// tsconfig.json is the build config: `npm run build` emits to dist, so it
+// excludes tests to keep them out of the shipped image. This config checks the
+// same sources with tests included and nothing emitted, so test bodies are
+// type-checked the way the client's already are.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src"],
+  "exclude": []
+}

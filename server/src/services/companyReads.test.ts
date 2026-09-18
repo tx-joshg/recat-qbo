@@ -78,28 +78,32 @@ function transaction(overrides: Record<string, unknown> = {}) {
 }
 
 function makeDb() {
+  // Typed against CompanyReadDb so the empty defaults do not infer never[],
+  // which would reject every mockResolvedValue a test supplies.
   const db = {
     user: {
-      findUnique: vi.fn(async () => ({ id: USER_ID, isInstanceAdmin: false })),
-      findMany: vi.fn(async () => []),
+      findUnique: vi.fn<CompanyReadDb['user']['findUnique']>(
+        async () => ({ id: USER_ID, isInstanceAdmin: false })),
+      findMany: vi.fn<NonNullable<CompanyReadDb['user']['findMany']>>(async () => []),
     },
     membership: {
-      findUnique: vi.fn(async () => ({ role: 'categorizer' })),
+      findUnique: vi.fn<CompanyReadDb['membership']['findUnique']>(
+        async () => ({ role: 'categorizer' })),
     },
     company: {
-      findUnique: vi.fn(async () => company()),
-      findMany: vi.fn(async () => []),
+      findUnique: vi.fn<CompanyReadDb['company']['findUnique']>(async () => company()),
+      findMany: vi.fn<CompanyReadDb['company']['findMany']>(async () => []),
     },
     transaction: {
-      findUnique: vi.fn(async () => transaction()),
-      findMany: vi.fn(async () => []),
-      count: vi.fn(async () => 0),
+      findUnique: vi.fn<CompanyReadDb['transaction']['findUnique']>(async () => transaction()),
+      findMany: vi.fn<CompanyReadDb['transaction']['findMany']>(async () => []),
+      count: vi.fn<CompanyReadDb['transaction']['count']>(async () => 0),
     },
-    qboMutationAttempt: { findMany: vi.fn(async () => []) },
-    qboAccount: { findMany: vi.fn(async () => []) },
-    qboTaxCode: { findMany: vi.fn(async () => []) },
-    tag: { findMany: vi.fn(async () => []) },
-    rule: { findMany: vi.fn(async () => []) },
+    qboMutationAttempt: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    qboAccount: { findMany: vi.fn<CompanyReadDb['qboAccount']['findMany']>(async () => []) },
+    qboTaxCode: { findMany: vi.fn<CompanyReadDb['qboTaxCode']['findMany']>(async () => []) },
+    tag: { findMany: vi.fn<CompanyReadDb['tag']['findMany']>(async () => []) },
+    rule: { findMany: vi.fn<CompanyReadDb['rule']['findMany']>(async () => []) },
   };
   return db;
 }
@@ -222,6 +226,9 @@ describe('company read services', () => {
       usingSalesTax: true,
       refreshedAt: '2026-01-01T00:00:00.000Z',
       taxCodes: [],
+      salesStatus: 'ready' as const,
+      salesReason: null,
+      salesTaxCodes: [],
     }));
     const service = createCompanyReadService(
       db as unknown as CompanyReadDb,
@@ -248,11 +255,14 @@ describe('company read services', () => {
       reason: 'Tax setup is incomplete',
       usingSalesTax: false,
       refreshedAt: '2026-01-05T00:00:00.000Z',
+      salesStatus: 'needs_setup' as const,
+      salesReason: 'Tax setup is incomplete',
+      salesTaxCodes: [],
       taxCodes: [
-        { qboId: 'A', name: 'Inactive', active: false, taxable: true, combinedPurchaseRate: 5 },
-        { qboId: 'B', name: 'Broken taxable', active: true, taxable: true, combinedPurchaseRate: null },
-        { qboId: 'C', name: 'Eligible taxable', active: true, taxable: true, combinedPurchaseRate: 5 },
-        { qboId: 'D', name: 'Eligible exempt', active: true, taxable: false, combinedPurchaseRate: null },
+        { qboId: 'A', name: 'Inactive', active: false, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
+        { qboId: 'B', name: 'Broken taxable', active: true, taxable: true, combinedPurchaseRate: null, combinedSalesRate: null },
+        { qboId: 'C', name: 'Eligible taxable', active: true, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
+        { qboId: 'D', name: 'Eligible exempt', active: true, taxable: false, combinedPurchaseRate: null, combinedSalesRate: null },
       ],
     }));
     const service = createCompanyReadService(
@@ -267,8 +277,8 @@ describe('company read services', () => {
       usingSalesTax: false,
       refreshedAt: '2026-01-05T00:00:00.000Z',
       items: [
-        { qboId: 'C', name: 'Eligible taxable', active: true, taxable: true, combinedPurchaseRate: 5 },
-        { qboId: 'D', name: 'Eligible exempt', active: true, taxable: false, combinedPurchaseRate: null },
+        { qboId: 'C', name: 'Eligible taxable', active: true, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
+        { qboId: 'D', name: 'Eligible exempt', active: true, taxable: false, combinedPurchaseRate: null, combinedSalesRate: null },
       ],
       nextCursor: null,
     });
@@ -764,9 +774,12 @@ describe('company read services', () => {
       reason: null,
       usingSalesTax: true,
       refreshedAt: '2026-01-01T00:00:00.000Z',
+      salesStatus: 'ready' as const,
+      salesReason: null,
+      salesTaxCodes: [],
       taxCodes: [
-        { qboId: 'tax-valid', name: 'Standard tax', active: true, taxable: true, combinedPurchaseRate: 5 },
-        { qboId: 'tax-ineligible', name: 'Old tax', active: false, taxable: true, combinedPurchaseRate: 5 },
+        { qboId: 'tax-valid', name: 'Standard tax', active: true, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
+        { qboId: 'tax-ineligible', name: 'Old tax', active: false, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
       ],
     }));
     const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, { getTaxReadiness });

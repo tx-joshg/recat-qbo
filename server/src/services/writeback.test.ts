@@ -28,6 +28,7 @@ import {
   undoPost,
   validateSplits,
   WritebackLifecycleError,
+  type DurableTransaction,
   type DurableWritebackDb,
   type DurableWritebackDeps,
   type WritebackDeps,
@@ -245,13 +246,14 @@ function makeFakeDb(row: FakeTxnRow) {
       })),
     },
     qboMutationAttempt: {
-      findFirst: vi.fn(async () => null),
+      // Annotated so mockResolvedValueOnce can return an attempt, not just null.
+      findFirst: vi.fn(async (): Promise<{ id: string } | null> => null),
     },
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
     },
     qboTaxRate: {
-      findMany: vi.fn(async () => [{
+      findMany: vi.fn<DurableWritebackDb['qboTaxRate']['findMany']>(async () => [{
         qboId: 'sales-rate-generic',
         name: 'Generic sales rate',
         description: null,
@@ -271,7 +273,7 @@ function makeDeps(
   envDryRun = false,
 ): { deps: WritebackDeps; db: ReturnType<typeof makeFakeDb>; audit: ReturnType<typeof vi.fn> } {
   const db = makeFakeDb(row);
-  const audit = vi.fn(async () => undefined);
+  const audit = vi.fn<DurableWritebackDeps['audit']>(async () => undefined);
   const safeClient: Partial<QboClient> = {
     fetchWriteSafety: async () => ({
       bookCloseDate: null,
@@ -545,7 +547,7 @@ describe('undoPost', () => {
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
       message: 'Tax-ready Purchases must use staged categorization.',
     });
@@ -585,7 +587,7 @@ describe('undoPost', () => {
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
       message: 'Tax-ready Deposits must use staged categorization.',
     });
@@ -617,7 +619,7 @@ describe('undoPost', () => {
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
     });
     expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
@@ -724,7 +726,7 @@ describe('postTransaction guards', () => {
 
     await expect(
       postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
       message: 'Tax-ready Purchases must use staged categorization.',
     });
@@ -760,7 +762,7 @@ describe('postTransaction guards', () => {
 
     await expect(
       postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
       message: 'Tax-ready Deposits must use staged categorization.',
     });
@@ -788,7 +790,7 @@ describe('postTransaction guards', () => {
 
     await expect(
       postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
     });
     expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
@@ -816,7 +818,7 @@ describe('postTransaction guards', () => {
 
     await expect(
       postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
+    ).rejects.toMatchObject({
       code: 'TAX_AWARE_STAGING_REQUIRED',
     });
     expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
@@ -1307,7 +1309,7 @@ interface DurableAttemptRow {
   updatedAt: Date;
 }
 
-function durableTransaction(qboType: PreparedEntity = 'Purchase') {
+function durableTransaction(qboType: PreparedEntity = 'Purchase'): DurableTransaction {
   const deposit = qboType === 'Deposit';
   return {
     id: DURABLE_TRANSACTION_ID,
@@ -1584,7 +1586,7 @@ class FakeDurableDb {
   };
 
   qboTaxRate = {
-    findMany: vi.fn(async () => [{
+    findMany: vi.fn<DurableWritebackDb['qboTaxRate']['findMany']>(async () => [{
       qboId: 'rate-generic',
       name: 'Generic rate',
       active: true,
@@ -1650,7 +1652,7 @@ function durableDeps(
     qboType === 'Deposit' ? beforeDeposit : beforePurchase;
   const verifiedSnapshot =
     qboType === 'Deposit' ? verifiedDeposit : verifiedPurchase;
-  const audit = vi.fn(async () => undefined);
+  const audit = vi.fn<DurableWritebackDeps['audit']>(async () => undefined);
   const prepareRecategorization = vi.fn(async (
     _txn: QboTxn,
     _staged: StagedCategorization,
@@ -1679,7 +1681,7 @@ function durableDeps(
     .fn<() => Promise<QboPurchaseSnapshot | QboDepositSnapshot | null>>()
     .mockResolvedValueOnce(structuredClone(beforeSnapshot))
     .mockResolvedValue(structuredClone(verifiedSnapshot));
-  const fetchWriteSafety = vi.fn(async () => ({
+  const fetchWriteSafety = vi.fn<NonNullable<QboClient['fetchWriteSafety']>>(async () => ({
     bookCloseDate: null,
   }));
   const client: Partial<QboClient> = {
@@ -1696,12 +1698,13 @@ function durableDeps(
     preparePurchaseRestore: prepareRestore,
   });
   const getClient = vi.fn(async () => client as QboClient);
-  const authorize = vi.fn(async () => true);
+  const authorize = vi.fn<DurableWritebackDeps['authorize']>(async () => true);
   const renewLease = vi.fn(async () => undefined);
   const leaseOwners: string[] = [];
   let invocationSequence = 0;
   const invocationId = vi.fn(() => `invocation-${++invocationSequence}`);
-  const onVerifiedCategorizationOutcome = vi.fn(async () => undefined);
+  const onVerifiedCategorizationOutcome =
+    vi.fn<NonNullable<DurableWritebackDeps['onVerifiedCategorizationOutcome']>>(async () => undefined);
   const deps: DurableWritebackDeps = {
     db: db as unknown as DurableWritebackDb,
     getClient,
@@ -2153,7 +2156,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
     fixture.db.transactionRow.amount = -9.29;
     fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
     fixture.db.transactionRow.rawData = {
-      ...fixture.db.transactionRow.rawData,
+      ...(fixture.db.transactionRow.rawData as Record<string, unknown>),
       TotalAmt: 10.5,
       Line: [{
         Id: 'line-holding',
@@ -2907,7 +2910,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
     const fixture = durableDeps();
     const attempt = seedAttempt(fixture.db, 'PREPARED', 'request-generic');
     const payload = structuredClone(attempt.requestPayload) as QboPreparedWrite;
-    payload.body.Line[0]!.Description = 'coordinated payload change';
+    payload.body.Line![0]!.Description = 'coordinated payload change';
     attempt.requestPayload = payload;
 
     await expect(
@@ -3312,7 +3315,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
       await expect(
         commitStagedCategorization(commitInput('request-other'), fixture.deps),
-      ).rejects.toMatchObject<WritebackLifecycleError>({ code: 'MUTATION_BLOCKED' });
+      ).rejects.toMatchObject({ code: 'MUTATION_BLOCKED' });
       expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
     },
   );
