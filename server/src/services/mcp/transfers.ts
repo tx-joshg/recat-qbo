@@ -83,7 +83,7 @@ export interface McpTransferStore
   };
 }
 
-type PrepareWithWorkflow = <T>(
+export type PrepareWithWorkflow = <T>(
   input: PrepareTransferInput,
   workflow: TransferPreparationWorkflow<T>,
 ) => Promise<T>;

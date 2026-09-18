@@ -16,7 +16,9 @@ import {
   prepareMcpTransfer,
   retryMcpTransferOperation,
   validateMcpTransferEnvelope,
+  type McpTransferExecutionDeps,
   type McpTransferStore,
+  type PrepareWithWorkflow,
 } from './transfers.js';
 
 const NOW = new Date('2026-07-29T12:00:00.000Z');
@@ -155,7 +157,7 @@ describe('MCP transfer preparation', () => {
       counterpartExpectedRevision: 3,
       idempotencyKey: ' transfer-one ',
     }, {
-      prepare: h.prepare,
+      prepare: h.prepare as unknown as PrepareWithWorkflow,
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
@@ -206,12 +208,12 @@ describe('MCP transfer preparation', () => {
       idempotencyKey: 'same-key',
     };
     const first = await prepareMcpTransfer(principal, input, {
-      prepare: h.prepare,
+      prepare: h.prepare as unknown as PrepareWithWorkflow,
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
     const replay = await prepareMcpTransfer(principal, input, {
-      prepare: h.prepare,
+      prepare: h.prepare as unknown as PrepareWithWorkflow,
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
@@ -231,7 +233,7 @@ describe('MCP transfer preparation', () => {
       counterpartExpectedRevision: 4,
       idempotencyKey: 'binding',
     }, {
-      prepare: h.prepare,
+      prepare: h.prepare as unknown as PrepareWithWorkflow,
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
@@ -260,7 +262,7 @@ describe('MCP transfer execution', () => {
       counterpartExpectedRevision: 4,
       idempotencyKey: 'execution-key',
     }, {
-      prepare: h.prepare,
+      prepare: h.prepare as unknown as PrepareWithWorkflow,
       createOperation: createPreparedOperation,
       now: () => NOW,
     });
@@ -317,7 +319,7 @@ describe('MCP transfer execution', () => {
       idempotencyKey: 'different',
     }, {
       store: h.store,
-      getTransfer: vi.fn(async () => ({
+      getTransfer: vi.fn<NonNullable<McpTransferExecutionDeps['getTransfer']>>(async () => ({
         operationId: coordinator.id,
         state: 'PREPARED',
         complete: false,
@@ -395,7 +397,7 @@ describe('MCP transfer execution', () => {
       {
         store: h.store,
         getTransfer,
-        retryTransfer,
+        retryTransfer: retryTransfer as unknown as McpTransferExecutionDeps['retryTransfer'],
         commitTransfer,
         createOperation: createPreparedOperation,
         now: () => NOW,

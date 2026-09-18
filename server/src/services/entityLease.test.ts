@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { EntityLeaseKey } from './entityLease.js';
 import {
   EntityLeaseError,
   acquireEntityLease,
@@ -196,11 +197,11 @@ describe('entity leases', () => {
   });
 
   it('locks and verifies the exact parameterized lease owner before fenced work', async () => {
-    const query = vi.fn(async () => [{ owner: 'owner-a' }]);
+    const query = vi.fn(async (..._args: unknown[]) => [{ owner: 'owner-a' }]);
     const fenceEntityLeaseOwnership = (
       entityLeaseModule as unknown as {
         fenceEntityLeaseOwnership(
-          key: typeof key,
+          key: EntityLeaseKey,
           owner: string,
           deps: { db: { $queryRawUnsafe: typeof query } },
         ): Promise<void>;
@@ -220,10 +221,11 @@ describe('entity leases', () => {
   });
 
   it('uses PostgreSQL wall-clock time when fencing live lease expiry', async () => {
-    const query = vi.fn(async () => [{ owner: 'owner-a' }]);
+    const query = vi.fn(async (..._args: unknown[]) => [{ owner: 'owner-a' }]);
 
     await fenceEntityLeaseOwnerships([keyA, keyB], 'owner-a', {
-      db: { $queryRawUnsafe: query },
+      // $queryRawUnsafe is generic in T; a concrete mock cannot satisfy it.
+      db: { $queryRawUnsafe: query as unknown as <T>(...args: unknown[]) => Promise<T> },
     });
 
     expect(query).toHaveBeenCalledTimes(2);
@@ -240,7 +242,7 @@ describe('entity leases', () => {
     const fenceEntityLeaseOwnership = (
       entityLeaseModule as unknown as {
         fenceEntityLeaseOwnership(
-          key: typeof key,
+          key: EntityLeaseKey,
           owner: string,
           deps: { db: { $queryRawUnsafe: (...values: unknown[]) => Promise<unknown> } },
         ): Promise<void>;
