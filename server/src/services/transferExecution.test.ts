@@ -290,9 +290,11 @@ class FakeExecutionDb {
           Object.assign(row, clone(data));
           return { count: 1 };
         },
-        createMany: async ({ data }: { data: StoredAttempt[] }) => {
+        // The interface passes Record<string, unknown>[]; these rows are
+        // attempts, so read them as such inside the fake.
+        createMany: async ({ data }) => {
           let count = 0;
-          for (const candidate of data) {
+          for (const candidate of data as unknown as StoredAttempt[]) {
             if (self.attempts.some((attempt) =>
               attempt.requestId === candidate.requestId
             )) {
@@ -393,7 +395,7 @@ class FakeExecutionDb {
           self.transactionDepth -= 1;
         }
       },
-    } as unknown as TransferExecutionDb;
+    };
   }
 }
 
@@ -640,7 +642,7 @@ function fixture(overrides: {
   const deps: TransferExecutionDeps = {
     db: db.executionStore(),
     getClient,
-    audit: audit as TransferExecutionDeps['audit'],
+    audit: audit as unknown as TransferExecutionDeps['audit'],
     authorize: authorize as TransferExecutionDeps['authorize'],
     lease: lease as TransferExecutionDeps['lease'],
     renewLease: renewLease as TransferExecutionDeps['renewLease'],
@@ -677,8 +679,9 @@ function fixture(overrides: {
     providerTransaction.syncToken = response.syncToken;
     providerTransaction.amount = 0;
     providerTransaction.lines = [];
-    providerTransaction.raw = clone(value.body);
-    providerTransaction.raw.SyncToken = response.syncToken;
+    const raw = clone(value.body) as Record<string, unknown>;
+    raw.SyncToken = response.syncToken;
+    providerTransaction.raw = raw;
     snapshots.set(value.qboId, clone(response));
   };
   return {
@@ -1066,7 +1069,7 @@ describe('commitTransfer', () => {
       firstLeg: { outcome: 'VERIFIED' },
       secondLeg: { outcome: 'UNCERTAIN' },
     });
-    expect(firstEvidence.status).toBe('VERIFIED');
+    expect(firstEvidence!.status).toBe('VERIFIED');
     expect(f.db.transactions[0]!.status).toBe('POSTED');
 
     f.sendPreparedLineWrite.mockClear();
@@ -1997,10 +2000,13 @@ describe('commitTransfer', () => {
 
 describe('retryTransferOperation', () => {
   it('rolls back the retry coordinator and replacement attempts when the final envelope hook fails', async () => {
-    const f = fixture({
-      firstStatus: 'RETRYABLE',
-      secondStatus: 'RETRYABLE',
-    });
+    // fixture() accepts neither firstStatus nor secondStatus, so the previous
+    // options were dropped and this never exercised the retry path. Set the
+    // statuses the way the sibling retry cases do.
+    const f = fixture();
+    for (const attempt of f.db.attempts) {
+      attempt.status = 'RETRYABLE';
+    }
     const operationsBefore = f.db.operations.length;
     const attemptsBefore = f.db.attempts.length;
 

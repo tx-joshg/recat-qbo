@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { AgentDecision } from './core/decision.js';
+import type { LiveTaxReference } from './liveWorker.js';
 import type { CategorizationProposal, StagedCategorization } from '@recat/shared';
 import { calculatePurchaseTransaction } from '../../lib/qbo/purchaseTax.js';
 import type { QboPurchaseSnapshot } from '../../lib/qbo/types.js';
@@ -90,6 +92,7 @@ function freshInput(
 ): FreshLiveInput {
   const decision = proposal();
   const snapshot: FreshLiveInput['snapshot'] = {
+    schemaVersion: 1,
     transaction: { id: TRANSACTION_ID, revision: 4 },
     date: '2026-07-29',
     signedAmountCents: -10_00,
@@ -213,16 +216,16 @@ function deps(
       .mockResolvedValueOnce(before)
       .mockResolvedValueOnce(before)
       .mockResolvedValue(before),
-    runDecision: vi.fn(async () => result),
-    verifyDecision: vi.fn(async () => verification),
-    evaluateEligibility: vi.fn(() => ({
+    runDecision: vi.fn<LiveWorkerDeps['runDecision']>(async () => result as never),
+    verifyDecision: vi.fn<LiveWorkerDeps['verifyDecision']>(async () => verification),
+    evaluateEligibility: vi.fn<LiveWorkerDeps['evaluateEligibility']>(() => ({
       eligible: true,
       code: 'ELIGIBLE',
       policyVersion: 'purchase-negative-v1',
     })),
     checkpoint: vi.fn(async () => undefined),
     stage: vi.fn(async () => staged()),
-    commit: vi.fn(async () => ({
+    commit: vi.fn<LiveWorkerDeps['commit']>(async () => ({
       transactionId: TRANSACTION_ID,
       requestId: JOB_ID,
       ok: true,
@@ -384,7 +387,7 @@ describe('guarded live worker', () => {
     status,
   ) => {
     const d = deps({
-      verifyDecision: vi.fn(async () => {
+      verifyDecision: vi.fn<LiveWorkerDeps['verifyDecision']>(async () => {
         throw Object.assign(new Error('safe verifier failure'), { code });
       }),
     });
@@ -401,7 +404,7 @@ describe('guarded live worker', () => {
 
   it('keeps an explicit schema-valid distinct-review rejection as an abstention', async () => {
     const d = deps({
-      verifyDecision: vi.fn(async () => ({
+      verifyDecision: vi.fn<LiveWorkerDeps['verifyDecision']>(async () => ({
         ok: false,
         code: 'AGENT_DISTINCT_REVIEW_REJECTED',
         message: 'Distinct review rejected the proposal.',
@@ -546,7 +549,7 @@ describe('guarded live worker', () => {
 
   it('persists guarded mutation authority loss as a failed retryable lifecycle', async () => {
     const d = deps({
-      commit: vi.fn(async () => {
+      commit: vi.fn<LiveWorkerDeps['commit']>(async () => {
         throw Object.assign(new Error('guarded authority changed'), {
           code: 'LIVE_AUTHORITY_DENIED',
         });
@@ -569,7 +572,7 @@ describe('guarded live worker', () => {
     ['RETRYABLE', 'retryable'],
   ] as const)('never calls a %s writeback outcome posted', async (outcome, status) => {
     const d = deps({
-      commit: vi.fn(async () => ({
+      commit: vi.fn<LiveWorkerDeps['commit']>(async () => ({
         transactionId: TRANSACTION_ID,
         requestId: JOB_ID,
         ok: outcome === 'DRY_RUN' || outcome === 'UNCHANGED',
@@ -598,7 +601,7 @@ describe('guarded live worker', () => {
     });
     const d = deps({
       loadFreshInput: vi.fn(async () => input),
-      evaluateEligibility: vi.fn(() => ({
+      evaluateEligibility: vi.fn<LiveWorkerDeps['evaluateEligibility']>(() => ({
         eligible: false,
         code,
         policyVersion: 'purchase-negative-v1',
@@ -637,13 +640,17 @@ describe('agent final-total staging reconciliation', () => {
       } as Partial<Extract<ReturnType<typeof proposal>, { kind: 'proposal' }>>);
       const reconciled = reconcileLiveProposalForStaging(
         COMPANY_ID,
-        input,
+        input as Extract<AgentDecision, { kind: 'proposal' }>,
         taxCalculation === 'NotApplicable'
-          ? { companyId: COMPANY_ID, codes: [], rates: [] }
+          ? { companyId: COMPANY_ID, status: 'ready', usingSalesTax: false, refreshedAt: null, codes: [], rates: [] }
           : {
               companyId: COMPANY_ID,
+              status: 'ready',
+              usingSalesTax: false,
+              refreshedAt: null,
               codes: [{
                 qboId: 'tax-generic',
+                salesRates: [],
                 name: 'Generic tax',
                 description: null,
                 active: true,
@@ -676,10 +683,14 @@ describe('agent final-total staging reconciliation', () => {
         tagIds: [],
       }],
     });
-    const reconciled = reconcileLiveProposalForStaging(COMPANY_ID, input, {
+    const reconciled = reconcileLiveProposalForStaging(COMPANY_ID, input as Extract<AgentDecision, { kind: 'proposal' }>, {
       companyId: COMPANY_ID,
+      status: 'ready',
+      usingSalesTax: false,
+      refreshedAt: null,
       codes: [{
         qboId: 'tax-generic',
+        salesRates: [],
         name: 'Generic tax',
         description: null,
         active: true,
@@ -705,10 +716,14 @@ describe('agent final-total staging reconciliation', () => {
   });
 
   it('round-trips a multi-line TaxExcluded remainder allocation through the shared oracle', () => {
-    const reference = {
+    const reference: LiveTaxReference = {
       companyId: COMPANY_ID,
+      status: 'ready',
+      usingSalesTax: false,
+      refreshedAt: null,
       codes: [{
         qboId: 'tax-generic',
+        salesRates: [],
         name: 'Generic tax',
         description: null,
         active: true,
@@ -745,7 +760,7 @@ describe('agent final-total staging reconciliation', () => {
       ],
     });
 
-    const reconciled = reconcileLiveProposalForStaging(COMPANY_ID, input, reference);
+    const reconciled = reconcileLiveProposalForStaging(COMPANY_ID, input as Extract<AgentDecision, { kind: 'proposal' }>, reference);
     const forward = calculatePurchaseTransaction({
       companyId: COMPANY_ID,
       taxCalculation: 'TaxExcluded',
@@ -781,10 +796,14 @@ describe('agent final-total staging reconciliation', () => {
       }],
     });
 
-    expect(() => reconcileLiveProposalForStaging(COMPANY_ID, input, {
+    expect(() => reconcileLiveProposalForStaging(COMPANY_ID, input as Extract<AgentDecision, { kind: 'proposal' }>, {
       companyId: COMPANY_ID,
+      status: 'ready',
+      usingSalesTax: false,
+      refreshedAt: null,
       codes: [{
         qboId: 'tax-generic',
+        salesRates: [],
         name: 'Generic tax',
         description: null,
         active: true,

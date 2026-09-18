@@ -333,22 +333,22 @@ describe('hashLineWriteContent', () => {
   });
 
   it.each([
-    ['amount', (body: typeof currentBody) => { body.Line[0].Amount = 11; }],
+    ['amount', (body: typeof currentBody) => { body.Line[0]!.Amount = 11; }],
     ['reference value', (body: typeof currentBody) => {
-      body.Line[0].AccountBasedExpenseLineDetail.AccountRef.value =
+      body.Line[0]!.AccountBasedExpenseLineDetail.AccountRef.value =
         'ACCOUNT_CHANGED_GENERIC';
     }],
     ['description', (body: typeof currentBody) => {
-      body.Line[0].Description = 'changed generic description';
+      body.Line[0]!.Description = 'changed generic description';
     }],
     ['tax detail', (body: typeof currentBody) => {
-      body.Line[0].AccountBasedExpenseLineDetail.TaxAmount = 0.75;
+      body.Line[0]!.AccountBasedExpenseLineDetail.TaxAmount = 0.75;
     }],
     ['unknown accounting field', (body: typeof currentBody) => {
       body.UnknownAccountingField.preserve = false;
     }],
     ['array order', (body: typeof currentBody) => { body.Line.reverse(); }],
-    ['explicit null', (body: typeof currentBody) => { delete body.ExplicitNull; }],
+    ['explicit null', (body: typeof currentBody) => { delete (body as { ExplicitNull?: unknown }).ExplicitNull; }],
   ])('retains %s in the content binding', (_name, mutate) => {
     const changed = structuredClone(currentBody);
     mutate(changed);
@@ -384,17 +384,17 @@ describe('hashLineWriteContent', () => {
   it('retains posting types and nested metadata fields', () => {
     const original = structuredClone(currentBody);
     Object.assign(
-      original.Line[0].AccountBasedExpenseLineDetail,
+      original.Line[0]!.AccountBasedExpenseLineDetail,
       { PostingType: 'Debit', MetaData: { userField: 'original' } },
     );
     const changedPostingType = structuredClone(original);
     Object.assign(
-      changedPostingType.Line[0].AccountBasedExpenseLineDetail,
+      changedPostingType.Line[0]!.AccountBasedExpenseLineDetail,
       { PostingType: 'Credit' },
     );
     const changedNestedMetadata = structuredClone(original);
     Object.assign(
-      changedNestedMetadata.Line[0].AccountBasedExpenseLineDetail,
+      changedNestedMetadata.Line[0]!.AccountBasedExpenseLineDetail,
       { MetaData: { userField: 'changed' } },
     );
 
@@ -593,7 +593,7 @@ describe('prepared line-write validation', () => {
       prepared.requestHash = exactBodyHash(prepared.body);
     }],
     ['unsafe integer', (prepared: ReturnType<typeof validPrepared>) => {
-      prepared.body.TotalAmt = Number.MAX_SAFE_INTEGER + 1;
+      (prepared.body as { TotalAmt?: number }).TotalAmt = Number.MAX_SAFE_INTEGER + 1;
     }],
     ['malformed Unicode', (prepared: ReturnType<typeof validPrepared>) => {
       prepared.body.PrivateNote = '\ud800';
