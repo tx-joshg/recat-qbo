@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { QboTaxCodeInfo, QboTaxRateInfo } from '../../lib/qbo/types.js';
 import {
   TAX_REFERENCE_TTL_MS,
   getTaxReadiness,
@@ -7,12 +8,12 @@ import {
 } from './reference.js';
 
 const profile = { usingSalesTax: true, partnerTaxEnabled: false };
-const rates = [
+const rates: QboTaxRateInfo[] = [
   { qboId: 'RATE5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: '2026-07-27T16:00:00.000Z' },
   { qboId: 'RATE7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
 ];
 
-function code(qboId: string) {
+function code(qboId: string): QboTaxCodeInfo {
   return {
     qboId,
     name: qboId,
@@ -103,7 +104,7 @@ function depsWith(
   taxRates = rates,
 ): TaxReferenceDeps {
   return {
-    db: db.db,
+    db: db.db as unknown as TaxReferenceDeps['db'],
     now: () => now,
     getClient: vi.fn(async () => ({
       getTaxProfile: vi.fn(async () => profile),
@@ -287,7 +288,7 @@ describe('refreshTaxReference', () => {
       { qboId: 'OLD', name: 'Old rate', description: null, active: false, rateValue: 7, sourceUpdatedAt: null },
     ]],
   ] as const)('does not declare sales readiness for %s', async (_case, salesCode, taxRates) => {
-    const result = await refreshTaxReference('company-1', { force: true }, depsWith(cache, [salesCode], undefined, taxRates));
+    const result = await refreshTaxReference('company-1', { force: true }, depsWith(cache, [salesCode as unknown as QboTaxCodeInfo], undefined, taxRates as unknown as QboTaxRateInfo[]));
 
     expect(result.readiness).toMatchObject({ status: 'needs_setup', salesStatus: 'needs_setup', salesTaxCodes: [] });
   });
@@ -309,7 +310,7 @@ describe('refreshTaxReference', () => {
     await refreshTaxReference('company-1', { force: true }, depsWith(cache, [code('OOS')]));
 
     expect(cache.taxCode('company-1', 'GST5')).toMatchObject({ active: false });
-    expect(cache.db.$transaction.mock.calls.filter((call) => call[1] === undefined)).toHaveLength(2);
+    expect(cache.db.$transaction.mock.calls.filter((call) => (call as unknown[])[1] === undefined)).toHaveLength(2);
   });
 
   it('preserves the last usable cache after an upstream failure', async () => {
@@ -370,7 +371,7 @@ describe('refreshTaxReference', () => {
     await getTaxReadiness('company-1', depsWith(cache, [code('GST5')]));
 
     expect(cache.db.$transaction).toHaveBeenCalledTimes(1);
-    expect(cache.db.$transaction.mock.calls[0]?.[1]).toEqual({
+    expect((cache.db.$transaction.mock.calls[0] as unknown[])?.[1]).toEqual({
       isolationLevel: 'RepeatableRead',
     });
   });
@@ -470,7 +471,7 @@ describe('refreshTaxReference', () => {
     const result = await refreshTaxReference(
       'company-1',
       { force: true },
-      depsWith(cache, [{ ...code('GST5'), ...changes }]),
+      depsWith(cache, [{ ...code('GST5'), ...changes } as QboTaxCodeInfo]),
     );
 
     expect(result.readiness.status).toBe('needs_setup');
@@ -529,7 +530,7 @@ describe('refreshTaxReference', () => {
     const result = await refreshTaxReference(
       'company-1',
       { force: true },
-      depsWith(cache, [code('GST5')], undefined, [rates[0], adjustment]),
+      depsWith(cache, [code('GST5')], undefined, [rates[0]!, adjustment]),
     );
 
     expect(result.readiness).toMatchObject({ status: 'ready' });
@@ -550,7 +551,7 @@ describe('refreshTaxReference', () => {
       ...code('REFERENCED_ADJUSTMENT'),
       purchaseRates: [{ taxRateQboId: 'REFERENCED_ADJUSTMENT', taxTypeApplicable: 'TaxOnAmount' }],
     };
-    const deps = depsWith(cache, [referencedAdjustment], undefined, [rates[0], adjustment]);
+    const deps = depsWith(cache, [referencedAdjustment], undefined, [rates[0]!, adjustment]);
 
     await expect(
       refreshTaxReference('company-1', { force: true }, deps),

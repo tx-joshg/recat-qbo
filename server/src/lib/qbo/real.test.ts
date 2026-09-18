@@ -3,6 +3,7 @@
 // those lines — everything else on the entity survives verbatim.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { StagedCategorization } from '@recat/shared';
 import {
   QboAttachmentNotFoundError,
   QboAuthError,
@@ -12,6 +13,8 @@ import {
   type QboDepositSnapshot,
   type QboPreparedLineWrite,
   type QboPreparedWrite,
+  type QboPurchaseExpectedState,
+  type QboPurchaseSnapshot,
 } from './types.js';
 import { QboAttachmentAdapterError } from './attachments.js';
 import {
@@ -205,6 +208,7 @@ function attachmentUploadFile(content = '%PDF') {
     marker: 'marker-1',
     async openContent() {
       return {
+        blobId: 'blob-attachment-1',
         contentType: 'application/pdf',
         sizeBytes: bytes.byteLength,
         async *chunks() {
@@ -227,7 +231,7 @@ async function consumeRequestBody(init: RequestInit | undefined): Promise<Buffer
 
 describe('RealQboClient attachment HTTP seam', () => {
   it('streams an exact multipart request and parses per-file upload outcomes', async () => {
-    let encodedBody = Buffer.alloc(0);
+    let encodedBody: Buffer = Buffer.alloc(0);
     const fetchMock = vi.fn(async (
       _input: string | URL | Request,
       init?: RequestInit,
@@ -922,7 +926,7 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
         memo: 'Generic sale',
       }],
       tagIds: [],
-    } as const;
+    } as unknown as StagedCategorization;
     const client = realClient(undefined, ['HOLDING_GENERIC']).client;
     const txn = mapDeposit(raw, new Set(['HOLDING_GENERIC']));
 
@@ -1066,8 +1070,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       requestId: 'REQUEST/GENERIC',
       requestHash: 'hash-generic',
       body,
-      before: {} as QboPreparedWrite['before'],
-      expected: {} as QboPreparedWrite['expected'],
+      before: {} as QboPurchaseSnapshot,
+      expected: {} as QboPurchaseExpectedState,
     } satisfies QboPreparedWrite;
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       Purchase: { ...body, SyncToken: '8' },
@@ -1160,8 +1164,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       requestId: 'REQUEST_GENERIC',
       requestHash: 'hash-generic',
       body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
-      before: {} as QboPreparedWrite['before'],
-      expected: {} as QboPreparedWrite['expected'],
+      before: {} as QboPurchaseSnapshot,
+      expected: {} as QboPurchaseExpectedState,
     } satisfies QboPreparedWrite;
 
     await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(errorType);
@@ -1179,8 +1183,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       requestId: 'REQUEST_GENERIC',
       requestHash: 'hash-generic',
       body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
-      before: {} as QboPreparedWrite['before'],
-      expected: {} as QboPreparedWrite['expected'],
+      before: {} as QboPurchaseSnapshot,
+      expected: {} as QboPurchaseExpectedState,
     } satisfies QboPreparedWrite;
 
     await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(QboRequestTimeout);
@@ -1204,8 +1208,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
         requestId: 'REQUEST_GENERIC',
         requestHash: 'hash-generic',
         body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
-        before: {} as QboPreparedWrite['before'],
-        expected: {} as QboPreparedWrite['expected'],
+        before: {} as QboPurchaseSnapshot,
+        expected: {} as QboPurchaseExpectedState,
       } satisfies QboPreparedWrite;
 
       await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(
@@ -1229,8 +1233,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       requestId: 'REQUEST_GENERIC',
       requestHash: 'hash-generic',
       body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
-      before: {} as QboPreparedWrite['before'],
-      expected: {} as QboPreparedWrite['expected'],
+      before: {} as QboPurchaseSnapshot,
+      expected: {} as QboPurchaseExpectedState,
     } satisfies QboPreparedWrite;
 
     await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(QboRequestTimeout);
@@ -1247,8 +1251,8 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       requestId: 'REQUEST_GENERIC',
       requestHash: 'hash-generic',
       body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
-      before: {} as QboPreparedWrite['before'],
-      expected: {} as QboPreparedWrite['expected'],
+      before: {} as QboPurchaseSnapshot,
+      expected: {} as QboPurchaseExpectedState,
     } satisfies QboPreparedWrite;
 
     await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toThrow(
