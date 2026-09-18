@@ -21,7 +21,7 @@ describe('rule candidate repair budget', () => {
 
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(legacyScan).not.toHaveBeenCalled();
-    const query = tx.$queryRaw.mock.calls[0]?.[0] as
+    const query = (tx.$queryRaw.mock.calls[0] as unknown[] | undefined)?.[0] as
       | { strings?: readonly string[] }
       | undefined;
     const sql = query?.strings?.join(' ') ?? '';

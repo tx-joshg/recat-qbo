@@ -319,10 +319,10 @@ describe('recordTransfer durable wrapper', () => {
     await recordTransfer('txn-z', 'txn-a', actor, first.deps);
     await recordTransfer('txn-a', 'txn-z', actor, second.deps);
 
-    const firstInput = first.prepare.mock.calls[0]![0];
-    const secondInput = second.prepare.mock.calls[0]![0];
-    expect(firstInput.idempotencyKey).toMatch(/^ui-transfer:[0-9a-f]{64}$/);
-    expect(secondInput.idempotencyKey).toBe(firstInput.idempotencyKey);
+    const firstInput = (first.prepare.mock.calls[0] as unknown[])[0] as { idempotencyKey?: string };
+    const secondInput = (second.prepare.mock.calls[0] as unknown[])[0] as { idempotencyKey?: string };
+    expect(firstInput.idempotencyKey!).toMatch(/^ui-transfer:[0-9a-f]{64}$/);
+    expect(secondInput.idempotencyKey!).toBe(firstInput.idempotencyKey!);
     expect(firstInput).toMatchObject({
       companyId: 'company-generic',
       transactionId: 'txn-z',

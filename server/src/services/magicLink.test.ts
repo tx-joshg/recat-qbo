@@ -79,7 +79,7 @@ describe('issueMagicLink', () => {
 
   it('emails the link to the user', async () => {
     const { link } = await issueMagicLink(USER);
-    const mail = mocks.sendMail.mock.calls[0]?.[0] as { to: string; subject: string; text: string };
+    const mail = (mocks.sendMail.mock.calls[0] as unknown[] | undefined)?.[0] as { to: string; subject: string; text: string };
     expect(mail.to).toBe(USER.email);
     expect(mail.text).toContain(link);
     expect(mail.subject).toContain('Sign in');
@@ -87,7 +87,7 @@ describe('issueMagicLink', () => {
 
   it('uses invite wording for invites', async () => {
     await issueMagicLink(USER, { invite: true });
-    const mail = mocks.sendMail.mock.calls[0]?.[0] as { subject: string };
+    const mail = (mocks.sendMail.mock.calls[0] as unknown[] | undefined)?.[0] as { subject: string };
     expect(mail.subject.toLowerCase()).toContain('invited');
   });
 

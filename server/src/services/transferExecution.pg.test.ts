@@ -192,8 +192,9 @@ function provider(fixture: Fixture): ProviderHarness {
         fresh.syncToken = snapshot.syncToken;
         fresh.amount = 0;
         fresh.lines = [];
-        fresh.raw = clone(prepared.body);
-        fresh.raw.SyncToken = snapshot.syncToken;
+        const raw = clone(prepared.body) as Record<string, unknown>;
+        raw.SyncToken = snapshot.syncToken;
+        fresh.raw = raw;
       }
       return {
         ok: true as const,

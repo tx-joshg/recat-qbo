@@ -240,7 +240,7 @@ describe('public HTTPS attachment imports', () => {
       sizeBytes: 14,
       sourceKind: 'HTTPS_IMPORT',
     });
-    expect(request.mock.calls[0]?.[0]).toMatchObject({
+    expect((request.mock.calls[0] as unknown[] | undefined)?.[0]).toMatchObject({
       hostname: 'public.test',
       address: PUBLIC_ADDRESS,
       port: 443,
