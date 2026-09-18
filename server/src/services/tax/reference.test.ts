@@ -500,7 +500,7 @@ describe('refreshTaxReference', () => {
     ['outside storage bound', 1_000],
   ])('rejects a %s rate while preserving the prior cache', async (_case, rateValue) => {
     await refreshTaxReference('company-1', { force: true }, depsWith(cache, [code('GST5')]));
-    const malformedRates = [{ ...rates[0], rateValue }];
+    const malformedRates = [{ ...rates[0]!, rateValue }];
 
     await expect(
       refreshTaxReference(
@@ -597,7 +597,7 @@ describe('refreshTaxReference', () => {
       { force: true },
       depsWith(cache, [...unsupported, ...supported, nonTax, zero], undefined, [
         ...rates,
-        { ...rates[0], qboId: 'ZERO', rateValue: 0 },
+        { ...rates[0]!, qboId: 'ZERO', rateValue: 0 },
       ]),
     );
 

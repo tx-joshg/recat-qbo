@@ -1667,11 +1667,11 @@ describe('RealQboClient prepared transfer line writes', () => {
   it.each([
     ['changed untouched line', (response: Record<string, unknown>) => {
       const lines = response.Line as Record<string, unknown>[];
-      lines[0] = { ...lines[0], Description: 'provider changed untouched memo' };
+      lines[0] = { ...lines[0]!, Description: 'provider changed untouched memo' };
     }],
     ['wrong target amount', (response: Record<string, unknown>) => {
       const lines = response.Line as Record<string, unknown>[];
-      lines[1] = { ...lines[1], Amount: 9 };
+      lines[1] = { ...lines[1]!, Amount: 9 };
     }],
     ['wrong target account', (response: Record<string, unknown>) => {
       const lines = response.Line as Record<string, unknown>[];

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../../lib/prisma.js';
 import { qboFactory } from '../../lib/qbo/factory.js';
@@ -488,7 +488,7 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
           transaction: { id: fixture.transactionId, revision: 0 },
         },
         decision: checkpoint.decision,
-        verification: { liveCheckpoint: { version: 1, ...checkpoint } },
+        verification: { liveCheckpoint: { version: 1, ...checkpoint } } as unknown as Prisma.InputJsonValue,
         decisionModel: 'decision-generic',
         verifierModel: 'verifier-generic',
         verifierKind: 'distinct_model',
@@ -536,8 +536,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         expectedRevision: 1,
         expectedSyncToken: '7',
         requestHash: prepared(fixture).requestHash,
-        requestPayload: prepared(fixture),
-        beforeSnapshot: beforeSnapshot(fixture),
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
       },
     });
     return expireAndClaim(fixture);
@@ -566,13 +566,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
     return {
       fetchTxn: vi.fn(async () => currentTxn(fixture)),
       fetchPreparedSnapshot: vi.fn(snapshots),
-      fetchWriteSafety: vi.fn(async () => ({
-        bookCloseDate: null,
-        cleared: false,
-        reconciled: false,
-      })),
+      fetchWriteSafety: vi.fn(async () => ({ bookCloseDate: null })),
       prepareRecategorization: vi.fn(async () => prepared(fixture)),
-      preparePurchaseRecategorization: vi.fn(async () => prepared(fixture)),
       sendPreparedWrite,
     } as unknown as QboClient;
   }
@@ -723,7 +718,6 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
       await runProductionClaimedLiveJob(claimed, 'worker-recovery', recoveryModels(nextTurn));
       expect(nextTurn).not.toHaveBeenCalled();
       expect(qbo.prepareRecategorization).not.toHaveBeenCalled();
-      expect(qbo.preparePurchaseRecategorization).not.toHaveBeenCalled();
       expect(send).not.toHaveBeenCalled();
       await expect(liveWritePermitCount(fixture)).resolves.toBe(0);
       await expect(prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }))
@@ -826,8 +820,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         expectedRevision: 0,
         expectedSyncToken: '1',
         requestHash: `foreign-hash-${randomUUID()}`,
-        requestPayload: prepared(fixture),
-        beforeSnapshot: beforeSnapshot(fixture),
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
       },
     });
     const snapshots = [beforeSnapshot(fixture), beforeSnapshot(fixture)];
@@ -888,8 +882,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
           expectedRevision: 0,
           expectedSyncToken: '1',
           requestHash: `foreign-hash-${foreignRequestId}`,
-          requestPayload: prepared(fixture),
-          beforeSnapshot: beforeSnapshot(fixture),
+          requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+          beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
         },
       });
     });
@@ -1586,8 +1580,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         expectedRevision: 1,
         expectedSyncToken: '7',
         requestHash: prepared(fixture).requestHash,
-        requestPayload: prepared(fixture),
-        beforeSnapshot: beforeSnapshot(fixture),
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
       },
     });
     await prisma.agentCompanyConfig.update({
@@ -1663,8 +1657,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         expectedRevision: 1,
         expectedSyncToken: '7',
         requestHash: prepared(fixture).requestHash,
-        requestPayload: prepared(fixture),
-        beforeSnapshot: beforeSnapshot(fixture),
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
       },
     });
     await disconnectCompanyWithLiveAuthority(fixture.companyId, {
@@ -1780,8 +1774,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
           expectedRevision: 1,
           expectedSyncToken: '7',
           requestHash: prepared(fixture).requestHash,
-          requestPayload: prepared(fixture),
-          beforeSnapshot: beforeSnapshot(fixture),
+          requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+          beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
         },
       });
       try {
@@ -1852,8 +1846,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
           expectedRevision: 1,
           expectedSyncToken: '7',
           requestHash: prepared(fixture).requestHash,
-          requestPayload: prepared(fixture),
-          beforeSnapshot: beforeSnapshot(fixture),
+          requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+          beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
         },
       });
       try {
@@ -1902,8 +1896,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         expectedRevision: 1,
         expectedSyncToken: '7',
         requestHash: prepared(fixture).requestHash,
-        requestPayload: prepared(fixture),
-        beforeSnapshot: beforeSnapshot(fixture),
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
       },
     });
     await disconnectCompanyWithLiveAuthority(fixture.companyId, {
@@ -1918,7 +1912,7 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
             where: { id: fixture.jobId },
           }),
           lastErrorCode: null,
-        },
+        } as Parameters<typeof runProductionClaimedLiveRecovery>[0],
         fixture.context.workerId,
       )).resolves.toBe(true);
 
@@ -1962,8 +1956,8 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
           expectedRevision: 1,
           expectedSyncToken: '7',
           requestHash: prepared(fixture).requestHash,
-          requestPayload: prepared(fixture),
-          beforeSnapshot: beforeSnapshot(fixture),
+          requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+          beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
         },
       });
       const send = vi.fn();
@@ -1989,7 +1983,7 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
               where: { id: fixture.jobId },
             }),
             lastErrorCode: null,
-          },
+          } as Parameters<typeof runProductionClaimedLiveRecovery>[0],
           fixture.context.workerId,
         )).resolves.toBe(true);
 

@@ -35,6 +35,6 @@ describe('cached tax reference validation', () => {
   });
 
   it('drops null rate values instead of coercing them to zero', () => {
-    expect(cachedTaxRates([{ ...validRates[0], rateValue: null }])).toEqual([]);
+    expect(cachedTaxRates([{ ...validRates[0]!, rateValue: null }])).toEqual([]);
   });
 });

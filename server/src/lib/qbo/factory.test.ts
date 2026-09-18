@@ -484,7 +484,7 @@ describe('testCompanyConnection', () => {
       disconnectedAt: new Date(),
     });
 
-    await expect(testCompanyConnection('company-1')).rejects.toMatchObject<QboAuthError>({
+    await expect(testCompanyConnection('company-1')).rejects.toMatchObject({
       reason: 'COMPANY_DISCONNECTED',
     });
   });

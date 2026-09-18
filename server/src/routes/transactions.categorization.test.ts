@@ -599,7 +599,7 @@ describe('tax-aware categorization action routes', () => {
         snapshot: { secret: 'nested totals snapshot' },
       },
       lines: [{
-        ...stagedResult.lines[0],
+        ...stagedResult.lines[0]!,
         beforeSnapshot: { secret: 'line snapshot' },
         rawPayload: { secret: 'line payload' },
         token: 'line-secret-token',
@@ -716,23 +716,23 @@ describe('tax-aware categorization action routes', () => {
     ['empty lines', { ...stageBody, lines: [] }],
     ['unsafe cents', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], grossCents: Number.MAX_SAFE_INTEGER + 1 }],
+      lines: [{ ...stageBody.lines[0]!, grossCents: Number.MAX_SAFE_INTEGER + 1 }],
     }],
     ['long account reference', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], categoryQboId: 'A'.repeat(121) }],
+      lines: [{ ...stageBody.lines[0]!, categoryQboId: 'A'.repeat(121) }],
     }],
     ['long tax reference', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], taxCodeQboId: 'T'.repeat(121) }],
+      lines: [{ ...stageBody.lines[0]!, taxCodeQboId: 'T'.repeat(121) }],
     }],
     ['long memo', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], memo: 'M'.repeat(501) }],
+      lines: [{ ...stageBody.lines[0]!, memo: 'M'.repeat(501) }],
     }],
     ['duplicate line tags', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], tagIds: [LINE_TAG_ID, LINE_TAG_ID] }],
+      lines: [{ ...stageBody.lines[0]!, tagIds: [LINE_TAG_ID, LINE_TAG_ID] }],
     }],
     ['too many transaction tags', {
       ...stageBody,
@@ -743,7 +743,7 @@ describe('tax-aware categorization action routes', () => {
     }],
     ['unknown line field', {
       ...stageBody,
-      lines: [{ ...stageBody.lines[0], clientTaxCents: -50 }],
+      lines: [{ ...stageBody.lines[0]!, clientTaxCents: -50 }],
     }],
   ])('strictly rejects %s before staging', async (_name, body) => {
     const response = await request(testApp())

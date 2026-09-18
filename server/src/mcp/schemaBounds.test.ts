@@ -14,7 +14,7 @@ describe('bounded MCP schemas', () => {
     'rejects a non-schema root: %j',
     (schema) => {
       expect(() => assertBoundedJsonSchema(schema)).toThrowError(
-        expect.objectContaining<McpSchemaBoundsError>({
+        expect.objectContaining({
           code: 'INVALID_SCHEMA',
         }),
       );
@@ -56,7 +56,7 @@ describe('bounded MCP schemas', () => {
         $ref: 'https://schemas.example.test/account.json',
       }),
     ).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'EXTERNAL_REF',
       }),
     );
@@ -85,7 +85,7 @@ describe('bounded MCP schemas', () => {
         $dynamicRef: 'https://schemas.example.test/account.json',
       }),
     ).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'EXTERNAL_REF',
       }),
     );
@@ -127,7 +127,7 @@ describe('bounded MCP schemas', () => {
         ...MCP_SCHEMA_BOUNDS,
         ...limits,
       }),
-    ).toThrowError(expect.objectContaining<McpSchemaBoundsError>({ code }));
+    ).toThrowError(expect.objectContaining({ code }));
   });
 
   it('measures output bounds in UTF-8 bytes including JSON syntax', () => {
@@ -147,7 +147,7 @@ describe('bounded MCP schemas', () => {
     expect(() => assertBoundedMcpOutput({ evidence: 'x'.repeat(128) }, {
       ...MCP_SCHEMA_BOUNDS,
       maxOutputBytes: 64,
-    })).toThrowError(expect.objectContaining<McpSchemaBoundsError>({
+    })).toThrowError(expect.objectContaining({
       code: 'OUTPUT_BYTES',
     }));
   });
@@ -185,7 +185,7 @@ describe('bounded MCP schemas', () => {
         ...MCP_SCHEMA_BOUNDS,
         ...limits,
       }),
-    ).toThrowError(expect.objectContaining<McpSchemaBoundsError>({ code }));
+    ).toThrowError(expect.objectContaining({ code }));
   });
 
   it('counts boolean schemas in applicator positions toward the subschema limit', () => {
@@ -200,7 +200,7 @@ describe('bounded MCP schemas', () => {
         },
       ),
     ).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'SCHEMA_SUBSCHEMAS',
       }),
     );
@@ -228,7 +228,7 @@ describe('bounded MCP schemas', () => {
     input.self = input;
 
     expect(() => parseBoundedMcpInput(z.unknown(), input)).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'CYCLIC_VALUE',
       }),
     );
@@ -239,7 +239,7 @@ describe('bounded MCP schemas', () => {
     schema.properties = { self: schema };
 
     expect(() => assertBoundedJsonSchema(schema)).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'CYCLIC_VALUE',
       }),
     );
@@ -247,12 +247,12 @@ describe('bounded MCP schemas', () => {
 
   it('retains stable serialization errors for non-JSON BigInt values', () => {
     expect(() => parseBoundedMcpInput(z.unknown(), { value: 1n })).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'INPUT_SERIALIZATION',
       }),
     );
     expect(() => assertBoundedJsonSchema({ const: 1n })).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'SCHEMA_SERIALIZATION',
       }),
     );
@@ -272,7 +272,7 @@ describe('bounded MCP schemas', () => {
         maxValidationTimeMs: 1,
       }),
     ).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'VALIDATION_TIME',
       }),
     );
@@ -295,7 +295,7 @@ describe('bounded MCP schemas', () => {
         maxValidationTimeMs: 1,
       }),
     ).toThrowError(
-      expect.objectContaining<McpSchemaBoundsError>({
+      expect.objectContaining({
         code: 'VALIDATION_TIME',
       }),
     );

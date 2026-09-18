@@ -521,7 +521,7 @@ describe('prepareTransfer', () => {
         tokenId: 'token-generic',
         tokenPrefix: 'rct_generic1',
       },
-    }), f.deps)).rejects.toMatchObject<TransferOperationError>({
+    }), f.deps)).rejects.toMatchObject({
       code: 'FORBIDDEN',
       message: 'You do not have permission to prepare this transfer.',
     });
@@ -821,7 +821,7 @@ describe('prepareTransfer', () => {
     }],
     ['a changed untouched line', (prepared: QboPreparedLineWrite) => {
       const lines = prepared.body.Line as Record<string, unknown>[];
-      lines[0] = { ...lines[0], Description: 'Changed by corrupt preparer' };
+      lines[0] = { ...lines[0]!, Description: 'Changed by corrupt preparer' };
     }],
     ['a changed top-level date', (prepared: QboPreparedLineWrite) => {
       prepared.body.TxnDate = '2026-07-30';
@@ -884,7 +884,7 @@ describe('prepareTransfer', () => {
     ['an untouched line', (prepared: QboPreparedLineWrite) => {
       const lines = prepared.body.Line as Record<string, unknown>[];
       lines[0] = {
-        ...lines[0],
+        ...lines[0]!,
         Description: 'Cross-leg adapter mutation',
       };
     }, (stored: QboPreparedLineWrite) => {

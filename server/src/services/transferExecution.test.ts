@@ -798,7 +798,7 @@ describe('transfer operation status', () => {
 
     await expect(
       getTransferOperation(OPERATION_ID, ACTOR, undefined, f.deps),
-    ).rejects.toMatchObject<TransferExecutionError>({
+    ).rejects.toMatchObject({
       code: 'FORBIDDEN',
       message: 'You do not have permission to access this transfer operation.',
     });
@@ -814,7 +814,7 @@ describe('transfer operation status', () => {
 
     await expect(
       getTransferOperation(OPERATION_ID, ACTOR, undefined, f.deps),
-    ).rejects.toMatchObject<TransferExecutionError>({
+    ).rejects.toMatchObject({
       code: 'OPERATION_CONFLICT',
       message: 'Stored transfer operation evidence is inconsistent.',
     });
@@ -830,7 +830,7 @@ describe('commitTransfer', () => {
     try {
       await expect(
         commitTransfer(OPERATION_ID, ACTOR),
-      ).rejects.toMatchObject<TransferExecutionError>({
+      ).rejects.toMatchObject({
         code: 'OPERATION_CONFLICT',
         message: 'Stored transfer operation evidence is inconsistent.',
       });
@@ -985,7 +985,7 @@ describe('commitTransfer', () => {
       const f = fixture();
       f.db.attempts[0]!.status = status;
       f.snapshots.set(f.prepared[0].qboId, {
-        ...f.prepared[0].expected,
+        ...f.prepared[0]!.expected,
         syncToken: '9',
       });
 
@@ -1082,7 +1082,7 @@ describe('commitTransfer', () => {
     f.markVerified(0);
     const firstEvidence = clone(f.db.attempts[0]);
     f.snapshots.set(f.prepared[1].qboId, {
-      ...f.prepared[1].before,
+      ...f.prepared[1]!.before,
       syncToken: '99',
       contentHash: hash('changed-content'),
     });
@@ -1144,7 +1144,7 @@ describe('commitTransfer', () => {
     const f = fixture({ expiresAt: new Date(NOW.getTime() - 1) });
     f.db.attempts[0]!.status = 'COMMITTING';
     f.snapshots.set(f.prepared[0].qboId, {
-      ...f.prepared[0].expected,
+      ...f.prepared[0]!.expected,
       syncToken: '9',
     });
 
@@ -1447,7 +1447,7 @@ describe('commitTransfer', () => {
     f.db.transactions[0]!.status = 'SUPERSEDED';
     f.db.transactions[0]!.qboSyncToken = '9';
     f.snapshots.set(f.prepared[0].qboId, {
-      ...f.prepared[0].expected,
+      ...f.prepared[0]!.expected,
       syncToken: '9',
     });
 
@@ -1768,7 +1768,7 @@ describe('commitTransfer', () => {
     f.fetchLineWriteSnapshot.mockImplementationOnce(async () => {
       await new Promise((resolve) => setTimeout(resolve, 30));
       return {
-        ...f.prepared[0].expected,
+        ...f.prepared[0]!.expected,
         syncToken: '9',
       };
     });
@@ -1984,7 +1984,7 @@ describe('commitTransfer', () => {
 
     await expect(
       commitTransfer(OPERATION_ID, ACTOR, undefined, undefined, f.deps),
-    ).rejects.toMatchObject<TransferExecutionError>({
+    ).rejects.toMatchObject({
       code: 'OPERATION_CONFLICT',
       message: 'Stored transfer operation evidence is inconsistent.',
     });

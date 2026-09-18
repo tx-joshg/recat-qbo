@@ -462,15 +462,15 @@ describe('Recat MCP mutation tools', () => {
       tagIds: [],
     };
     const invalidProposals = [
-      { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: undefined }] },
-      { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: null }] },
-      { ...valid, lines: [...valid.lines, { ...valid.lines[0] }] },
-      { ...valid, lines: [{ ...valid.lines[0], memo: 'do not change' }] },
+      { ...valid, lines: [{ ...valid.lines[0]!, taxCodeQboId: undefined }] },
+      { ...valid, lines: [{ ...valid.lines[0]!, taxCodeQboId: null }] },
+      { ...valid, lines: [...valid.lines, { ...valid.lines[0]! }] },
+      { ...valid, lines: [{ ...valid.lines[0]!, memo: 'do not change' }] },
       { ...valid, tagIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'] },
       {
         ...valid,
         lines: [{
-          ...valid.lines[0],
+          ...valid.lines[0]!,
           tagIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],
         }],
       },

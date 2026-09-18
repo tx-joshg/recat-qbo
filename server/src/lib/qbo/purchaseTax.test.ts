@@ -12,10 +12,16 @@ import {
   purchaseTargetLineMatches,
   reconstructPurchaseTaxExcludedTransaction,
 } from './purchaseTax.js';
-import { QboSyncTokenConflict, type QboPurchaseSnapshot, type RawPurchase } from './types.js';
+import {
+  QboSyncTokenConflict,
+  type QboPurchaseSnapshot,
+  type QboTaxCodeInfo,
+  type QboTaxRateInfo,
+  type RawPurchase,
+} from './types.js';
 import type { StagedCategorization } from '@recat/shared';
 
-const reference = {
+const reference: { codes: QboTaxCodeInfo[]; rates: QboTaxRateInfo[] } = {
   codes: [
     {
       qboId: 'GST5',
@@ -24,6 +30,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'OOS',
@@ -32,6 +40,8 @@ const reference = {
       active: true,
       taxable: false,
       purchaseRates: [],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'OLD',
@@ -40,6 +50,8 @@ const reference = {
       active: false,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'COMPOUND',
@@ -51,6 +63,8 @@ const reference = {
         { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
         { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
       ],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'DUPLICATE_COMPONENT',
@@ -62,6 +76,8 @@ const reference = {
         { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
         { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
       ],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'SALES_ONLY',
@@ -70,6 +86,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'FULL',
@@ -78,6 +96,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE100', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'FRACTIONAL',
@@ -86,6 +106,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE5_123456', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'HIGH',
@@ -94,6 +116,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE200', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'PST7',
@@ -102,6 +126,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'VAT20',
@@ -110,6 +136,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE20', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'ZERO_CODE',
@@ -118,6 +146,8 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'ZERO', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'UNKNOWN_TAXABLE',
@@ -126,6 +156,8 @@ const reference = {
       active: true,
       taxable: null,
       purchaseRates: [],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'CONTRADICTORY',
@@ -134,6 +166,8 @@ const reference = {
       active: true,
       taxable: false,
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
     {
       qboId: 'WRONG_COMPONENT',
@@ -142,17 +176,19 @@ const reference = {
       active: true,
       taxable: true,
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnTax' }],
+      salesRates: [],
+      sourceUpdatedAt: null,
     },
   ],
   rates: [
-    { qboId: 'RATE5', name: 'GST 5%', description: null, active: true, rateValue: 5 },
-    { qboId: 'RATE7', name: 'PST 7%', description: null, active: true, rateValue: 7 },
-    { qboId: 'RATE20', name: 'VAT 20%', description: null, active: true, rateValue: 20 },
-    { qboId: 'ZERO', name: 'Zero', description: null, active: true, rateValue: 0 },
-    { qboId: 'RATE100', name: 'Full', description: null, active: true, rateValue: 100 },
-    { qboId: 'RATE5_123456', name: 'Fractional', description: null, active: true, rateValue: 5.123456 },
-    { qboId: 'RATE200', name: 'High', description: null, active: true, rateValue: 200 },
-    { qboId: 'OLD_RATE', name: 'Old', description: null, active: false, rateValue: 5 },
+    { qboId: 'RATE5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
+    { qboId: 'RATE7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
+    { qboId: 'RATE20', name: 'VAT 20%', description: null, active: true, rateValue: 20, sourceUpdatedAt: null },
+    { qboId: 'ZERO', name: 'Zero', description: null, active: true, rateValue: 0, sourceUpdatedAt: null },
+    { qboId: 'RATE100', name: 'Full', description: null, active: true, rateValue: 100, sourceUpdatedAt: null },
+    { qboId: 'RATE5_123456', name: 'Fractional', description: null, active: true, rateValue: 5.123456, sourceUpdatedAt: null },
+    { qboId: 'RATE200', name: 'High', description: null, active: true, rateValue: 200, sourceUpdatedAt: null },
+    { qboId: 'OLD_RATE', name: 'Old', description: null, active: false, rateValue: 5, sourceUpdatedAt: null },
   ],
 };
 
@@ -211,7 +247,7 @@ describe('calculatePurchaseLine', () => {
   it('supports an active zero rate', () => {
     const zeroRateReference = {
       ...reference,
-      codes: [{ ...reference.codes[0], qboId: 'ZERO_CODE', purchaseRates: [{ taxRateQboId: 'ZERO', taxTypeApplicable: 'TaxOnAmount' }] }],
+      codes: [{ ...reference.codes[0]!, qboId: 'ZERO_CODE', purchaseRates: [{ taxRateQboId: 'ZERO', taxTypeApplicable: 'TaxOnAmount' }] }],
     };
 
     expect(
@@ -282,7 +318,7 @@ describe('calculatePurchaseLine', () => {
     expect(() =>
       calculatePurchaseLine(
         { grossCents: -10_00, taxCalculation: 'TaxExcluded', taxCodeQboId: 'GST5' },
-        { ...reference, rates: [{ qboId: 'RATE5', name: 'Old', description: null, active: false, rateValue: 5 }] },
+        { ...reference, rates: [{ qboId: 'RATE5', name: 'Old', description: null, active: false, rateValue: 5, sourceUpdatedAt: null }] },
       ),
     ).toThrowError(new PurchaseTaxError('TAX_RATE_UNAVAILABLE'));
   });
@@ -506,7 +542,7 @@ describe('calculatePurchaseTransaction', () => {
           taxCalculation: 'TaxExcluded',
           lines: [{ grossCents: -1_000, taxCodeQboId: 'GST5' }],
         },
-        { ...reference, rates: [{ ...reference.rates[0], rateValue: Number.NaN }] },
+        { ...reference, rates: [{ ...reference.rates[0]!, rateValue: Number.NaN }] },
       ),
     ).toEqual({ eligible: false, reason: 'TAX_RATE_MALFORMED', lineIndex: 0 });
 
@@ -516,7 +552,7 @@ describe('calculatePurchaseTransaction', () => {
           taxCalculation: 'TaxExcluded',
           lines: [{ grossCents: -1_000, taxCodeQboId: 'GST5' }],
         },
-        { ...reference, rates: [{ ...reference.rates[0], active: false }] },
+        { ...reference, rates: [{ ...reference.rates[0]!, active: false }] },
       ),
     ).toEqual({ eligible: false, reason: 'TAX_RATE_INACTIVE', lineIndex: 0 });
 
@@ -526,7 +562,7 @@ describe('calculatePurchaseTransaction', () => {
           taxCalculation: 'TaxExcluded',
           lines: [{ grossCents: -1_000, taxCodeQboId: 'GST5' }],
         },
-        { ...reference, rates: [{ ...reference.rates[0], rateValue: 1_000 }] },
+        { ...reference, rates: [{ ...reference.rates[0]!, rateValue: 1_000 }] },
       ),
     ).toEqual({ eligible: false, reason: 'TAX_RATE_MALFORMED', lineIndex: 0 });
   });
@@ -563,10 +599,10 @@ describe('calculatePurchaseTransaction', () => {
         },
         {
           codes: [{
-            ...reference.codes[0],
+            ...reference.codes[0]!,
             purchaseRates: [{ taxRateQboId: '', taxTypeApplicable: 'TaxOnAmount' }],
           }],
-          rates: [{ ...reference.rates[0], qboId: '' }],
+          rates: [{ ...reference.rates[0]!, qboId: '' }],
         },
       ),
     ).toEqual({ eligible: false, reason: 'TAX_RATE_MALFORMED', lineIndex: 0 });
@@ -578,8 +614,8 @@ describe('calculatePurchaseTransaction', () => {
           lines: [{ grossCents: -1_000, taxCodeQboId: 'GST5' }],
         },
         {
-          codes: [reference.codes[0]],
-          rates: [{ ...reference.rates[0], qboId: '' }],
+          codes: [reference.codes[0]!],
+          rates: [{ ...reference.rates[0]!, qboId: '' }],
         },
       ),
     ).toEqual({ eligible: false, reason: 'TAX_RATE_MALFORMED', lineIndex: 0 });
@@ -1463,7 +1499,7 @@ describe('preparePurchaseRecategorization', () => {
       staged: preserved,
       before,
       requestId: 'REQUEST_PURCHASE_SYNTHETIC_1_MISMATCH',
-    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code }));
+    })).toThrowError(expect.objectContaining({ code }));
   });
 
   it('prepares an exact tax-inclusive full Purchase body and expected snapshot', () => {
@@ -1639,13 +1675,13 @@ describe('preparePurchaseRecategorization', () => {
       ],
     };
     expect(() => prepare(unprovable, staged(), unprovableBefore)).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({
+      expect.objectContaining({
         code: 'QBO_PURCHASE_UNSUPPORTED',
       }),
     );
 
     expect(() => prepare(completePurchase(), staged('TaxExcluded'))).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({
+      expect.objectContaining({
         code: 'QBO_PURCHASE_UNSUPPORTED',
       }),
     );
@@ -1661,7 +1697,7 @@ describe('preparePurchaseRecategorization', () => {
         totalTaxCents: -80,
       },
     )).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({
+      expect.objectContaining({
         code: 'QBO_PURCHASE_UNSUPPORTED',
       }),
     );
@@ -1755,16 +1791,16 @@ describe('preparePurchaseRecategorization', () => {
 
   it('rejects unsupported shapes, drift, missing references, unsafe cents, and stale tokens', () => {
     expect(() => prepare(completePurchase({ Line: undefined }))).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_PURCHASE_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_PURCHASE_UNSUPPORTED' }),
     );
     expect(() => prepare(completePurchase({ TotalAmt: 16 }))).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_STATE_DRIFT' }),
+      expect.objectContaining({ code: 'QBO_STATE_DRIFT' }),
     );
     expect(() => prepare(completePurchase(), {
       ...staged(),
       lines: [{ ...staged().lines[0]!, categoryQboId: '' }],
     })).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+      expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
     );
     const missingPaymentAccount = completePurchase({ AccountRef: undefined });
     expect(() => prepare(
@@ -1772,13 +1808,13 @@ describe('preparePurchaseRecategorization', () => {
       staged(),
       { ...snapshotFor(missingPaymentAccount), accountQboId: null },
     )).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+      expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
     );
     expect(() => prepare(completePurchase(), {
       ...staged(),
       lines: [{ ...staged().lines[0]!, subtotalCents: Number.MAX_SAFE_INTEGER }],
     })).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_AMOUNT_UNSAFE' }),
+      expect.objectContaining({ code: 'QBO_AMOUNT_UNSAFE' }),
     );
     expect(() => prepare(
       completePurchase({ SyncToken: '8' }),
@@ -1811,7 +1847,7 @@ describe('preparePurchaseRecategorization', () => {
       },
     ] satisfies StagedCategorization[]) {
       expect(() => prepare(completePurchase(), invalid)).toThrowError(
-        expect.objectContaining<QboPurchasePreparationError>({
+        expect.objectContaining({
           code: 'QBO_PURCHASE_UNSUPPORTED',
         }),
       );
@@ -1828,7 +1864,7 @@ describe('preparePurchaseRecategorization', () => {
         totalCents: 1_000,
       }],
     }, snapshotFor(refund))).toThrowError(
-      expect.objectContaining<QboPurchasePreparationError>({
+      expect.objectContaining({
         code: 'QBO_PURCHASE_UNSUPPORTED',
       }),
     );
@@ -1933,7 +1969,7 @@ describe('preparePurchaseRestore', () => {
       current: { ...current, TxnTaxDetail: { TotalTax: 0.01 } },
       prepared: original,
       requestId: 'REQUEST_RESTORE_TAX_DRIFT',
-    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({
+    })).toThrowError(expect.objectContaining({
       code: 'QBO_STATE_DRIFT',
     }));
     expect(() => preparePurchaseRestore({
@@ -1946,7 +1982,7 @@ describe('preparePurchaseRestore', () => {
         },
       },
       requestId: 'REQUEST_RESTORE_EQUAL_TAX_DRIFT',
-    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({
+    })).toThrowError(expect.objectContaining({
       code: 'QBO_STATE_DRIFT',
     }));
   });
@@ -2059,12 +2095,12 @@ describe('preparePurchaseRestore', () => {
       current: { ...original.body, SyncToken: '8', TotalAmt: 16 },
       prepared: original,
       requestId: 'REQUEST_RESTORE_GENERIC',
-    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_STATE_DRIFT' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_STATE_DRIFT' }));
     expect(() => preparePurchaseRestore({
       current: { ...original.body, SyncToken: '8', Line: undefined },
       prepared: original,
       requestId: 'REQUEST_RESTORE_GENERIC',
-    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_PURCHASE_UNSUPPORTED' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_PURCHASE_UNSUPPORTED' }));
   });
 
   it('reserves untouched line identities before matching colliding restore targets', () => {

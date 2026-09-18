@@ -832,7 +832,7 @@ describe('MCP categorization operation execution', () => {
     transactionSync.value = 'sync-private';
     await expect(
       retryMcpOperation(principal, { operationId: 'operation-2' }, deps),
-    ).rejects.toMatchObject<McpOperationExecutionError>({ code: 'RETRY_NOT_ALLOWED' });
+    ).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
     expect(createOperation).toHaveBeenCalledOnce();
   });
 

@@ -570,7 +570,7 @@ describe('prepareDepositRecategorization', () => {
     });
 
     expect(() => prepare(raw, staged(), snapshotFor(raw))).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
   });
 
@@ -613,7 +613,7 @@ describe('prepareDepositRecategorization', () => {
     });
 
     expect(() => prepare(raw, splitStage)).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
   });
 
@@ -637,7 +637,7 @@ describe('prepareDepositRecategorization', () => {
     }
 
     expect(() => prepare(raw, staged(), snapshotFor(raw))).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({
+      expect.objectContaining({
         code: 'QBO_DEPOSIT_UNSUPPORTED',
       }),
     );
@@ -712,7 +712,7 @@ describe('prepareDepositRecategorization', () => {
       };
 
       expect(() => prepare(raw, staged(), before)).toThrowError(
-        expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+        expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
       );
     }
   });
@@ -722,7 +722,7 @@ describe('prepareDepositRecategorization', () => {
     (malformed.Line![0]!.DepositLineDetail!.Entity as Record<string, unknown>).name = 42;
 
     expect(() => prepare(malformed, staged(), snapshotFor(malformed))).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+      expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
     );
 
     for (const field of [
@@ -740,7 +740,7 @@ describe('prepareDepositRecategorization', () => {
       (reference as Record<string, unknown>).GenericRefField = 'semantic data';
 
       expect(() => prepare(unsupported, staged(), snapshotFor(unsupported))).toThrowError(
-        expect.objectContaining<QboDepositPreparationError>({
+        expect.objectContaining({
           code: 'QBO_DEPOSIT_UNSUPPORTED',
         }),
       );
@@ -749,12 +749,12 @@ describe('prepareDepositRecategorization', () => {
 
   it('rejects unsupported shapes, missing references, mixed untouched tax mode, unsafe cents, balance drift, and stale tokens', () => {
     expect(() => prepare(completeDeposit({ Line: undefined }))).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
     const wrongDetailType = completeDeposit();
     wrongDetailType.Line![0] = { ...wrongDetailType.Line![0]!, DetailType: 'UnsupportedDetail' };
     expect(() => prepare(wrongDetailType)).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
     const missingBank = completeDeposit({ DepositToAccountRef: undefined });
     expect(() => prepare(
@@ -762,32 +762,32 @@ describe('prepareDepositRecategorization', () => {
       staged(),
       { ...snapshotFor(missingBank), depositToAccountQboId: null },
     )).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+      expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
     );
     expect(() => prepare(completeDeposit(), {
       ...staged(),
       lines: [{ ...staged().lines[0]!, taxCodeQboId: null }],
     })).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+      expect.objectContaining({ code: 'QBO_REFERENCE_MISSING' }),
     );
     expect(() => prepare(completeDeposit(), {
       ...staged(),
       lines: [{ ...staged().lines[0]!, subtotalCents: Number.MAX_SAFE_INTEGER }],
     })).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_AMOUNT_UNSAFE' }),
+      expect.objectContaining({ code: 'QBO_AMOUNT_UNSAFE' }),
     );
     expect(() => prepare(completeDeposit(), {
       ...staged(),
       totals: { ...staged().totals, totalCents: 10_699 },
     })).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_STATE_DRIFT' }),
+      expect.objectContaining({ code: 'QBO_STATE_DRIFT' }),
     );
     expect(() => prepare(
       completeDeposit({ TotalAmt: 158 }),
       staged(),
       snapshotFor(completeDeposit()),
     )).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_STATE_DRIFT' }),
+      expect.objectContaining({ code: 'QBO_STATE_DRIFT' }),
     );
     expect(() => prepare(
       completeDeposit({ SyncToken: '8' }),
@@ -820,7 +820,7 @@ describe('prepareDepositRecategorization', () => {
       ],
     };
     expect(() => prepare(mixed, staged('TaxExcluded'), mixedBefore)).toThrowError(
-      expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
+      expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
   });
 });
@@ -1003,7 +1003,7 @@ describe('prepareDepositRestore', () => {
       current: targetDrift,
       prepared: original,
       requestId: 'request-target-drift',
-    })).toThrowError(expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_STATE_DRIFT' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_STATE_DRIFT' }));
 
     const targetIdDrift: RawDeposit = {
       ...current,
@@ -1016,7 +1016,7 @@ describe('prepareDepositRestore', () => {
       current: targetIdDrift,
       prepared: original,
       requestId: 'request-target-id-drift',
-    })).toThrowError(expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_STATE_DRIFT' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_STATE_DRIFT' }));
 
     const untouchedDrift: RawDeposit = {
       ...current,
@@ -1029,18 +1029,18 @@ describe('prepareDepositRestore', () => {
       current: untouchedDrift,
       prepared: original,
       requestId: 'request-untouched-drift',
-    })).toThrowError(expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_STATE_DRIFT' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_STATE_DRIFT' }));
 
     expect(() => prepareDepositRestore({
       current: { ...current, Line: undefined },
       prepared: original,
       requestId: 'request-unsupported',
-    })).toThrowError(expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }));
 
     expect(() => prepareDepositRestore({
       current,
       prepared: { ...original, qboType: 'Purchase' } as unknown as QboPreparedWrite,
       requestId: 'request-wrong-member',
-    })).toThrowError(expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }));
+    })).toThrowError(expect.objectContaining({ code: 'QBO_DEPOSIT_UNSUPPORTED' }));
   });
 });

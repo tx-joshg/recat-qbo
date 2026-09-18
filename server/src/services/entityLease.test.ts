@@ -249,7 +249,7 @@ describe('entity leases', () => {
 
     await expect(fenceEntityLeaseOwnership(key, 'owner-a', {
       db: { $queryRawUnsafe: async () => rows },
-    })).rejects.toMatchObject<EntityLeaseError>({
+    })).rejects.toMatchObject({
       name: 'EntityLeaseError',
       code: 'ENTITY_BUSY',
     });
@@ -273,7 +273,7 @@ describe('entity leases', () => {
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
     expect(rejected).toHaveLength(1);
-    expect(rejected[0]?.reason).toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+    expect(rejected[0]?.reason).toMatchObject({ code: 'ENTITY_BUSY' });
     expect(db.rows).toHaveLength(1);
     expect(['owner-a', 'owner-b']).toContain(db.rows[0]?.owner);
   });
@@ -302,7 +302,7 @@ describe('entity leases', () => {
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
     expect(rejected).toHaveLength(1);
-    expect(rejected[0]?.reason).toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+    expect(rejected[0]?.reason).toMatchObject({ code: 'ENTITY_BUSY' });
     expect(['owner-a', 'owner-b']).toContain(db.rows[0]?.owner);
     expect(db.rows[0]?.leaseExpiresAt.getTime()).toBe(at.getTime() + 30_000);
   });
@@ -324,7 +324,7 @@ describe('entity leases', () => {
     await expect(renewEntityLease(key, 'owner-b', {
       db,
       now: async () => new Date(at.getTime() + 30_001),
-    })).rejects.toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+    })).rejects.toMatchObject({ code: 'ENTITY_BUSY' });
   });
 
   it('keeps an outer lease held when the same async owner reenters and releases once', async () => {
@@ -359,7 +359,7 @@ describe('entity leases', () => {
         'owner-b',
         async () => undefined,
         { db, now: async () => at },
-      )).rejects.toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+      )).rejects.toMatchObject({ code: 'ENTITY_BUSY' });
       expect(db.rows).toMatchObject([{ owner: 'owner-a' }]);
     }, { db, now: async () => at });
   });
@@ -373,7 +373,7 @@ describe('entity leases', () => {
         db,
         now: async () => now,
       });
-    }, { db, now: async () => now })).rejects.toMatchObject<EntityLeaseError>({
+    }, { db, now: async () => now })).rejects.toMatchObject({
       code: 'ENTITY_BUSY',
     });
   });
@@ -397,7 +397,7 @@ describe('entity leases', () => {
     }, { db, now: async () => at });
 
     releaseDetached();
-    await expect(detached).rejects.toMatchObject<EntityLeaseError>({
+    await expect(detached).rejects.toMatchObject({
       code: 'ENTITY_BUSY',
     });
     expect(db.rows).toHaveLength(0);

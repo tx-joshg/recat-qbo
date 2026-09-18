@@ -697,7 +697,7 @@ describe('agent final-total staging reconciliation', () => {
       }],
     });
 
-    expect(reconciled).toMatchObject<CategorizationProposal>({
+    expect(reconciled).toMatchObject({
       taxCalculation: 'TaxExcluded',
       lines: [expect.objectContaining({ grossCents: -10_00 })],
       tagIds: [],
