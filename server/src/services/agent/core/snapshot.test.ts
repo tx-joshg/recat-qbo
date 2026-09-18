@@ -323,11 +323,11 @@ describe('buildAgentSnapshot', () => {
 
   it('rejects likely account numbers and strict-DTo descriptor bypasses without reflecting values', () => {
     const accountNumber = '1234 5678 9012';
-    const hidden = validSource() as Record<PropertyKey, unknown>;
+    const hidden = validSource() as unknown as Record<PropertyKey, unknown>;
     Object.defineProperty(hidden, 'companyId', { value: IDS.transaction, enumerable: false });
-    const accessor = validSource() as Record<PropertyKey, unknown>;
+    const accessor = validSource() as unknown as Record<PropertyKey, unknown>;
     Object.defineProperty(accessor, 'payee', { get: () => 'ordinary payee', enumerable: true });
-    const symbol = validSource() as Record<PropertyKey, unknown>;
+    const symbol = validSource() as unknown as Record<PropertyKey, unknown>;
     symbol[Symbol('private')] = 'hidden';
 
     const cases = [

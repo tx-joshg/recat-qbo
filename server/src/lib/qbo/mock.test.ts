@@ -21,7 +21,9 @@ import {
   QboAttachmentNotFoundError,
   QboRequestTimeout,
   QboSyncTokenConflict,
+  type QboDepositExpectedState,
   type QboDepositSnapshot,
+  type QboPurchaseSnapshot,
   type RawDeposit,
   type RawPurchase,
 } from './types.js';
@@ -152,6 +154,7 @@ describe('MockQboClient attachments', () => {
       marker,
       async openContent() {
         return {
+          blobId: `blob-${marker}`,
           contentType: 'text/plain',
           sizeBytes: bytes.byteLength,
           async *chunks() {
@@ -1014,6 +1017,7 @@ describe('MockQboClient prepared Purchase writes', () => {
           taxRateQboId: 'TAX_RATE_STANDARD',
           taxTypeApplicable: 'TaxOnAmount',
         }],
+        salesRates: [],
         sourceUpdatedAt: null,
       },
       {
@@ -1026,6 +1030,7 @@ describe('MockQboClient prepared Purchase writes', () => {
           taxRateQboId: 'TAX_RATE_STANDARD',
           taxTypeApplicable: 'TaxOnAmount',
         }],
+        salesRates: [],
         sourceUpdatedAt: null,
       },
     );
@@ -1137,7 +1142,7 @@ describe('MockQboClient prepared Purchase writes', () => {
           taxInclusiveCents: null,
         },
       ],
-    } as const;
+    } as unknown as QboPurchaseSnapshot;
     realm.purchaseSnapshots.push(structuredClone(before));
     const staged = {
       transactionId: '00000000-0000-4000-8000-000000000001',
@@ -1433,7 +1438,8 @@ describe('MockQboClient prepared Deposit writes', () => {
       qboId: prepared.expected.qboId,
       syncToken: '8',
       totalCents: prepared.expected.totalCents,
-      depositToAccountQboId: prepared.expected.depositToAccountQboId,
+      depositToAccountQboId:
+        (prepared.expected as QboDepositExpectedState).depositToAccountQboId,
       date: prepared.expected.date,
       globalTaxCalculation: prepared.expected.globalTaxCalculation,
       totalTaxCents: prepared.expected.totalTaxCents,
