@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentDecision } from './decision.js';
 import { buildAgentSnapshot, type AgentSnapshotSource } from './snapshot.js';
-import { verifyAgentDecision } from './verifier.js';
+import { verifyAgentDecision, type AgentVerification } from './verifier.js';
 
 const TRANSACTION_ID = '11111111-1111-4111-8111-111111111111';
 const RULE_ID = '22222222-2222-4222-8222-222222222222';
@@ -70,9 +70,32 @@ function source(
   };
 }
 
+// The helper builds a TaxExcluded proposal; naming that variant gives `lines`
+// a single shape instead of the union across all three tax calculations.
+type TaxExcludedProposal = Extract<
+  AgentDecision,
+  { kind: 'proposal'; taxCalculation: 'TaxExcluded' }
+>;
+
+// AgentVerification is a union: `decision` exists only when ok, and only a
+// proposal decision carries lines. Narrow once, loudly, instead of
+// short-circuiting an expectation to false.
+function verifiedDecision(result: AgentVerification) {
+  if (!result.ok) throw new Error(`expected a verified decision, got ${result.code}`);
+  return result.decision;
+}
+
+function verifiedProposal(result: AgentVerification) {
+  const decision = verifiedDecision(result);
+  if (decision.kind !== 'proposal') {
+    throw new Error(`expected a proposal decision, got ${decision.kind}`);
+  }
+  return decision;
+}
+
 function proposal(
-  overrides: Partial<Extract<AgentDecision, { kind: 'proposal' }>> = {},
-): Extract<AgentDecision, { kind: 'proposal' }> {
+  overrides: Partial<TaxExcludedProposal> = {},
+): TaxExcludedProposal {
   return {
     kind: 'proposal',
     taxCalculation: 'TaxExcluded',
@@ -93,7 +116,7 @@ function proposal(
     ],
     rationale: 'Generic evidence supports this proposal.',
     ...overrides,
-  } as Extract<AgentDecision, { kind: 'proposal' }>;
+  } as TaxExcludedProposal;
 }
 
 function expectRejected(
@@ -125,7 +148,7 @@ describe('verifyAgentDecision', () => {
     });
     expect(result).not.toBe(decision);
     expect(Object.isFrozen(result)).toBe(true);
-    expect(Object.isFrozen(result.decision)).toBe(true);
+    expect(Object.isFrozen(verifiedDecision(result))).toBe(true);
   });
 
   it('accepts verified single-category and balanced split proposals', () => {
@@ -167,8 +190,8 @@ describe('verifyAgentDecision', () => {
     expect(single).toMatchObject({ ok: true, code: 'AGENT_DECISION_VERIFIED' });
     expect(split).toMatchObject({ ok: true, code: 'AGENT_DECISION_VERIFIED' });
     expect(split.ok && split.decision).not.toBe(splitDecision);
-    expect(split.ok && Object.isFrozen(split.decision.lines)).toBe(true);
-    expect(split.ok && Object.isFrozen(split.decision.lines[0])).toBe(true);
+    expect(Object.isFrozen(verifiedProposal(split).lines)).toBe(true);
+    expect(Object.isFrozen(verifiedProposal(split).lines[0])).toBe(true);
   });
 
   it.each([
@@ -193,7 +216,7 @@ describe('verifyAgentDecision', () => {
     expectRejected(
       proposal({
         lines: [{
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           categoryQboId: 'fabricated-category',
         }],
         evidence: [{ kind: 'category', qboId: 'expense-a' }],
@@ -206,7 +229,7 @@ describe('verifyAgentDecision', () => {
     );
     expectRejected(
       proposal({
-        lines: [{ ...proposal().lines[0], tagIds: [UNKNOWN_ID] }],
+        lines: [{ ...proposal().lines[0]!, tagIds: [UNKNOWN_ID] }],
       }),
       'AGENT_TAG_REFERENCE_INVALID',
     );
@@ -219,7 +242,7 @@ describe('verifyAgentDecision', () => {
     );
     expectRejected(
       proposal({
-        lines: [{ ...proposal().lines[0], tagIds: [LINE_TAG_ID, LINE_TAG_ID] }],
+        lines: [{ ...proposal().lines[0]!, tagIds: [LINE_TAG_ID, LINE_TAG_ID] }],
       }),
       'AGENT_TAG_REFERENCE_DUPLICATE',
     );
@@ -242,10 +265,14 @@ describe('verifyAgentDecision', () => {
     'rejects %s tax readiness/mode mismatches',
     (status, supportedCalculationModes, eligibleReferences, taxCalculation, code) => {
       expectRejected(
-        proposal({ taxCalculation }),
+        proposal({ taxCalculation } as Partial<TaxExcludedProposal>),
         code,
         source({
-          tax: { status, supportedCalculationModes, eligibleReferences },
+          tax: {
+            status,
+            supportedCalculationModes: [...supportedCalculationModes],
+            eligibleReferences: [...eligibleReferences],
+          },
           rules: [],
           similarVerifiedTransactions: [],
         }),
@@ -256,13 +283,13 @@ describe('verifyAgentDecision', () => {
   it('rejects taxable lines with missing or fabricated tax references', () => {
     expectRejected(
       proposal({
-        lines: [{ ...proposal().lines[0], taxCodeQboId: null }] as never,
+        lines: [{ ...proposal().lines[0]!, taxCodeQboId: null }] as never,
       }),
       'AGENT_TAX_REFERENCE_MISSING',
     );
     expectRejected(
       proposal({
-        lines: [{ ...proposal().lines[0], taxCodeQboId: 'fabricated-tax' }],
+        lines: [{ ...proposal().lines[0]!, taxCodeQboId: 'fabricated-tax' }],
         evidence: [{ kind: 'category', qboId: 'expense-a' }],
       }),
       'AGENT_TAX_REFERENCE_INVALID',
@@ -274,8 +301,8 @@ describe('verifyAgentDecision', () => {
       ...proposal({
         taxCalculation: 'NotApplicable',
         evidence: [{ kind: 'category', qboId: 'expense-a' }],
-      }),
-      lines: [{ ...proposal().lines[0], taxCodeQboId: 'tax-a' }],
+      } as unknown as Partial<TaxExcludedProposal>),
+      lines: [{ ...proposal().lines[0]!, taxCodeQboId: 'tax-a' }],
     } as unknown as AgentDecision;
 
     expectRejected(invalid, 'AGENT_TAX_REFERENCE_NOT_APPLICABLE');
@@ -424,11 +451,11 @@ describe('verifyAgentDecision', () => {
     const split = proposal({
       lines: [
         {
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           grossCents: -4_00,
         },
         {
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           grossCents: -6_00,
           categoryQboId: 'expense-b',
           taxCodeQboId: 'tax-b',
@@ -468,11 +495,11 @@ describe('verifyAgentDecision', () => {
     const split = proposal({
       lines: [
         {
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           grossCents: -4_00,
         },
         {
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           grossCents: -6_00,
           categoryQboId: 'expense-b',
           taxCodeQboId: 'tax-b',
@@ -500,7 +527,7 @@ describe('verifyAgentDecision', () => {
     const decision = proposal({
       rationale: secret,
       lines: [{
-        ...proposal().lines[0],
+        ...proposal().lines[0]!,
         categoryQboId: secret,
         memo: secret,
       }],
