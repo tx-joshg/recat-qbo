@@ -91,14 +91,14 @@ function liveModel(options: {
   return {
     identity,
     healthAuthority: options.authority ?? `authority:${identity.model}`,
-    nextTurn: vi.fn(),
-    probe: options.probe ?? vi.fn(async () => ({
+    nextTurn: vi.fn<LiveAgentModel['nextTurn']>(),
+    probe: options.probe ?? vi.fn<LiveAgentModel['probe']>(async () => ({
       identity: {
         provider: 'custom',
         model: options.resolved ?? identity.model,
       },
     })),
-    reviewLiveDecision: options.reviewLiveDecision ?? vi.fn(async () => ({
+    reviewLiveDecision: options.reviewLiveDecision ?? vi.fn<LiveAgentModel['reviewLiveDecision']>(async () => ({
       identity: {
         provider: 'custom',
         model: options.resolved ?? identity.model,
@@ -112,7 +112,7 @@ describe('live verifier identity and approval', () => {
   it('normalizes only a validated provider-returned identity', () => {
     const model = {
       identity: { provider: 'custom', model: '  Resolved/Model  ' },
-      nextTurn: vi.fn(),
+      nextTurn: vi.fn<LiveAgentModel['nextTurn']>(),
     } satisfies AgentModel;
 
     expect(modelIdentity(model)).toBe('custom:resolved/model');
@@ -186,7 +186,7 @@ describe('live verifier identity and approval', () => {
       requested: 'decision',
       resolved: 'resolved/decision',
       authority: 'opaque-immutable-decision',
-      probe: vi.fn(async () => new Promise((resolve) => {
+      probe: vi.fn<LiveAgentModel['probe']>(async () => new Promise((resolve) => {
         releaseProbe = resolve;
       })),
     });
@@ -214,7 +214,7 @@ describe('live verifier identity and approval', () => {
       timeoutMs: 100,
     });
     await vi.waitFor(() => expect(decisionModel.probe).toHaveBeenCalledOnce());
-    mutableSnapshot.payee = 'Changed after verification';
+    (mutableSnapshot as { payee: string }).payee = 'Changed after verification';
     const proposal = mutableDecision as Extract<AgentDecision, { kind: 'proposal' }>;
     proposal.lines[0]!.grossCents = -999;
     releaseProbe?.({ identity: { provider: 'custom', model: 'resolved/decision' } });
@@ -303,7 +303,7 @@ describe('live verifier identity and approval', () => {
       verifierModel: liveModel({
         requested: 'verifier',
         resolved: 'resolved/verifier',
-        reviewLiveDecision: vi.fn(async () => ({
+        reviewLiveDecision: vi.fn<LiveAgentModel['reviewLiveDecision']>(async () => ({
           identity: { provider: 'custom', model: 'resolved/other' },
           rawReview: { approved: true, issues: [] },
         })),
@@ -346,7 +346,7 @@ describe('live verifier identity and approval', () => {
 
     const result = await verifyLiveDecision({
       snapshot: snapshot(),
-      decision: malformed,
+      decision: malformed as Extract<AgentDecision, { kind: 'proposal' }>,
     }, {
       decisionModel,
       verifierModel,

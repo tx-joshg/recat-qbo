@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Prisma } from '@prisma/client';
 import {
   LIVE_POLICY_VERSION,
   LiveGateError,
@@ -131,7 +132,7 @@ function providerHealthDeps(options: {
         smtpFrom: 'noreply@example.invalid',
         smtpFromEnv: false,
       },
-    }),
+    } as Awaited<ReturnType<LiveProviderHealthDeps['getAuthority']>>),
     createModel: (modelConfig) => {
       const identity = {
         provider: modelConfig.provider,
@@ -381,7 +382,9 @@ describe('guarded live autopilot gates', () => {
           { key: 'agentDecisionModel', value: instanceDecisionModel, encrypted: false },
         ],
       },
-    });
+      // Prisma delegates return PrismaPromise wrappers a plain async fake
+      // cannot satisfy structurally.
+    } as unknown as Pick<Prisma.TransactionClient, 'agentCompanyConfig' | 'appConfig'>);
 
     const first = await bindingFor('https://models.example/v1', 'credential-a');
     const endpointChanged = await bindingFor('https://models.example/v2', 'credential-a');
@@ -554,7 +557,7 @@ describe('guarded live autopilot gates', () => {
         findUnique: async () => ({ configVersion: 'config-current' }),
       },
       agentRun: { count },
-    })).resolves.toEqual({ abstentions: 0, errors: 0 });
+    } as unknown as Prisma.TransactionClient)).resolves.toEqual({ abstentions: 0, errors: 0 });
     expect(count).toHaveBeenCalledTimes(2);
   });
 
@@ -739,7 +742,13 @@ describe('guarded live autopilot gates', () => {
       liveEnabledAt: NOW,
       liveEnabledByUserId: 'admin-1',
     });
-    deps.getProviderHealth = async () => ({ decisionModel: false, verifierModel: true });
+    deps.getProviderHealth = async () => ({
+      binding: 'opaque-binding-current',
+      decisionModel: false,
+      verifierModel: true,
+      decisionIdentity: null,
+      verifierIdentity: null,
+    });
 
     const readiness = await pauseLiveMode('company-1', deps);
 
