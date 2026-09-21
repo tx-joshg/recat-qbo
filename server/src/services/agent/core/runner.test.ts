@@ -101,9 +101,16 @@ function snapshot(): AgentTransactionSnapshot {
   return buildAgentSnapshot(snapshotSource());
 }
 
+// The helper builds a TaxExcluded proposal; naming that variant gives `lines`
+// a single shape instead of the union across all three tax calculations.
+type TaxExcludedProposal = Extract<
+  AgentDecision,
+  { kind: 'proposal'; taxCalculation: 'TaxExcluded' }
+>;
+
 function proposal(
-  overrides: Partial<Extract<AgentDecision, { kind: 'proposal' }>> = {},
-): Extract<AgentDecision, { kind: 'proposal' }> {
+  overrides: Partial<TaxExcludedProposal> = {},
+): TaxExcludedProposal {
   return {
     kind: 'proposal',
     taxCalculation: 'TaxExcluded',
@@ -123,7 +130,7 @@ function proposal(
     ],
     rationale: 'Generic evidence supports this proposal.',
     ...overrides,
-  } as Extract<AgentDecision, { kind: 'proposal' }>;
+  } as TaxExcludedProposal;
 }
 
 function abstention(): Extract<AgentDecision, { kind: 'abstain' }> {
@@ -553,7 +560,7 @@ describe('runShadowDecision', () => {
     const privateMarker = 'private-fabricated-category';
     const invalidProposal = proposal({
       lines: [{
-        ...proposal().lines[0],
+        ...proposal().lines[0]!,
         categoryQboId: privateMarker,
         memo: privateMarker,
       }],
@@ -575,7 +582,7 @@ describe('runShadowDecision', () => {
   it('maps tax verification failures to INVALID_TAX_STATE', async () => {
     const invalidTax = proposal({
       lines: [{
-        ...proposal().lines[0],
+        ...proposal().lines[0]!,
         taxCodeQboId: 'fabricated-tax',
       }],
       evidence: [{ kind: 'category', qboId: 'expense-a' }],
@@ -786,7 +793,7 @@ describe('runShadowDecision', () => {
     });
     const invalid = proposal({
       lines: [{
-        ...proposal().lines[0],
+        ...proposal().lines[0]!,
         categoryQboId: 'fabricated',
       }],
       evidence: [{ kind: 'category', qboId: 'expense-a' }],
@@ -819,7 +826,7 @@ describe('runShadowDecision', () => {
       'fabricated',
       proposal({
         lines: [{
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           taxCodeQboId: 'fabricated-tax',
         }],
       }),
@@ -829,7 +836,7 @@ describe('runShadowDecision', () => {
       'mismatched',
       proposal({
         lines: [{
-          ...proposal().lines[0],
+          ...proposal().lines[0]!,
           taxCodeQboId: 'tax-b',
         }],
         evidence: [{
@@ -1054,7 +1061,7 @@ describe('runShadowDecision', () => {
     });
     await runShadowDecision(snapshot(), {
       model: new RecordingModel([decisionTurn(proposal({
-        lines: [{ ...proposal().lines[0], categoryQboId: 'fabricated' }],
+        lines: [{ ...proposal().lines[0]!, categoryQboId: 'fabricated' }],
       }))]),
       reviewModel: reviewer,
     });

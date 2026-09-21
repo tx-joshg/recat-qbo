@@ -278,7 +278,7 @@ describe('writeAudit mutation metadata', () => {
       },
     );
 
-    const payload = (create.mock.calls[0] as unknown[] | undefined)?.[0].data.payload as {
+    const payload = ((create.mock.calls[0] as unknown[])[0] as { data: { payload: unknown } }).data.payload as {
       requestId: string;
       references: {
         qboId: string;
@@ -331,7 +331,7 @@ describe('writeAudit mutation metadata', () => {
       },
     );
 
-    const payload = (create.mock.calls[0] as unknown[] | undefined)?.[0].data.payload as {
+    const payload = ((create.mock.calls[0] as unknown[])[0] as { data: { payload: unknown } }).data.payload as {
       mcp: {
         sourceOperationId: string;
         operationId: string;
@@ -386,7 +386,7 @@ describe('writeAudit mutation metadata', () => {
       },
     );
 
-    const data = (create.mock.calls[0] as unknown[] | undefined)?.[0].data;
+    const data = ((create.mock.calls[0] as unknown[])[0] as { data: Record<string, unknown> }).data;
     expect(data).toEqual(expect.objectContaining({
       action: 'transfer',
       payload: {

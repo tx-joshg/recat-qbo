@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { DurableMutationResult } from '../writeback.js';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import { hashOperationPayload, type McpOperationRecord } from './operations.js';
 import {
@@ -165,7 +166,7 @@ function fixture(status: string | null = null) {
   const transactionSync = {
     value: status === 'VERIFIED' ? '8' : 'sync-private',
   };
-  const commit = vi.fn(async () => {
+  const commit = vi.fn(async (): Promise<DurableMutationResult> => {
     attempts.splice(
       0,
       attempts.length,
@@ -196,11 +197,11 @@ function fixture(status: string | null = null) {
       transactionId: TRANSACTION_ID,
       requestId: operations.at(-1)!.id,
       ok: true,
-      status: 'POSTED' as const,
-      outcome: 'VERIFIED' as const,
+      status: 'POSTED',
+      outcome: 'VERIFIED',
     };
   });
-  const reconcile = vi.fn(async () => {
+  const reconcile = vi.fn(async (): Promise<DurableMutationResult> => {
     attempts[0]!.status = 'VERIFIED';
     attempts[0]!.verification = {
       outcome: 'VERIFIED',
@@ -213,8 +214,8 @@ function fixture(status: string | null = null) {
       transactionId: TRANSACTION_ID,
       requestId: 'operation-1',
       ok: true,
-      status: 'POSTED' as const,
-      outcome: 'VERIFIED' as const,
+      status: 'POSTED',
+      outcome: 'VERIFIED',
     };
   });
   const createOperation = vi.fn(async (input: Parameters<NonNullable<McpOperationExecutionDeps['createOperation']>>[0]) => {

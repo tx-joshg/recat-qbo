@@ -332,9 +332,9 @@ describe('buildAgentSnapshot', () => {
 
     const cases = [
       () => buildAgentSnapshot(validSource({ payee: accountNumber })),
-      () => buildAgentSnapshot(hidden as AgentSnapshotSource),
-      () => buildAgentSnapshot(accessor as AgentSnapshotSource),
-      () => buildAgentSnapshot(symbol as AgentSnapshotSource),
+      () => buildAgentSnapshot(hidden as unknown as AgentSnapshotSource),
+      () => buildAgentSnapshot(accessor as unknown as AgentSnapshotSource),
+      () => buildAgentSnapshot(symbol as unknown as AgentSnapshotSource),
     ];
     for (const action of cases) {
       try {
@@ -374,7 +374,7 @@ describe('serializeAgentSnapshot', () => {
   it('validates supplied snapshots and does not reflect their data in serialization errors', () => {
     const snapshot = buildAgentSnapshot(validSource({ payee: 'private merchant name' }));
     const invalid = JSON.parse(serializeAgentSnapshot(snapshot, 64 * 1024)) as typeof snapshot;
-    invalid.currency = 'BAD!';
+    (invalid as { currency: string }).currency = 'BAD!';
 
     try {
       serializeAgentSnapshot(invalid, 64 * 1024);
