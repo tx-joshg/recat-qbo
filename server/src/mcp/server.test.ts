@@ -156,7 +156,7 @@ function mockMutations(
       },
     }),
     ...overrides,
-  };
+  } as McpMutationOperations;
 }
 
 function expectSafeInvalidToolFailure(body: Record<string, any>, sentinel: string): void {

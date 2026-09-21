@@ -25,7 +25,7 @@ function deps(
   return {
     authorizeAdmin: vi.fn(async () => true),
     loadBinding: vi.fn(async () => ({ ...input })),
-    reconcile: vi.fn(async () => ({
+    reconcile: vi.fn<LiveReconciliationDeps['reconcile']>(async () => ({
       transactionId: input.transactionId,
       requestId: input.requestId,
       ok: true,
@@ -108,7 +108,7 @@ describe('live mutation reconciliation', () => {
     'returns canonical %s truth without auto-resuming live mode',
     async (outcome) => {
       const d = deps({
-        reconcile: vi.fn(async () => ({
+        reconcile: vi.fn<LiveReconciliationDeps['reconcile']>(async () => ({
           transactionId: input.transactionId,
           requestId: input.requestId,
           ok: outcome !== 'UNCERTAIN',

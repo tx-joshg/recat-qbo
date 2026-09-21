@@ -135,7 +135,7 @@ describePostgres('attachment operation PostgreSQL lifecycle', () => {
         contentType: 'application/pdf',
         chunkCount: 1,
         expiresAt: BLOB_EXPIRES_AT,
-        chunks: { create: { ordinal: 0, content } },
+        chunks: { create: { ordinal: 0, content: Buffer.from(content) } },
       },
     });
     const receipt = await db.receiptDocument.create({

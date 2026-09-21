@@ -135,7 +135,7 @@ function mutations(
     prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
     commitTransfer: vi.fn().mockResolvedValue(transferOperation),
     ...overrides,
-  };
+  } as McpMutationOperations;
 }
 
 async function legacy(

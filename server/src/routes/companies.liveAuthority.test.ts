@@ -119,7 +119,7 @@ vi.mock('../middleware/auth.js', () => {
       id: 'admin-1',
       isInstanceAdmin: true,
       memberships: [],
-    } as NonNullable<typeof req.user>;
+    } as unknown as NonNullable<typeof req.user>;
     next();
   };
   return {

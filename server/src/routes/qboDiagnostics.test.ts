@@ -51,7 +51,7 @@ vi.mock('../middleware/auth.js', () => {
       id: `${role}-user`,
       isInstanceAdmin: role === 'admin',
       memberships: [],
-    } as NonNullable<typeof req.user>;
+    } as unknown as NonNullable<typeof req.user>;
     next();
   };
   const requireInstanceAdmin: RequestHandler = (req, _res, next) => {

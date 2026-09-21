@@ -445,7 +445,7 @@ describe('Recat MCP read tools', () => {
     [{ startDate: '2025-02-29' }, 'real date'],
     [{ endDate: '2026-02-30' }, 'real date'],
     [{ startDate: '2025-01-01', endDate: '2026-01-03' }, '366 days'],
-  ])('rejects invalid transaction date bounds before calling services: %s', async (dates) => {
+  ] as [ { startDate?: string; endDate?: string }, string ][])('rejects invalid transaction date bounds before calling services: %s', async (dates) => {
     const operations = reads();
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),

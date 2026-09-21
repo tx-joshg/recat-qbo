@@ -194,7 +194,7 @@ function fixture(overrides: Partial<TestInput> = {}): TestInput {
       status: 'PENDING',
       amountCents: -1000,
       currency: 'XTS',
-      qboState: 'current',
+      qboState: 'current' as const,
     },
     config: {
       companyCurrency: 'XTS',
@@ -219,8 +219,8 @@ function fixture(overrides: Partial<TestInput> = {}): TestInput {
     },
     warnings: [],
     ...overrides,
-  };
-  return input satisfies LiveEligibilityInput;
+  } as TestInput;
+  return input;
 }
 
 function withTransaction(
@@ -614,7 +614,7 @@ describe('evaluateLiveEligibility', () => {
     }
     expectDenied(new InputRecord(fixture()), 'INPUT_INVALID');
     const nested = fixture();
-    nested.reviewedRun = new RunRecord(nested.reviewedRun);
+    nested.reviewedRun = new RunRecord(nested.reviewedRun) as unknown as TestInput['reviewedRun'];
     expectDenied(nested, 'INPUT_INVALID');
   });
 

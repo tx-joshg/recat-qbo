@@ -150,7 +150,7 @@ function fakeDeps(): ReceiptWorkerDeps & {
 describe('receipt extraction worker', () => {
   it('performs zero blob or provider calls while processing is disabled', async () => {
     const fake = fakeDeps();
-    fake.resolveProvider = vi.fn(async () => ({
+    fake.resolveProvider = vi.fn<ReceiptWorkerDeps['resolveProvider']>(async () => ({
       settings: {
         enabled: false,
         provider: 'openrouter',

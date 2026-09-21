@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { LivePauseStateDto } from '@recat/shared';
 import {
   evaluateCircuitBreakers,
   pauseLiveCompanyInTransaction,
@@ -58,7 +59,8 @@ function deps(
 
 describe('live circuit breakers', () => {
   it('requires durable company-admin authority before invoking the manual kill', async () => {
-    const pause = vi.fn(async () => undefined);
+    // never invoked here: the call is rejected for authority first
+    const pause = vi.fn(async () => undefined as unknown as LivePauseStateDto);
     const authorizeAdmin = vi.fn(async () => false);
 
     await expect(pauseLiveModeManually(

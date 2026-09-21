@@ -16,7 +16,7 @@ vi.mock('../middleware/auth.js', () => ({
       next(new HttpError(401, 'Not signed in', 'UNAUTHENTICATED'));
       return;
     }
-    req.user = { id: userId, memberships: [] } as NonNullable<typeof req.user>;
+    req.user = { id: userId, memberships: [] } as unknown as NonNullable<typeof req.user>;
     next();
   }) satisfies RequestHandler,
 }));

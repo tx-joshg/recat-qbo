@@ -217,7 +217,8 @@ function harness(options: HarnessOptions = {}) {
   });
 
   const deps: McpCategorizationDeps = {
-    stage,
+    // vi.fn captures a concrete signature; stage is generic in T.
+    stage: stage as unknown as McpCategorizationDeps['stage'],
     authorizationStore: transactionStore,
     now: () => NOW,
     createOperation: createPreparedOperation,

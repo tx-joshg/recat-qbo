@@ -625,14 +625,7 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
       fetchPreparedSnapshot: vi.fn(async () => structuredClone(beforeSnapshot)),
       fetchWriteSafety: vi.fn(async () => ({
         bookCloseDate: null,
-        cleared: false,
-        reconciled: false,
       })),
-      preparePurchaseRecategorization: vi.fn(async () => {
-        prepareStarted.resolve();
-        await allowPreparation.promise;
-        return structuredClone(prepared);
-      }),
       prepareRecategorization: vi.fn(async () => {
         prepareStarted.resolve();
         await allowPreparation.promise;

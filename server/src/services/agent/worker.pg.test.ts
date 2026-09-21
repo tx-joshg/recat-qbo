@@ -319,7 +319,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
       limits: LIMITS,
       now: async () => BASE_TIME,
       ...overrides,
-    };
+    } as ShadowWorkerDeps;
   }
 
   function model(

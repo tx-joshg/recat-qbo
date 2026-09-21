@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import {
   afterAll,
   afterEach,
@@ -292,8 +292,8 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
         expectedRevision: 1,
         expectedSyncToken: '7',
         requestHash,
-        requestPayload: prepared,
-        beforeSnapshot: before,
+        requestPayload: prepared as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: before as unknown as Prisma.InputJsonValue,
         errorCode: 'QBO_WRITE_UNCERTAIN',
         errorMessage: 'QuickBooks mutation requires reconciliation.',
       },

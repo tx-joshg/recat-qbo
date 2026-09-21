@@ -126,6 +126,7 @@ describePostgres('live gate PostgreSQL authority races', () => {
         threshold: 25,
         thresholdMet: true,
       }),
+      authorizeAdmin: async () => true,
       getShadowMetrics: async () => ({ abstentions: 0, errors: 0 }),
       getTaxReadiness: async () => ({ status: 'ready', refreshedAt: NOW.toISOString() }),
       getWriteBlockers: async (companyId) => {

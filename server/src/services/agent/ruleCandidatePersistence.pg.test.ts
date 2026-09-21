@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type {
   VerifiedCategorizationOutcome,
@@ -205,13 +205,14 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
             expectedSyncToken: '0',
             requestHash: `hash-${current.requestId}`,
             requestPayload: {
+              // Prisma Json columns take InputJsonValue.
               ruleCandidateFold: { version: 1 },
               categorizationEvidence: { version: 1, proposal: current.proposal },
               ruleCandidateEvidence: {
                 version: 1,
                 ...current.candidateContext,
               },
-            },
+            } as unknown as Prisma.InputJsonValue,
             beforeSnapshot: {},
           },
         });
@@ -321,7 +322,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
               version: 1,
               ...conflicting.candidateContext,
             },
-          },
+          } as unknown as Prisma.InputJsonValue,
           beforeSnapshot: {},
         },
       });
@@ -469,7 +470,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
               version: 1,
               ...counterexample.candidateContext,
             },
-          },
+          } as unknown as Prisma.InputJsonValue,
           beforeSnapshot: {},
         },
       });

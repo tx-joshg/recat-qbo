@@ -364,7 +364,7 @@ describePostgres('transfer operation PostgreSQL durability', () => {
             const invalid = structuredClone(data);
             invalid[1]!.transactionId = randomUUID();
             return transaction.qboMutationAttempt.createMany({
-              data: invalid,
+              data: invalid as unknown as Prisma.QboMutationAttemptCreateManyInput[],
               skipDuplicates,
             });
           },
@@ -717,7 +717,7 @@ describePostgres('transfer operation PostgreSQL durability', () => {
         secondAttemptRequestId: `${id}-t1`,
         expiresAt: new Date(Date.now() + 15 * 60 * 1000),
         createdAt: new Date(),
-        retryOfId: null,
+        retryOfId: null as string | null,
       };
     };
     const legacy = clone();

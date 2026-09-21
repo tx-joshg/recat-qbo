@@ -309,11 +309,11 @@ describe('receipt intake', () => {
     const { state, deps } = dependencies();
     const delegate = deps.serializable!;
     let attempts = 0;
-    deps.serializable = async (callback) => {
+    (deps as { serializable: typeof delegate }).serializable = (async (callback: Parameters<typeof delegate>[0]) => {
       attempts += 1;
       if (attempts === 1) throw { code: 'P2002' };
       return delegate(callback);
-    };
+    }) as typeof delegate;
 
     await expect(createReceipts(input(), deps)).resolves.toMatchObject({
       receipts: [expect.objectContaining({ id: 'receipt-1' })],

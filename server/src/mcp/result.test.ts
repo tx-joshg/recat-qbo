@@ -109,7 +109,9 @@ describe('MCP tool results', () => {
         },
       },
     });
-    expect(JSON.stringify(result)).not.toContain(error.message);
+    // the table mixes bare strings with Error instances
+    const sentinel = typeof error === 'string' ? error : error.message;
+    expect(JSON.stringify(result)).not.toContain(sentinel);
   });
 
   it('maps unexpected details to the approved company-unavailable fallback', () => {
@@ -256,6 +258,8 @@ describe('MCP tool results', () => {
         requestId: 'request-mutation',
       },
     });
-    expect(JSON.stringify(result)).not.toContain(error.message);
+    // the table mixes bare strings with Error instances
+    const sentinel = typeof error === 'string' ? error : error.message;
+    expect(JSON.stringify(result)).not.toContain(sentinel);
   });
 });
