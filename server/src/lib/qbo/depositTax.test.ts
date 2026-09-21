@@ -629,10 +629,11 @@ describe('prepareDepositRecategorization', () => {
     const raw = completeDeposit();
     const holdingLine = raw.Line![0]!;
     Object.assign(holdingLine, extra);
-    if (extra.DepositLineDetail !== undefined) {
+    const extraDetail = (extra as { DepositLineDetail?: Record<string, unknown> }).DepositLineDetail;
+    if (extraDetail !== undefined) {
       holdingLine.DepositLineDetail = {
         ...completeDeposit().Line![0]!.DepositLineDetail,
-        ...extra.DepositLineDetail,
+        ...extraDetail,
       };
     }
 
@@ -696,7 +697,7 @@ describe('prepareDepositRecategorization', () => {
         ...raw.Line![0]!,
         DepositLineDetail: {
           ...raw.Line![0]!.DepositLineDetail,
-          ...malformedDetail,
+          ...(malformedDetail as Record<string, unknown>),
         },
       };
       const before = snapshotFor(raw);

@@ -61,7 +61,7 @@ vi.mock('../middleware/auth.js', () => {
       id: 'admin-user',
       isInstanceAdmin: true,
       memberships: [],
-    } as NonNullable<typeof req.user>;
+    } as unknown as NonNullable<typeof req.user>;
     next();
   };
   return {
@@ -524,7 +524,7 @@ describe('QuickBooks OAuth callback publication', () => {
     expect(failed.headers.get('location')).toBe(
       'https://recat.example/setup?qbo_error=QBO_CONNECTION_FAILED',
     );
-    expect(stored?.disconnectedAt).toBeInstanceOf(Date);
+    expect((stored as Record<string, unknown> | null)?.disconnectedAt).toBeInstanceOf(Date);
     expect(mocks.companyUpdate).not.toHaveBeenCalled();
 
     const freshState = createOauthState({ mode: 'demo', env: null });
@@ -544,7 +544,7 @@ describe('QuickBooks OAuth callback publication', () => {
     expect(publication.connectedAt.getTime()).toBeGreaterThan(
       pendingConnectedAt.getTime(),
     );
-    expect(stored?.disconnectedAt).toBeNull();
-    expect(stored?.connectedAt.getTime()).toBe(publication.connectedAt.getTime());
+    expect((stored as Record<string, unknown> | null)?.disconnectedAt).toBeNull();
+    expect(((stored as { connectedAt: Date } | null)?.connectedAt)?.getTime()).toBe(publication.connectedAt.getTime());
   });
 });

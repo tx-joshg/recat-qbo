@@ -15,6 +15,7 @@ import {
   runScheduledShadowJob,
   type AgentSchedulerDeps,
   type AgentSchedulerModelConfig,
+  type ScheduledLiveRecoveryDeps,
 } from './scheduler.js';
 
 const NOW = new Date('2026-07-29T08:20:00.000Z');
@@ -83,7 +84,7 @@ function companySettings(
     },
     configVersion: 'config-v1',
     ...overrides,
-  };
+  } as AgentCompanySettingsDto;
 }
 
 function model(provider: 'openrouter' | 'custom', name: string): AgentModel {
@@ -220,7 +221,7 @@ describe('shadow agent scheduler', () => {
       { companyId: 'not-due-7', scheduleMinutes: 7, liveRequested: false },
       { companyId: 'due-4', scheduleMinutes: 4, liveRequested: false },
     ]);
-    const firstDiscover = vi.fn(async () => undefined);
+    const firstDiscover = vi.fn(async (_companyId: string) => undefined);
     const secondDiscover = vi.fn(async () => undefined);
 
     await createAgentScheduler(schedulerDeps({
@@ -397,7 +398,7 @@ describe('shadow agent scheduler', () => {
       const defer = vi.fn(async () => undefined);
       const reconciling = reconcileScheduledLiveMutations({
         listCandidates: vi.fn(async () => [candidate]),
-        reconcile: vi.fn(async (_input, signal?: AbortSignal) =>
+        reconcile: vi.fn<ScheduledLiveRecoveryDeps['reconcile']>(async (_input, signal?: AbortSignal) =>
           new Promise((_resolve, reject) => {
             signal?.addEventListener('abort', () => reject(new Error('aborted')));
           })),

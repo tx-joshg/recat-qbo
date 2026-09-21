@@ -141,9 +141,9 @@ function expectRawParity(value: unknown, expected: boolean): void {
 
 describe('agent decision provider contract', () => {
   it('exports a direct strict object root with only nested decision anyOf', () => {
-    expect(agentDecisionJsonSchema.type).toBe('object');
-    expect(agentDecisionJsonSchema.anyOf).toBeUndefined();
-    expect((agentDecisionJsonSchema.properties as RecordValue).decision).toMatchObject({ anyOf: expect.any(Array) });
+    expect((agentDecisionJsonSchema as Record<string, unknown>).type).toBe('object');
+    expect((agentDecisionJsonSchema as Record<string, unknown>).anyOf).toBeUndefined();
+    expect(((agentDecisionJsonSchema as Record<string, unknown>).properties as RecordValue).decision).toMatchObject({ anyOf: expect.any(Array) });
     assertProviderObjectsAreStrict(agentDecisionJsonSchema);
     assertNoUnsupportedProviderKeywords(agentDecisionJsonSchema);
     expect(JSON.stringify(agentDecisionJsonSchema)).not.toContain('agent-decision-provider-text');
