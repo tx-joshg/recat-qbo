@@ -280,12 +280,31 @@ export function csvEscape(value: string): string {
   return value;
 }
 
+/**
+ * csvEscape for free text (payees, names, category labels). A leading
+ * = + - @ (or tab/CR) makes Excel and Sheets evaluate the cell as a formula,
+ * so a payee like `=HYPERLINK(...)` would run when the export is opened; a
+ * leading apostrophe keeps it literal. Not for numeric columns, where a
+ * minus sign is the value.
+ */
+export function csvText(value: string): string {
+  return csvEscape(/^[=+\-@\t\r]/.test(value) ? `'${value}` : value);
+}
+
 export const AUDIT_CSV_HEADER = 'When,Who,Transaction,Amount,Action,Before,After';
 
 /** Pure CSV builder (unit-testable without a database). */
 export function buildAuditCsv(entries: AuditEntryDto[]): string {
   const lines = entries.map((e) =>
-    [e.at, e.actor, e.payee, e.amount.toFixed(2), e.action, e.before, e.after].map(csvEscape).join(','),
+    [
+      csvEscape(e.at),
+      csvText(e.actor),
+      csvText(e.payee),
+      csvEscape(e.amount.toFixed(2)),
+      csvText(e.action),
+      csvText(e.before),
+      csvText(e.after),
+    ].join(','),
   );
   return [AUDIT_CSV_HEADER, ...lines].join('\n') + '\n';
 }
