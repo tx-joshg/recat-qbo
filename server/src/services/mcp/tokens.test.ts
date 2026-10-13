@@ -81,6 +81,7 @@ describe('createMcpToken', () => {
         prefix: first.token.slice(0, 12),
         label: 'Automation',
         expiresAt: new Date('2026-10-26T12:00:00.000Z'),
+        viaExposedSession: false,
       },
     });
     expect(JSON.stringify(persisted)).not.toContain(first.token);

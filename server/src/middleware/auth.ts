@@ -79,6 +79,7 @@ export const requireUser: RequestHandler = asyncHandler(async (req, _res, next) 
     throw new HttpError(401, 'Session expired — sign in again', 'UNAUTHENTICATED');
   }
   req.user = session.user;
+  req.sessionViaExposedLink = session.viaExposedLink;
   next();
 });
 

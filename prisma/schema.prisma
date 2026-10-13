@@ -163,6 +163,9 @@ model McpToken {
   createdAt  DateTime  @default(now())
   lastUsedAt DateTime?
   revokedAt  DateTime?
+  /// Created from a session signed in through an exposed (demo-mode devLink)
+  /// magic link. Refused once a real company is connected, like the session.
+  viaExposedSession Boolean @default(false)
 
   @@index([userId, createdAt])
 }

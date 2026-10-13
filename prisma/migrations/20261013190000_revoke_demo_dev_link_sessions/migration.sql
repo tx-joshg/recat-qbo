@@ -1,18 +1,16 @@
--- Marks magic links returned in a response body (the demo-mode devLink) and
--- the sessions they minted, so both stop working once a real company connects.
+-- Marks magic links returned in a response body (the demo-mode devLink), the
+-- sessions they mint, and the MCP tokens those sessions create, so all three
+-- stop working once a real company connects.
 ALTER TABLE "MagicLinkToken" ADD COLUMN "exposed" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "Session" ADD COLUMN "viaExposedLink" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "McpToken" ADD COLUMN "viaExposedSession" BOOLEAN NOT NULL DEFAULT false;
 
--- Sessions that already exist cannot say how they were minted. Any created
--- while no real company was connected may have come from a devLink, so treat
--- them as exposed: they keep working while the instance stays demo-only and
--- are revoked on first use after real books connect. Reconnects only move
--- connectedAt later, which flags more sessions, never fewer. The realm ids are
--- the demo realms (MOCK_REALM_IDS in shared/src/index.ts).
-UPDATE "Session" SET "viaExposedLink" = true
-WHERE "createdAt" < COALESCE(
-  (SELECT MIN("connectedAt") FROM "Company"
-   WHERE "disconnectedAt" IS NULL
-     AND "realmId" NOT IN ('9341002287640001', '4471889011230002')),
-  'infinity'::timestamp
-);
+-- Rows that already exist cannot say how they were minted, and timestamps do
+-- not settle it: a devLink issued during the demo window could be consumed
+-- after real books connected, and reconnecting a company does not move its
+-- connectedAt. So every existing credential is treated as possibly exposed.
+-- Nothing changes while the instance stays demo-only; once a real company is
+-- connected, each user signs in again and re-creates MCP tokens once.
+UPDATE "MagicLinkToken" SET "exposed" = true WHERE "usedAt" IS NULL;
+UPDATE "Session" SET "viaExposedLink" = true;
+UPDATE "McpToken" SET "viaExposedSession" = true WHERE "revokedAt" IS NULL;

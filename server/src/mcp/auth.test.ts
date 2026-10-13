@@ -82,6 +82,44 @@ describe('createRecatTokenVerifier', () => {
     await expect(verifier.verifyAccessToken(RAW_TOKEN)).rejects.toBeInstanceOf(OAuthError);
   });
 
+  it.each([
+    ['still demo-only', true, true],
+    ['real books connected', false, false],
+  ])('a token minted from a devLink session, %s, is accepted: %s', async (_case, allowed, accepted) => {
+    const devLoginAllowed = vi.fn().mockResolvedValue(allowed);
+    const verifier = createRecatTokenVerifier({
+      db: {
+        mcpToken: {
+          findUnique: vi.fn().mockResolvedValue(tokenRow({ viaExposedSession: true })),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
+      },
+      now: () => NOW,
+      devLoginAllowed,
+    });
+
+    const result = verifier.verifyAccessToken(RAW_TOKEN);
+    if (accepted) await expect(result).resolves.toMatchObject({ token: 'token-id' });
+    else await expect(result).rejects.toBeInstanceOf(OAuthError);
+  });
+
+  it('does not consult the dev-login lock for an ordinary token', async () => {
+    const devLoginAllowed = vi.fn().mockResolvedValue(false);
+    const verifier = createRecatTokenVerifier({
+      db: {
+        mcpToken: {
+          findUnique: vi.fn().mockResolvedValue(tokenRow()),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
+      },
+      now: () => NOW,
+      devLoginAllowed,
+    });
+
+    await expect(verifier.verifyAccessToken(RAW_TOKEN)).resolves.toMatchObject({ token: 'token-id' });
+    expect(devLoginAllowed).not.toHaveBeenCalled();
+  });
+
   it('rejects malformed PATs without querying storage', async () => {
     const findUnique = vi.fn();
     const verifier = createRecatTokenVerifier({
