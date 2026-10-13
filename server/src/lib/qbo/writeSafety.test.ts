@@ -44,8 +44,21 @@ describe('QuickBooks write safety', () => {
     [{ ...purchase, txnDate: '08/01/2026' }, { bookCloseDate: null, cleared: false, reconciled: false }],
     [purchase, { bookCloseDate: 'not-a-date', cleared: false, reconciled: false }],
     [{ ...purchase, bankAccountQboId: '' }, { bookCloseDate: null, cleared: false, reconciled: false }],
+    [{ ...purchase, bankAccountQboId: null }, { bookCloseDate: null }],
   ])('fails closed on malformed safety input', (target, evidence) => {
     expect(() => assertQboWriteAllowed(target, evidence))
       .toThrow(expect.objectContaining({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' }));
+  });
+
+  it('checks a JournalEntry by date alone', () => {
+    const journal: QboWriteSafetyTarget = {
+      qboType: 'JournalEntry',
+      qboId: 'journal-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: null,
+    };
+    expect(() => assertQboWriteAllowed(journal, { bookCloseDate: '2026-07-31' })).not.toThrow();
+    expect(() => assertQboWriteAllowed(journal, { bookCloseDate: '2026-08-01' }))
+      .toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
   });
 });

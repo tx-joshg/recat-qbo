@@ -96,6 +96,7 @@ import {
 } from './depositTax.js';
 import {
   QboWriteSafetyError,
+  validWriteSafetyTarget,
   type QboWriteSafetyEvidence,
   type QboWriteSafetyTarget,
 } from './writeSafety.js';
@@ -1425,12 +1426,9 @@ export class RealQboClient implements QboClient {
   }
 
   async fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence> {
-    if (
-      (target.qboType !== 'Purchase' && target.qboType !== 'Deposit')
-      || target.qboId.trim() === ''
-      || target.bankAccountQboId.trim() === ''
-      || !/^\d{4}-\d{2}-\d{2}$/u.test(target.txnDate)
-    ) throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+    if (!validWriteSafetyTarget(target)) {
+      throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+    }
 
     try {
       // The book-close date is the only provider evidence a write depends on.
