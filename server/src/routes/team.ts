@@ -116,13 +116,14 @@ teamRouter.post(
     // New users get an invite link; existing users already sign in on their own.
     let devLink: string | undefined;
     if (isNew) {
-      const { link } = await issueMagicLink(user, { invite: true });
       // Same policy as /auth/magic-link: on a local-admin deployment a
       // response-body link would let the inviting admin sign in as the
       // invitee, so it only ever reaches the server log.
-      if (!(await isSmtpConfigured()) && !localAdminLockdown() && (await devLoginAllowed())) {
-        devLink = link;
-      }
+      const exposed = !(await isSmtpConfigured())
+        && !localAdminLockdown()
+        && (await devLoginAllowed());
+      const { link } = await issueMagicLink(user, { invite: true, exposed });
+      if (exposed) devLink = link;
     }
 
     const member = toMemberDto(user, role);

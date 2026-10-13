@@ -370,8 +370,12 @@ function fixture(overrides: Partial<TransferOperationDeps> = {}) {
   const sendPreparedLineWrite = vi.fn(async () => {
     throw new Error('preparation must never send');
   });
+  const fetchWriteSafety = vi.fn<QboClient['fetchWriteSafety']>(
+    async () => ({ bookCloseDate: null }),
+  );
   const client = {
     fetchTxn,
+    fetchWriteSafety,
     prepareLineRecategorization,
     sendPreparedLineWrite,
   } as unknown as QboClient;
@@ -400,6 +404,7 @@ function fixture(overrides: Partial<TransferOperationDeps> = {}) {
     db,
     fresh,
     fetchTxn,
+    fetchWriteSafety,
     prepareLineRecategorization,
     sendPreparedLineWrite,
     authorize,
@@ -410,6 +415,17 @@ function fixture(overrides: Partial<TransferOperationDeps> = {}) {
 }
 
 describe('prepareTransfer', () => {
+  it('refuses a leg dated inside a closed period before preparing any write', async () => {
+    const f = fixture();
+    f.fetchWriteSafety.mockResolvedValue({ bookCloseDate: '2026-12-31' });
+
+    await expect(prepareTransfer(input(), f.deps)).rejects.toMatchObject({
+      code: 'QBO_PERIOD_CLOSED',
+    });
+    expect(f.prepareLineRecategorization).not.toHaveBeenCalled();
+    expect(f.sendPreparedLineWrite).not.toHaveBeenCalled();
+  });
+
   it('atomically prepares canonical durable attempts with exact QBO evidence and no sends', async () => {
     const f = fixture();
 

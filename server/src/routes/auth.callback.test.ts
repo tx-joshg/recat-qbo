@@ -36,7 +36,7 @@ function testApp(): Express {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.consumeMagicLink.mockResolvedValue({ id: 'u1' });
+  mocks.consumeMagicLink.mockResolvedValue({ user: { id: 'u1' }, exposed: false });
   mocks.createSession.mockResolvedValue({ token: 'session-token', expiresAt: new Date() });
 });
 
@@ -75,7 +75,7 @@ describe('magic-link callback', () => {
       .expect(302);
 
     expect(mocks.consumeMagicLink).toHaveBeenCalledWith('abc');
-    expect(mocks.createSession).toHaveBeenCalledWith('u1');
+    expect(mocks.createSession).toHaveBeenCalledWith('u1', { viaExposedLink: false });
     expect(res.headers.location).toBe('http://recat.test/');
     expect(String(res.headers['set-cookie'])).toContain('recat_session=session-token');
   });

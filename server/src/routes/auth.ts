@@ -97,7 +97,6 @@ authRouter.post(
     const smtp = await isSmtpConfigured();
     let devLink: string | undefined;
     if (user) {
-      const { link } = await issueMagicLink(user);
       // Dev convenience: no SMTP configured → let the UI offer "open the
       // magic link →" directly. Never on a local-admin deployment: this route
       // is unauthenticated and the admin address is published (Umbrel's
@@ -105,7 +104,11 @@ authRouter.post(
       // asking. The link still reaches the server log for the operator, which
       // the login screen points to. Otherwise auto-locked the moment a real
       // (non-demo) company is connected, unless ALLOW_DEV_LOGIN=true forces it.
-      if (!smtp && !localAdminLockdown() && (await devLoginAllowed())) devLink = link;
+      // An exposed link, and the session it mints, is also revoked at that
+      // moment — see consumeMagicLink and requireUser.
+      const exposed = !smtp && !localAdminLockdown() && (await devLoginAllowed());
+      const { link } = await issueMagicLink(user, { exposed });
+      if (exposed) devLink = link;
     }
 
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
@@ -180,12 +183,12 @@ authRouter.post(
   asyncHandler(async (req, res) => {
     const body = req.body as { token?: unknown } | undefined;
     const token = typeof body?.token === 'string' ? body.token : '';
-    const user = token !== '' ? await consumeMagicLink(token) : null;
-    if (!user) {
+    const consumed = token !== '' ? await consumeMagicLink(token) : null;
+    if (!consumed) {
       res.redirect(`${await resolvePublicUrl()}/?auth=invalid`);
       return;
     }
-    const session = await createSession(user.id);
+    const session = await createSession(consumed.user.id, { viaExposedLink: consumed.exposed });
     res.cookie(SESSION_COOKIE, session.token, sessionCookieOptions);
     res.redirect(`${await resolvePublicUrl()}/`);
   }),

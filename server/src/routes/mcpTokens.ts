@@ -54,6 +54,7 @@ mcpTokensRouter.post(
       await createMcpToken({
         userId: req.user.id,
         label: body.label,
+        viaExposedSession: req.sessionViaExposedLink === true,
         ...(body.expiresInDays === undefined ? {} : { expiresInDays: body.expiresInDays }),
       }),
     );
