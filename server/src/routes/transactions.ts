@@ -432,6 +432,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   ATTEMPT_CORRUPT: { status: 500, message: 'Mutation state could not be verified.' },
   ATTEMPT_NOT_FOUND: { status: 404, message: 'Mutation attempt not found.' },
   COMPANY_DISCONNECTED: { status: 409, message: 'This company is disconnected from QuickBooks.' },
+  DRY_RUN_PREPARED_WRITE: {
+    status: 409,
+    message: 'Dry-run mode is on, so this prepared QuickBooks write was not sent. Turn dry-run off to finish it.',
+  },
   ENTITY_BUSY: { status: 409, message: 'Another write is already in progress.' },
   FORBIDDEN: { status: 403, message: 'You do not have permission to do that.' },
   INVALID_ACCOUNT: { status: 400, message: 'One or more category accounts are unavailable for this company.' },

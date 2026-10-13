@@ -3008,6 +3008,28 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(restarted.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['company dry-run', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.company.dryRun = true;
+    }],
+    ['DRY_RUN env', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.deps.envDryRun = true;
+    }],
+  ] as const)('holds a resumed PREPARED request without sending when %s is on', async (_label, enable) => {
+    const db = new FakeDurableDb();
+    seedAttempt(db, 'PREPARED', 'request-generic');
+    const restarted = durableDeps(db);
+    enable(restarted);
+
+    await expect(
+      commitStagedCategorization(commitInput(), restarted.deps),
+    ).rejects.toMatchObject({ code: 'DRY_RUN_PREPARED_WRITE' });
+
+    expect(restarted.getClient).not.toHaveBeenCalled();
+    expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(db.attempts[0]).toMatchObject({ status: 'PREPARED' });
+  });
+
   it('rechecks closed-period safety when resuming a persisted PREPARED request', async () => {
     const db = new FakeDurableDb();
     seedAttempt(db, 'PREPARED', 'request-generic');

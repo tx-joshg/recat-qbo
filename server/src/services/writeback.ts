@@ -3594,8 +3594,23 @@ async function commitStagedCategorizationInternal(
             'ATTEMPT_CORRUPT',
           );
         }
+        // Dry-run switched on after this write was prepared: hold it rather
+        // than send it. The attempt stays PREPARED, so the same request
+        // finishes once dry-run is off again.
+        if (txn.company.dryRun || d.envDryRun) {
+          lifecycleError(
+            'DRY_RUN_PREPARED_WRITE',
+            'Dry-run mode is on, so this prepared QuickBooks write was not sent.',
+          );
+        }
         client = await d.getClient(input.companyId);
       } catch (error) {
+        if (
+          error instanceof WritebackLifecycleError
+          && error.code === 'DRY_RUN_PREPARED_WRITE'
+        ) {
+          throw error;
+        }
         const retryable = await markRetryable(
           d,
           existing,
