@@ -8,6 +8,7 @@ import { env, isProd } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
+import { devLoginAllowed } from '../services/devLogin.js';
 import { allowedOrigins } from '../services/publicUrl.js';
 
 export const SESSION_COOKIE = 'recat_session';
@@ -29,11 +30,19 @@ export const clearCookieOptions = {
   path: '/',
 } as const;
 
-export async function createSession(userId: string): Promise<{ token: string; expiresAt: Date }> {
+/**
+ * `viaExposedLink` marks a session signed in through a magic link that was
+ * returned in a response body (the demo-mode devLink); requireUser revokes it
+ * once a real company is connected.
+ */
+export async function createSession(
+  userId: string,
+  options: { viaExposedLink?: boolean } = {},
+): Promise<{ token: string; expiresAt: Date }> {
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
   await prisma.session.create({
-    data: { tokenHash: sha256Hex(token), userId, expiresAt },
+    data: { tokenHash: sha256Hex(token), userId, expiresAt, viaExposedLink: options.viaExposedLink === true },
   });
   return { token, expiresAt };
 }
@@ -50,7 +59,10 @@ export function sessionTokenFromRequest(cookies: unknown): string | null {
 
 /**
  * Loads the session's user (with memberships — the session DTO and role gates
- * both need them) onto req.user; 401 JSON when absent or expired.
+ * both need them) onto req.user; 401 JSON when absent or expired. A session
+ * minted from a demo-mode devLink is deleted on first use after a real company
+ * connects: anyone who could reach the server during the demo window could
+ * have asked for that link, so it must not carry over to real books.
  */
 export const requireUser: RequestHandler = asyncHandler(async (req, _res, next) => {
   const token = sessionTokenFromRequest(req.cookies);
@@ -60,6 +72,10 @@ export const requireUser: RequestHandler = asyncHandler(async (req, _res, next) 
     include: { user: { include: { memberships: true } } },
   });
   if (!session || session.expiresAt.getTime() <= Date.now()) {
+    throw new HttpError(401, 'Session expired — sign in again', 'UNAUTHENTICATED');
+  }
+  if (session.viaExposedLink && !(await devLoginAllowed())) {
+    await prisma.session.deleteMany({ where: { id: session.id } });
     throw new HttpError(401, 'Session expired — sign in again', 'UNAUTHENTICATED');
   }
   req.user = session.user;

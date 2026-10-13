@@ -13,7 +13,10 @@ const mocks = vi.hoisted(() => ({
     update: vi.fn(),
   },
   sendMail: vi.fn(async () => undefined),
+  devLoginAllowed: vi.fn(async () => true),
 }));
+
+vi.mock('./devLogin.js', () => ({ devLoginAllowed: mocks.devLoginAllowed }));
 
 vi.mock('../lib/prisma.js', () => ({
   prisma: {
@@ -38,6 +41,7 @@ beforeEach(() => {
   mocks.magicLinkToken.deleteMany.mockResolvedValue({ count: 0 });
   mocks.magicLinkToken.updateMany.mockResolvedValue({ count: 1 });
   mocks.user.update.mockResolvedValue({ id: USER.id, email: USER.email, invitePending: false });
+  mocks.devLoginAllowed.mockResolvedValue(true);
 });
 
 function tokenFromLink(link: string): string {
@@ -111,12 +115,13 @@ describe('consumeMagicLink', () => {
     userId: USER.id,
     usedAt: null,
     expiresAt: new Date(Date.now() + 60_000),
+    exposed: false,
   });
 
   it('accepts a fresh token: marks used, clears invitePending, returns the user', async () => {
     mocks.magicLinkToken.findUnique.mockResolvedValue(validRecord());
 
-    const user = await consumeMagicLink('the-token');
+    const consumed = await consumeMagicLink('the-token');
 
     expect(mocks.magicLinkToken.findUnique).toHaveBeenCalledWith({
       where: { tokenHash: sha256Hex('the-token') },
@@ -129,8 +134,29 @@ describe('consumeMagicLink', () => {
       where: { id: USER.id },
       data: { invitePending: false },
     });
-    expect(user).not.toBeNull();
-    expect(user?.invitePending).toBe(false);
+    expect(consumed).not.toBeNull();
+    expect(consumed?.user.invitePending).toBe(false);
+    expect(consumed?.exposed).toBe(false);
+  });
+
+  it('accepts an exposed (devLink) token while dev login is still allowed, and reports it', async () => {
+    mocks.magicLinkToken.findUnique.mockResolvedValue({ ...validRecord(), exposed: true });
+    const consumed = await consumeMagicLink('the-token');
+    expect(consumed?.exposed).toBe(true);
+  });
+
+  it('rejects an exposed (devLink) token once a real company is connected', async () => {
+    mocks.magicLinkToken.findUnique.mockResolvedValue({ ...validRecord(), exposed: true });
+    mocks.devLoginAllowed.mockResolvedValue(false);
+    expect(await consumeMagicLink('the-token')).toBeNull();
+    expect(mocks.magicLinkToken.updateMany).not.toHaveBeenCalled();
+    expect(mocks.user.update).not.toHaveBeenCalled();
+  });
+
+  it('still accepts an emailed token once a real company is connected', async () => {
+    mocks.magicLinkToken.findUnique.mockResolvedValue(validRecord());
+    mocks.devLoginAllowed.mockResolvedValue(false);
+    expect((await consumeMagicLink('the-token'))?.exposed).toBe(false);
   });
 
   it('rejects an unknown token', async () => {

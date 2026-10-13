@@ -102,7 +102,7 @@ describe('POST /auth/magic-link — local-admin lockdown', () => {
 
       // The link is still issued — it reaches the server log for the owner —
       // but the response body must not carry it.
-      expect(mocks.issueMagicLink).toHaveBeenCalled();
+      expect(mocks.issueMagicLink).toHaveBeenCalledWith(ADMIN, { exposed: false });
       expect(res.body).not.toHaveProperty('devLink');
     });
 
@@ -124,6 +124,23 @@ describe('POST /auth/magic-link — local-admin lockdown', () => {
         data: { email: 'me-d@example.com', isInstanceAdmin: true, invitePending: false },
       });
       expect(res.body.devLink).toBeDefined();
+    });
+
+    // The returned link is marked exposed so it, and the session it mints,
+    // stop working once real books connect.
+    it('marks a returned link as exposed', async () => {
+      mocks.userFindUnique.mockResolvedValue(ADMIN);
+      const res = await post(testApp(), 'exposed-e@example.com').expect(200);
+      expect(res.body.devLink).toBeDefined();
+      expect(mocks.issueMagicLink).toHaveBeenCalledWith(ADMIN, { exposed: true });
+    });
+
+    it('neither returns nor marks the link once a real company is connected', async () => {
+      mocks.userFindUnique.mockResolvedValue(ADMIN);
+      mocks.companyCount.mockResolvedValue(1);
+      const res = await post(testApp(), 'locked-f@example.com').expect(200);
+      expect(res.body).not.toHaveProperty('devLink');
+      expect(mocks.issueMagicLink).toHaveBeenCalledWith(ADMIN, { exposed: false });
     });
   });
 
