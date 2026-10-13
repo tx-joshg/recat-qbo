@@ -550,9 +550,10 @@ receiptsRouter.post(
       attachmentContentDisposition(exported.filename, 'attachment'),
     );
     res.setHeader('Cache-Control', 'private, no-store');
+    // A client that disconnects mid-download must still release the archive
+    // and any open file readers.
+    res.once('close', () => exported.stream.destroy());
     if (!(await streamToResponse(exported.stream, res, false))) {
-      // The client left; the archive is torn down with the stream, so its
-      // completion no longer matters and must not surface as unhandled.
       exported.completed.catch(() => undefined);
       return;
     }
