@@ -28,6 +28,7 @@ import {
   type DeleteAttachmentInput,
 } from '../attachments/operations.js';
 import {
+  candidateAmountRange,
   rankReceiptCandidates,
   type MatchableTransaction,
   type ScoredReceiptCandidate,
@@ -196,11 +197,25 @@ export async function buildReceiptMatches(
       );
     }
 
-    const transactions = await tx.transaction.findMany({
+    // Filter by the amounts the matcher can score before capping the rows, so
+    // a busy company's true match is not crowded out by unrelated newer rows.
+    const amountRange = candidateAmountRange(
+      attempt.totalAmount?.toString() ?? null,
+    );
+    const transactions = amountRange === null ? [] : await tx.transaction.findMany({
       where: {
         companyId: receipt.companyId,
         status: { in: [...ACTIVE_TRANSACTION_STATUSES] },
         ...transactionDirectionFilter(attempt.documentType),
+        OR: [
+          { amount: { gte: amountRange.min, lte: amountRange.max } },
+          {
+            amount: {
+              gte: `-${amountRange.max}`,
+              lte: `-${amountRange.min}`,
+            },
+          },
+        ],
         ...(attempt.receiptDate
           ? {
             date: {

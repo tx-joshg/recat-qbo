@@ -260,6 +260,35 @@ describePostgres('receipt matching persistence on PostgreSQL', () => {
       .toContain(compatible.id);
   });
 
+  it('finds an early-window match in a busy company by filtering on amount first', async () => {
+    const value = await fixture({ autoMatchThreshold: 101 });
+    const early = await transaction(value.owner.id, { date: '2026-07-17' });
+    await db.transaction.createMany({
+      data: Array.from({ length: 150 }, (_, index) => ({
+        companyId: value.owner.id,
+        qboId: `busy-unrelated-${index}-${randomUUID()}`,
+        qboType: 'Purchase',
+        qboSyncToken: '0',
+        date: new Date('2026-08-12T00:00:00.000Z'),
+        payee: 'Synthetic Other Vendor',
+        memo: null,
+        amount: `-${(200 + index).toFixed(2)}`,
+        bankAccount: 'Synthetic Bank',
+        status: 'PENDING' as const,
+        rawData: { CurrencyRef: { value: 'CAD' } },
+      })),
+    });
+
+    const result = await buildReceiptMatches(
+      value.receipt.id,
+      1,
+      deps(),
+    );
+
+    expect(result.candidates.map((candidate) => candidate.transactionId))
+      .toEqual([early.id]);
+  });
+
   it('auto-matches locally only when score and margin clear policy', async () => {
     const value = await fixture({
       autoMatchThreshold: 85,
