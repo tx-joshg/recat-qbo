@@ -283,25 +283,36 @@ export async function exportReceipts(
   const archive = new ZipArchive({ store: true });
   const output = byteLimitStream(MAX_EXPORT_BYTES);
   archive.pipe(output);
+  // archiver never listens for `error` on entry streams, so an unreadable
+  // file would otherwise be an unhandled 'error' event that exits the
+  // process. Every failure is routed here instead: stop the archive and
+  // fail the output stream the caller is reading.
+  const fail = (error: unknown): void => {
+    if (output.destroyed) return;
+    archive.abort();
+    output.destroy(error instanceof Error ? error : new Error(String(error)));
+  };
   const archiveDone = new Promise<void>((resolve, reject) => {
     output.once('end', resolve);
     output.once('error', reject);
     archive.once('error', reject);
     archive.on('warning', (error: Error) => reject(error));
   });
+  archive.once('error', fail);
+  archive.on('warning', fail);
   archive.append(buildReceiptCsv(orderedRows.map(projectedExportDto)), {
     name: 'receipts.csv',
     date: new Date(0),
   });
   for (const row of orderedRows) {
-    archive.append(lazyFileStream(row, deps), {
+    const entry = lazyFileStream(row, deps);
+    entry.once('error', fail);
+    archive.append(entry, {
       name: `files/${row.id}-${safeArchiveFilename(row.originalFilename)}`,
       date: new Date(0),
     });
   }
-  void archive.finalize().catch((error: unknown) => {
-    output.destroy(error instanceof Error ? error : new Error(String(error)));
-  });
+  void archive.finalize().catch(fail);
 
   const completed = archiveDone.then(async () => {
     await db.$transaction(async (transaction) => {
@@ -320,6 +331,10 @@ export async function exportReceipts(
       });
     });
   });
+  // A caller that stops at a stream error may never await `completed`;
+  // keep that from becoming an unhandled rejection. Awaiting it still
+  // rejects.
+  completed.catch(() => undefined);
 
   return {
     filename: `recat-receipts-${now.toISOString().slice(0, 10)}.zip`,

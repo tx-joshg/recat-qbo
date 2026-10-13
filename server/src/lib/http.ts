@@ -30,6 +30,14 @@ export function asyncHandler(
 
 /** Central error handler: HttpError → its status + {error, code}; anything else → 500. */
 export const errorMiddleware: ErrorRequestHandler = (err, _req, res, _next) => {
+  if (res.headersSent) {
+    // A streamed response failed partway through; a status or JSON body can
+    // no longer be sent, so cut the connection and let the client see the
+    // truncated download.
+    console.error('[recat] error after response started:', err);
+    res.destroy();
+    return;
+  }
   if (err instanceof HttpError) {
     const body: ApiError = {
       error: err.message,
