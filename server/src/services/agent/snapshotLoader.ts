@@ -8,11 +8,13 @@ const REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/u;
 const ASSIGNED_CURRENCY_CODES = new Set(Intl.supportedValuesOf('currency'));
 // SQL mirror of normalizePayee: uppercase, treat '#', '*' and '·' as
-// separators, drop tokens containing a digit. Verified history is evidence
-// only when its payee normalizes to the same key as the current transaction.
+// separators, split on the same whitespace set as JS \s, and drop tokens
+// containing a digit. Verified history is evidence only when its payee
+// normalizes to the same key as the current transaction.
 const NORMALIZED_PAYEE_SQL = `array_to_string(ARRAY(
   SELECT token.value
-  FROM regexp_split_to_table(upper(translate(txn."payee", '#*·', '   ')), '\\s+')
+  FROM regexp_split_to_table(upper(translate(txn."payee", '#*·', '   ')),
+    '[\\s\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]+')
     WITH ORDINALITY AS token(value, ord)
   WHERE token.value <> '' AND token.value !~ '[0-9]'
   ORDER BY token.ord

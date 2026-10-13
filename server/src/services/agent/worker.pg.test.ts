@@ -158,7 +158,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         qboType: 'Purchase',
         qboSyncToken: '2',
         date: new Date('2026-07-20T00:00:00.000Z'),
-        payee: 'GENERIC MERCHANT #4471',
+        payee: 'GENERIC\u00a0MERCHANT #4471',
         amount: '-10.00',
         bankAccount: 'Sensitive source label',
         status: 'POSTED',
