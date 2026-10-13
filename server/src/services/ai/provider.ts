@@ -20,6 +20,8 @@ const COMPLETION_TIMEOUT_MS = 30_000;
 export async function completeCategory(
   prompt: string,
   providerSettings?: CategoryProviderSettings,
+  /** Aborts the request early, e.g. when a caller's overall budget runs out. */
+  signal?: AbortSignal,
 ): Promise<string | null> {
   try {
     const settings = providerSettings ?? await getInstanceSettings();
@@ -34,13 +36,14 @@ export async function completeCategory(
       ...(openrouter && settings.openrouterReferer ? { 'HTTP-Referer': settings.openrouterReferer } : {}),
       ...(openrouter && settings.openrouterTitle ? { 'X-Title': settings.openrouterTitle } : {}),
     };
+    if (signal?.aborted) return null;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), COMPLETION_TIMEOUT_MS);
     try {
       const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
         headers,
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
         body: JSON.stringify({
           model: settings.suggestionModel,
           temperature: 0,
