@@ -177,6 +177,91 @@ describePostgres('attachment PostgreSQL blob store', () => {
     })).resolves.toBe(0);
   }, 30_000);
 
+  it('refuses an over-quota upload before the rest of it is streamed', async () => {
+    const company = await createCompany();
+    const policyDefaults = {
+      companyQuotaBytes: 2n * MIB,
+      instanceQuotaBytes: 1024n * MIB,
+      retentionDays: 365,
+    };
+    let yieldedBytes = 0;
+    async function* large() {
+      const chunk = pdfFixture(Number(MIB), 41);
+      for (let index = 0; index < 40; index += 1) {
+        yieldedBytes += chunk.byteLength;
+        yield chunk;
+      }
+    }
+
+    await expect(stageAttachment({
+      companyId: company.id,
+      actorKey: `user:${randomUUID()}`,
+      sourceKind: 'LOCAL_UPLOAD',
+      retainLocally: true,
+      filename: 'receipt.pdf',
+      declaredContentType: 'application/pdf',
+      content: large(),
+      expiresAt: new Date(Date.now() + 60_000),
+    }, { db, policyDefaults })).rejects.toMatchObject({
+      code: 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED',
+    });
+
+    expect(yieldedBytes).toBeLessThanOrEqual(4 * Number(MIB));
+    await expect(db.attachmentBlob.count({
+      where: { companyId: company.id },
+    })).resolves.toBe(0);
+  }, 30_000);
+
+  it('counts an in-flight upload reservation against a concurrent upload', async () => {
+    const company = await createCompany();
+    const policyDefaults = {
+      companyQuotaBytes: 10n * MIB,
+      instanceQuotaBytes: 1024n * MIB,
+      retentionDays: 365,
+    };
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let firstChunkYielded!: () => void;
+    const firstChunkSent = new Promise<void>((resolve) => { firstChunkYielded = resolve; });
+    async function* paused() {
+      yield pdfFixture(Number(MIB), 51);
+      firstChunkYielded();
+      await released;
+      yield new Uint8Array(1024).fill(52);
+    }
+    const first = stageAttachment({
+      companyId: company.id,
+      actorKey: `user:${randomUUID()}`,
+      sourceKind: 'LOCAL_UPLOAD',
+      retainLocally: true,
+      filename: 'receipt.pdf',
+      declaredContentType: 'application/pdf',
+      content: paused(),
+      expiresAt: new Date(Date.now() + 60_000),
+    }, { db, policyDefaults });
+    await firstChunkSent;
+    await expect.poll(() => db.attachmentBlob.count({
+      where: { companyId: company.id, state: 'STAGING', sizeBytes: { gt: 0n } },
+    })).toBe(1);
+
+    await expect(stage(
+      company.id,
+      pdfFixture(3 * Number(MIB), 53),
+      undefined,
+      { policyDefaults },
+    )).rejects.toMatchObject({ code: 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED' });
+    // A file that fits beside the reservation is still accepted.
+    await expect(stage(
+      company.id,
+      pdfFixture(Number(MIB), 54),
+      undefined,
+      { policyDefaults },
+    )).resolves.toMatchObject({ sizeBytes: Number(MIB) });
+
+    release();
+    await expect(first).resolves.toMatchObject({ sizeBytes: Number(MIB) + 1024 });
+  }, 30_000);
+
   it('serializes concurrent companies at the instance boundary', async () => {
     const firstCompany = await createCompany();
     const secondCompany = await createCompany();
