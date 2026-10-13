@@ -236,4 +236,39 @@ describe('receipt export', () => {
       process.off('unhandledRejection', unhandled);
     }
   });
+  it('releases open file readers when the consumer abandons the stream', async () => {
+    const { db, updateMany } = exportDb([exportRow('receipt-a', 'blob-a')]);
+    let readerClosed = false;
+    const result = await exportReceipts({
+      companyId: 'company-1',
+      actorUserId: 'user-1',
+      documentIds: ['receipt-a'],
+    }, {
+      db,
+      openBlob: async (_companyId, blobId) => ({
+        blobId,
+        contentType: 'application/octet-stream',
+        sizeBytes: 4,
+        chunks: async function* () {
+          try {
+            for (;;) {
+              yield Buffer.alloc(64 * 1024);
+              await new Promise((resolve) => setTimeout(resolve, 1));
+            }
+          } finally {
+            readerClosed = true;
+          }
+        },
+      }),
+    });
+
+    for await (const _chunk of result.stream) {
+      result.stream.destroy();
+      break;
+    }
+    await expect(result.completed).rejects.toThrow('closed before completion');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(readerClosed).toBe(true);
+    expect(updateMany).not.toHaveBeenCalled();
+  });
 });

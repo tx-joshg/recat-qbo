@@ -289,12 +289,23 @@ export async function exportReceipts(
   // fail the output stream the caller is reading.
   const fail = (error: unknown): void => {
     if (output.destroyed) return;
-    archive.abort();
     output.destroy(error instanceof Error ? error : new Error(String(error)));
   };
+  // Piping never propagates a failed or abandoned output upstream (the
+  // byte limit tripping, the client disconnecting), so release the archive
+  // and every open blob/QBO reader here whenever the output closes early.
+  const entries: Readable[] = [];
+  output.once('close', () => {
+    if (output.readableEnded) return;
+    archive.abort();
+    for (const entry of entries) entry.destroy();
+  });
   const archiveDone = new Promise<void>((resolve, reject) => {
     output.once('end', resolve);
     output.once('error', reject);
+    output.once('close', () => reject(
+      new Error('Receipt export stream closed before completion.'),
+    ));
     archive.once('error', reject);
     archive.on('warning', (error: Error) => reject(error));
   });
@@ -307,6 +318,7 @@ export async function exportReceipts(
   for (const row of orderedRows) {
     const entry = lazyFileStream(row, deps);
     entry.once('error', fail);
+    entries.push(entry);
     archive.append(entry, {
       name: `files/${row.id}-${safeArchiveFilename(row.originalFilename)}`,
       date: new Date(0),
