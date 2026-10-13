@@ -347,4 +347,29 @@ describe('AI cache binding', () => {
     expect(mocks.company.findUnique).toHaveBeenCalledTimes(1);
     expect(mocks.qboAccount.findMany).toHaveBeenCalledTimes(1);
   });
+
+  it('stops waiting on AI once the sync budget is spent and keeps stored snapshots', async () => {
+    const companyId = 'ai-budget-hung-endpoint';
+    const previous = { category: 'Office supplies', categoryQboId: '1', source: 'ai' };
+    const rows = [
+      { id: 'txn-a', payee: 'Example hung alpha', memo: null, amount: -25, suggestion: null },
+      { id: 'txn-b', payee: 'Example hung beta', memo: null, amount: -30, suggestion: previous },
+      { id: 'txn-c', payee: 'Example hung gamma', memo: null, amount: -35, suggestion: previous },
+    ];
+    mocks.transaction.findMany.mockImplementation(async (args: { where: { status: unknown } }) => (
+      args.where.status === 'PENDING' ? rows : []
+    ));
+    // A provider that never answers until the request is aborted.
+    mocks.fetch.mockImplementation((_url: string, init: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      }));
+
+    const started = Date.now();
+    await refreshSuggestions(companyId, { aiBudgetMs: 50 });
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    expect(mocks.transaction.update).not.toHaveBeenCalled();
+  });
 });

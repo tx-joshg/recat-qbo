@@ -116,6 +116,13 @@ docker compose up -d
 open http://localhost:3001  # first-run setup wizard takes it from here
 ```
 
+Until the first admin account exists, anyone who can reach the setup wizard can
+claim the instance, so the compose file publishes port 3001 on `127.0.0.1`
+only. To use Recat from another machine, finish setup locally first (or set
+`LOCAL_ADMIN_EMAIL`/`LOCAL_ADMIN_PASSWORD`, which the wizard then requires),
+then set `RECAT_BIND_ADDRESS=0.0.0.0` in `.env` and run `docker compose up -d`
+again.
+
 Prebuilt images are published to `ghcr.io/tx-joshg/recat-qbo` for **`linux/amd64` and `linux/arm64`**, so the same tag works on an x86 server, an Apple Silicon Mac, or a Raspberry Pi running a 64-bit OS. There is no 32-bit (`linux/arm/v7`) image.
 
 The wizard walks you through everything: how you want to start (demo or real) → admin account → Intuit keys (real path only) → email (SMTP, skippable) → connect QuickBooks → pick holding accounts → first sync. For the real path you'll need free QuickBooks API credentials from the [Intuit Developer Portal](https://developer.intuit.com) — **[docs/intuit-setup.md](docs/intuit-setup.md) walks you through it step by step**, including the production-access questionnaire.

@@ -943,6 +943,9 @@ model AgentCompanyConfig {
   decisionModel               String
   verifierModel               String
   scheduleMinutes             Int       @default(10)
+  /// Start of the last scheduler tick that finished job discovery. Lets a
+  /// skipped or overlong tick catch up instead of waiting a whole period.
+  lastDiscoveredAt            DateTime?
   companyConcurrency          Int       @default(1)
   evidenceThreshold           Int       @default(50)
   dailyLiveWriteLimit         Int       @default(25)

@@ -113,11 +113,26 @@ async function dtoById(id: string): Promise<TransactionDto> {
 
 const txnStatusSchema = z.enum(['PENDING', 'POSTING', 'POSTED', 'DRY_RUN', 'ERROR', 'SUPERSEDED', 'REVERTED']);
 
+const MAX_LIST_IDS = 200;
+/**
+ * Finished rows stay in the queue for this long after their last change, so
+ * the full reload does not grow with a company's entire posting history.
+ */
+export const QUEUE_COMPLETED_HISTORY_DAYS = 90;
+
 const listQuery = z.object({
   status: txnStatusSchema.optional(),
   search: z.string().optional(),
   account: z.string().optional(),
   cursor: z.string().optional(),
+  /** Comma-separated ids: refresh just these rows instead of the whole queue. */
+  ids: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? undefined : [...new Set(v.split(',').map((id) => id.trim()).filter((id) => id !== ''))]))
+    .refine((v) => v === undefined || (v.length >= 1 && v.length <= MAX_LIST_IDS && v.every((id) => id.length <= 64)), {
+      message: `ids must list 1 to ${MAX_LIST_IDS} transaction ids`,
+    }),
   countOnly: z
     .string()
     .optional()
@@ -144,9 +159,21 @@ companyTransactionsRouter.get(
     }
 
     // The queue shows posted/dry-run/error rows too; only SUPERSEDED is hidden.
-    // Prototype order: date ascending as entered.
+    // Finished rows are limited to recent history; a refresh by id returns the
+    // named rows whatever their age. Prototype order: date ascending as entered.
+    const historySince = new Date(
+      Date.now() - QUEUE_COMPLETED_HISTORY_DAYS * 24 * 60 * 60 * 1000,
+    );
     const rows = await prisma.transaction.findMany({
-      where: { companyId: company.id, status: { not: 'SUPERSEDED' } },
+      where: query.ids !== undefined
+        ? { companyId: company.id, status: { not: 'SUPERSEDED' }, id: { in: query.ids } }
+        : {
+          companyId: company.id,
+          OR: [
+            { status: { in: ['PENDING', 'POSTING', 'ERROR'] } },
+            { status: { in: ['POSTED', 'DRY_RUN', 'REVERTED'] }, updatedAt: { gte: historySince } },
+          ],
+        },
       include: transactionReadInclude,
       orderBy: { date: 'asc' },
     });

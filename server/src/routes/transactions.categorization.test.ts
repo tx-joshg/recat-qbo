@@ -258,8 +258,57 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(200);
     expect(response.body.transactions).toEqual([]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { companyId: COMPANY_ID, status: { not: 'SUPERSEDED' } },
+      where: {
+        companyId: COMPANY_ID,
+        OR: [
+          { status: { in: ['PENDING', 'POSTING', 'ERROR'] } },
+          { status: { in: ['POSTED', 'DRY_RUN', 'REVERTED'] }, updatedAt: { gte: expect.any(Date) } },
+        ],
+      },
     }));
+  });
+
+  it('limits finished rows in a full queue read to recent history', async () => {
+    mocks.transactionFindMany.mockResolvedValue([]);
+    const before = Date.now();
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    const where = mocks.transactionFindMany.mock.calls
+      .map(([args]) => (args as { where?: { OR?: unknown } } | undefined)?.where)
+      .find((candidate) => candidate?.OR !== undefined) as {
+        OR: [unknown, { updatedAt: { gte: Date } }];
+      };
+    const since = where.OR[1].updatedAt.gte.getTime();
+    const ninetyDays = 90 * 24 * 60 * 60 * 1000;
+    expect(since).toBeGreaterThanOrEqual(before - ninetyDays - 1_000);
+    expect(since).toBeLessThanOrEqual(Date.now() - ninetyDays + 1_000);
+  });
+
+  it('refreshes only the named rows, whatever their age', async () => {
+    mocks.transactionFindMany.mockResolvedValue([]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions?ids=txn-1,txn-2,txn-1`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: COMPANY_ID, status: { not: 'SUPERSEDED' }, id: { in: ['txn-1', 'txn-2'] } },
+    }));
+  });
+
+  it('rejects an oversized id refresh', async () => {
+    const ids = Array.from({ length: 201 }, (_, index) => `txn-${index}`).join(',');
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions?ids=${ids}`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(400);
   });
 
   it('exposes the current revision and staged transaction tax identity for reloads', async () => {
