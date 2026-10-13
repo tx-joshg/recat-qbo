@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { env } from '../../env.js';
 import { prisma } from '../../lib/prisma.js';
 import { qboFactory } from '../../lib/qbo/factory.js';
 import type {
@@ -1640,6 +1641,52 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
         errorCode: 'LIVE_MUTATION_RETRY_EXHAUSTED',
       });
     } finally {
+      factory.mockRestore();
+      await cleanup(fixture);
+    }
+  });
+
+  it('keeps a PREPARED live recovery retryable while DRY_RUN is on', async () => {
+    const fixture = await seed();
+    await createCheckpointRun(fixture);
+    await prisma.qboMutationAttempt.create({
+      data: {
+        transactionId: fixture.transactionId,
+        requestId: fixture.jobId,
+        operation: 'recategorize',
+        status: 'PREPARED',
+        expectedRevision: 1,
+        expectedSyncToken: '7',
+        requestHash: prepared(fixture).requestHash,
+        requestPayload: prepared(fixture) as unknown as Prisma.InputJsonValue,
+        beforeSnapshot: beforeSnapshot(fixture) as unknown as Prisma.InputJsonValue,
+      },
+    });
+    const claimed = await expireAndClaim(fixture);
+    const factory = vi.spyOn(qboFactory, 'forCompany');
+    const previousDryRun = env.DRY_RUN;
+    env.DRY_RUN = true;
+    try {
+      await expect(runProductionClaimedLiveRecovery(
+        claimed,
+        'worker-recovery',
+      )).resolves.toBe(true);
+      expect(factory).not.toHaveBeenCalled();
+      await expect(prisma.agentJob.findUniqueOrThrow({
+        where: { id: fixture.jobId },
+      })).resolves.toMatchObject({
+        status: 'retry',
+        attemptCount: 2,
+        lastErrorCode: 'DRY_RUN_PREPARED_WRITE',
+      });
+      await expect(prisma.qboMutationAttempt.findUniqueOrThrow({
+        where: { requestId: fixture.jobId },
+      })).resolves.toMatchObject({
+        status: 'RETRYABLE',
+        errorCode: 'DRY_RUN_PREPARED_WRITE',
+      });
+    } finally {
+      env.DRY_RUN = previousDryRun;
       factory.mockRestore();
       await cleanup(fixture);
     }

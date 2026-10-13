@@ -1,8 +1,8 @@
 // Background jobs: polling sync loop, nightly reconcile, daily digest, and the
 // stuck-POSTING sweep (boot + every tick).
 // A single 60-second ticker drives them; per-company syncs never overlap
-// (in-flight set) and the dailies are guarded by a last-run date so they fire
-// exactly once per day even though the ticker runs every minute.
+// (in-flight set) and the dailies are guarded by a last-run date, claimed in
+// the database, so they fire once per day even across several instances.
 
 import { env } from '../env.js';
 import { isSmtpConfigured, sendMail } from '../lib/mailer.js';
@@ -23,6 +23,7 @@ import { sweepQboTokenRevocations } from '../services/qboTokenRevocation.js';
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
 const STUCK_POSTING_MS = 5 * 60 * 1000;
+const SLACK_TIMEOUT_MS = 10_000;
 
 let ticker: NodeJS.Timeout | null = null;
 const inFlight = new Set<string>();
@@ -59,11 +60,14 @@ export async function sweepStuckPosting(): Promise<void> {
   });
   for (const txn of stuck) {
     try {
-      await prisma.$transaction(async (tx) => {
-        await tx.transaction.update({
-          where: { id: txn.id },
+      const swept = await prisma.$transaction(async (tx) => {
+        // Re-check the status in the write itself: the post may have finished
+        // (or another instance swept it) between the read above and now.
+        const moved = await tx.transaction.updateMany({
+          where: { id: txn.id, status: 'POSTING', updatedAt: { lt: cutoff } },
           data: { status: 'ERROR', errorCode: 'STUCK_POSTING', errorMessage: STUCK_POSTING_MESSAGE },
         });
+        if (moved.count === 0) return false;
         await writeAudit(tx, {
           companyId: txn.companyId,
           actorId: null,
@@ -75,12 +79,70 @@ export async function sweepStuckPosting(): Promise<void> {
           before: 'POSTING (stuck)',
           after: STUCK_POSTING_MESSAGE,
         });
+        return true;
       });
+      if (!swept) continue;
       console.warn(`[jobs] stuck POSTING txn ${txn.id} (${txn.payee}) moved to ERROR`);
     } catch (err) {
       console.error(`[jobs] could not sweep stuck POSTING txn ${txn.id}:`, err);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Once-a-day claims — the in-process date guards stop a single process from
+// repeating a daily job, but several app instances sharing one database would
+// each run it. The run is claimed with one atomic upsert on AppConfig and
+// marked done when it finishes. A claim whose instance died before finishing
+// is reclaimable once its 15-minute lease runs out, so a crash does not skip
+// the day.
+// ---------------------------------------------------------------------------
+
+export type DailyRunClaim = 'claimed' | 'done' | 'busy';
+
+export async function claimDailyRun(job: 'nightly' | 'digest', day: string): Promise<DailyRunClaim> {
+  const key = `jobs.lastRun.${job}`;
+  const claimed = await prisma.$queryRaw<{ key: string }[]>`
+    INSERT INTO "AppConfig" ("key", "value", "encrypted", "updatedAt")
+    VALUES (${key}, ${`${day}|running`}, false, now())
+    ON CONFLICT ("key") DO UPDATE
+      SET "value" = EXCLUDED."value", "updatedAt" = now()
+      WHERE split_part("AppConfig"."value", '|', 1) <> ${day}
+         OR (
+           split_part("AppConfig"."value", '|', 2) = 'running'
+           AND "AppConfig"."updatedAt" < now() - interval '15 minutes'
+         )
+    RETURNING "key"`;
+  if (claimed.length === 1) return 'claimed';
+  const row = await prisma.appConfig.findUnique({ where: { key } });
+  return row?.value === `${day}|running` ? 'busy' : 'done';
+}
+
+export async function completeDailyRun(job: 'nightly' | 'digest', day: string): Promise<void> {
+  await prisma.appConfig.updateMany({
+    where: { key: `jobs.lastRun.${job}`, value: `${day}|running` },
+    data: { value: `${day}|done` },
+  });
+}
+
+/**
+ * Runs `work` at most once per day across instances. Returns true once the
+ * day's run is settled here (ran, or another instance already finished it);
+ * false while another instance holds the claim, so the caller tries again on
+ * a later tick.
+ */
+async function runDailyOnce(
+  job: 'nightly' | 'digest',
+  day: string,
+  work: () => Promise<void>,
+): Promise<boolean> {
+  const claim = await claimDailyRun(job, day);
+  if (claim === 'busy') return false;
+  if (claim === 'claimed') {
+    await work();
+    await completeDailyRun(job, day);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,9 +167,11 @@ async function pollTick(now: Date): Promise<void> {
 
 async function nightlyTick(now: Date): Promise<void> {
   if (now.getHours() !== NIGHTLY_HOUR || lastNightlyDate === dateKey(now)) return;
-  lastNightlyDate = dateKey(now);
-  const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
-  for (const c of companies) runSync(c.id, 'nightly');
+  const settled = await runDailyOnce('nightly', dateKey(now), async () => {
+    const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
+    for (const c of companies) runSync(c.id, 'nightly');
+  });
+  if (settled) lastNightlyDate = dateKey(now);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +180,10 @@ async function nightlyTick(now: Date): Promise<void> {
 
 async function digestTick(now: Date): Promise<void> {
   if (now.getHours() !== env.DIGEST_HOUR || lastDigestDate === dateKey(now)) return;
-  lastDigestDate = dateKey(now);
+  if (await runDailyOnce('digest', dateKey(now), sendDigest)) lastDigestDate = dateKey(now);
+}
 
+async function sendDigest(): Promise<void> {
   const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
   const lines: string[] = [];
   for (const c of companies) {
@@ -149,6 +215,7 @@ async function digestTick(now: Date): Promise<void> {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
+        signal: AbortSignal.timeout(SLACK_TIMEOUT_MS),
       });
     } catch (err) {
       console.error('[jobs] digest Slack notification failed:', err);

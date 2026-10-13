@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   agentJobCount: vi.fn(),
   agentJobFindFirst: vi.fn(),
   agentJobUpdateMany: vi.fn(),
+  cancelQueuedAgentJobs: vi.fn(),
   agentRunFindFirst: vi.fn(),
   agentRunFindMany: vi.fn(),
   qboMutationAttemptFindMany: vi.fn(),
@@ -79,6 +80,11 @@ vi.mock('../services/agent/liveGates.js', () => ({
   },
   enableLiveModeForAdmin: mocks.enableLiveModeForAdmin,
   evaluateLiveGates: mocks.evaluateLiveGates,
+}));
+
+vi.mock('../services/agent/jobs.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/agent/jobs.js')>(),
+  cancelQueuedAgentJobs: mocks.cancelQueuedAgentJobs,
 }));
 
 vi.mock('../services/agent/circuitBreaker.js', () => ({
@@ -383,6 +389,7 @@ beforeEach(() => {
         : { dueAt: new Date('2026-07-29T09:00:00.000Z') },
   );
   mocks.agentJobUpdateMany.mockResolvedValue({ count: 4 });
+  mocks.cancelQueuedAgentJobs.mockResolvedValue({ cancelled: 4, kept: 1 });
   mocks.agentRunFindMany.mockResolvedValue([
     run,
     {
@@ -685,7 +692,7 @@ describe('autopilot safe operational responses', () => {
     }));
   });
 
-  it('cancels only queued and retry jobs without deleting history or touching running leases', async () => {
+  it('cancels queued work through the guarded job service for admins only', async () => {
     const app = testApp();
     role = 'categorizer';
     const forbidden = await request(app)
@@ -699,19 +706,10 @@ describe('autopilot safe operational responses', () => {
 
     expect(forbidden.status).toBe(403);
     expect(cancelled.status).toBe(200);
-    expect(cancelled.body).toEqual({ cancelled: 4 });
-    expect(mocks.agentJobUpdateMany).toHaveBeenCalledWith({
-      where: {
-        companyId: COMPANY_ID,
-        status: { in: ['queued', 'retry'] },
-      },
-      data: {
-        status: 'cancelled',
-        lockOwner: null,
-        leaseExpiresAt: null,
-        lastErrorCode: 'AGENT_CANCELLED_BY_ADMIN',
-      },
-    });
+    expect(cancelled.body).toEqual({ cancelled: 4, kept: 1 });
+    expect(mocks.cancelQueuedAgentJobs).toHaveBeenCalledTimes(1);
+    expect(mocks.cancelQueuedAgentJobs).toHaveBeenCalledWith(COMPANY_ID);
+    expect(mocks.agentJobUpdateMany).not.toHaveBeenCalled();
     expect(mocks.agentRunFindMany).not.toHaveBeenCalled();
   });
 });

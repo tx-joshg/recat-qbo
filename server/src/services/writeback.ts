@@ -157,8 +157,22 @@ export function validateSplits(txnAmount: number, splits: { amount: number }[]):
       };
     }
   }
-  const sum = splits.reduce((acc, s) => acc + s.amount, 0);
-  if (Math.abs(sum - txnAmount) > 0.005) {
+  // Compare in whole cents. Split lines are stored to the cent, so a staged
+  // -10.004 would pass a half-cent float tolerance here and then fail this
+  // same check at post time once storage had rounded it.
+  const splitCents: number[] = [];
+  for (const s of splits) {
+    // Exact-cent check without an epsilon: an integer over 100 rounds to the
+    // same double as the decimal literal it stands for, so a whole-cent
+    // amount round-trips even where amount * 100 picks up float noise.
+    const cents = Math.round(s.amount * 100);
+    if (cents / 100 !== s.amount) {
+      return { ok: false, message: 'Split amounts must be whole cents.' };
+    }
+    splitCents.push(cents);
+  }
+  const sum = splitCents.reduce((acc, cents) => acc + cents, 0);
+  if (sum !== Math.round(txnAmount * 100)) {
     return { ok: false, message: 'Split amounts must add up to the transaction amount.' };
   }
   return { ok: true };
@@ -3716,8 +3730,27 @@ async function commitStagedCategorizationInternal(
             'ATTEMPT_CORRUPT',
           );
         }
+        // Dry-run switched on after this write was prepared: hold it rather
+        // than send it. The attempt stays PREPARED, so the same request
+        // finishes once dry-run is off again.
+        if (txn.company.dryRun || d.envDryRun) {
+          lifecycleError(
+            'DRY_RUN_PREPARED_WRITE',
+            'Dry-run mode is on, so this prepared QuickBooks write was not sent.',
+          );
+        }
         client = await d.getClient(input.companyId);
       } catch (error) {
+        // A person's request keeps its PREPARED attempt to finish later. An
+        // autopilot job takes the usual bounded retry path instead, so the
+        // attempt is retired rather than stranded if its retries run out.
+        if (
+          autopilot === undefined
+          && error instanceof WritebackLifecycleError
+          && error.code === 'DRY_RUN_PREPARED_WRITE'
+        ) {
+          throw error;
+        }
         const retryable = await markRetryable(
           d,
           existing,

@@ -727,6 +727,7 @@ function isLiveMutationFailure(error: unknown): boolean {
   const code = safeErrorCode(error);
   return code === 'LIVE_AUTHORITY_DENIED'
     || code === 'COMPANY_DISCONNECTED'
+    || code === 'DRY_RUN_PREPARED_WRITE'
     || code === 'LIVE_MUTATION_RETRY_EXHAUSTED';
 }
 
@@ -1577,8 +1578,11 @@ export async function finishProductionLiveRun(
     const transientVerifierFailure = completion.errorCode === 'MODEL_HEALTH_UNAVAILABLE'
       || completion.errorCode === 'LIVE_VERIFIER_TIMEOUT'
       || completion.errorCode === 'LIVE_VERIFIER_UNAVAILABLE';
+    // Dry-run switched on under a prepared live write is the same kind of
+    // pause as lost authority: keep the job so its retry can finish the write.
     const transientAuthorityLoss = completion.errorCode === 'LIVE_AUTHORITY_DENIED'
-      || completion.errorCode === 'COMPANY_DISCONNECTED';
+      || completion.errorCode === 'COMPANY_DISCONNECTED'
+      || completion.errorCode === 'DRY_RUN_PREPARED_WRITE';
     const transient = job.attemptCount < 3
       && (
         completion.status === 'retryable'

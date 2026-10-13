@@ -17,7 +17,7 @@ import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
-import { devLoginAllowed } from '../services/devLogin.js';
+import { devLoginAllowed, localAdminLockdown } from '../services/devLogin.js';
 import { issueMagicLink } from '../services/magicLink.js';
 
 const roleSchema = z.enum(['admin', 'categorizer', 'viewer']);
@@ -116,7 +116,12 @@ teamRouter.post(
     // New users get an invite link; existing users already sign in on their own.
     let devLink: string | undefined;
     if (isNew) {
-      const exposed = !(await isSmtpConfigured()) && (await devLoginAllowed());
+      // Same policy as /auth/magic-link: on a local-admin deployment a
+      // response-body link would let the inviting admin sign in as the
+      // invitee, so it only ever reaches the server log.
+      const exposed = !(await isSmtpConfigured())
+        && !localAdminLockdown()
+        && (await devLoginAllowed());
       const { link } = await issueMagicLink(user, { invite: true, exposed });
       if (exposed) devLink = link;
     }

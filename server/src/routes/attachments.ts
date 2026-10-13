@@ -10,6 +10,7 @@ import type {
 import { sha256Hex } from '../lib/crypto.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
+import { streamToResponse } from '../lib/responseStream.js';
 import { qboFactory } from '../lib/qbo/factory.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
@@ -350,11 +351,7 @@ async function streamAttachmentResponse(
   res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
   res.setHeader('Cache-Control', 'private, no-store');
   if (sizeBytes !== null) res.setHeader('Content-Length', String(sizeBytes));
-  for await (const chunk of body) {
-    if (res.destroyed) return;
-    if (!res.write(chunk)) await once(res, 'drain');
-  }
-  res.end();
+  await streamToResponse(body, res);
 }
 
 export const companyAttachmentGrantsRouter = Router({ mergeParams: true });

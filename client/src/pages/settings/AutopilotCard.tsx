@@ -512,12 +512,17 @@ export default function AutopilotCard({
             queue: {
               ...current.queue,
               queued: 0,
-              retrying: 0,
+              retrying: result.kept,
               cancelled: current.queue.cancelled + result.cancelled,
               earliestDueAt: null,
             },
           });
-      toast(`${result.cancelled} queued shadow job${result.cancelled === 1 ? '' : 's'} cancelled`);
+      toast(
+        `${result.cancelled} queued shadow job${result.cancelled === 1 ? '' : 's'} cancelled`
+          + (result.kept > 0
+            ? `; ${result.kept} kept to finish a QuickBooks write already in progress`
+            : ''),
+      );
     } catch (error) {
       if (generationRef.current === generation) toast(errorMessage(error));
     } finally {

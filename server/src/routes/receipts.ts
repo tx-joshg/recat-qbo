@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { once } from 'node:events';
 import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
 import type {
@@ -9,6 +8,7 @@ import type {
 } from '@prisma/client';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
+import { streamToResponse } from '../lib/responseStream.js';
 import { qboFactory } from '../lib/qbo/factory.js';
 import { QboAttachmentNotFoundError } from '../lib/qbo/types.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
@@ -271,18 +271,6 @@ const hideUnscopedCompany: RequestHandler = (req, _res, next) => {
   next(new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND'));
 };
 
-async function streamBody(
-  body: AsyncIterable<Uint8Array>,
-  res: Response,
-  end = true,
-): Promise<void> {
-  for await (const chunk of body) {
-    if (res.destroyed) return;
-    if (!res.write(chunk)) await once(res, 'drain');
-  }
-  if (end) res.end();
-}
-
 async function tryOpenBlob(
   companyId: string,
   blobId: string | null,
@@ -386,7 +374,7 @@ async function streamReceipt(
   );
   res.setHeader('Cache-Control', 'private, no-store');
   if (sizeBytes !== null) res.setHeader('Content-Length', String(sizeBytes));
-  await streamBody(body, res);
+  await streamToResponse(body, res);
 }
 
 export const receiptsRouter = Router({ mergeParams: true });
@@ -565,8 +553,10 @@ receiptsRouter.post(
     // A client that disconnects mid-download must still release the archive
     // and any open file readers.
     res.once('close', () => exported.stream.destroy());
-    await streamBody(exported.stream, res, false);
-    if (res.destroyed) return;
+    if (!(await streamToResponse(exported.stream, res, false))) {
+      exported.completed.catch(() => undefined);
+      return;
+    }
     await exported.completed;
     res.end();
   }),

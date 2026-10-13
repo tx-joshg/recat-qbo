@@ -545,6 +545,58 @@ export async function cancelSupersededAgentJob(
 }
 
 /** Renew only a still-active lease owned by this worker. */
+/**
+ * Admin "cancel queued": cancels the company's queued and retry jobs, except
+ * a job that still owns an unfinished QuickBooks write. That job's retry is
+ * the only thing that resumes or reconciles its attempt (the attempt's
+ * requestId is the job id), so cancelling it would strand a PREPARED write
+ * that blocks every later live write to the transaction. Runs under the
+ * company mutation scope so it cannot interleave with a claim or live write.
+ */
+export async function cancelQueuedAgentJobs(
+  companyId: string,
+  deps: AgentJobDeps = defaultDeps,
+): Promise<{ cancelled: number; kept: number }> {
+  assertIdentifier(companyId);
+  return deps.db.$transaction(async (tx) => {
+    await lockCompanyMutationScopes(tx, [companyId]);
+    const cancelledAt = await currentTime(tx, deps);
+    const rows = await tx.$queryRawUnsafe<{ cancelled: number; kept: number }[]>(
+      `WITH candidates AS (
+         SELECT job."id",
+                EXISTS (
+                  SELECT 1
+                    FROM "QboMutationAttempt" attempt
+                   WHERE attempt."requestId" = job."id"
+                     AND attempt."transactionId" = job."transactionId"
+                     AND attempt."status" IN ('PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN')
+                ) AS "ownsWrite"
+           FROM "AgentJob" job
+          WHERE job."companyId" = $1
+            AND job."status" IN ('queued', 'retry')
+          FOR UPDATE OF job
+       ),
+       cancelled AS (
+         UPDATE "AgentJob" job
+            SET "status" = 'cancelled',
+                "lockOwner" = NULL,
+                "leaseExpiresAt" = NULL,
+                "lastErrorCode" = 'AGENT_CANCELLED_BY_ADMIN',
+                "updatedAt" = $2
+           FROM candidates
+          WHERE job."id" = candidates."id"
+            AND NOT candidates."ownsWrite"
+         RETURNING job."id"
+       )
+       SELECT (SELECT COUNT(*)::integer FROM cancelled) AS "cancelled",
+              (SELECT COUNT(*)::integer FROM candidates WHERE "ownsWrite") AS "kept"`,
+      companyId,
+      cancelledAt,
+    );
+    return { cancelled: rows[0]?.cancelled ?? 0, kept: rows[0]?.kept ?? 0 };
+  });
+}
+
 export async function renewJobLease(
   jobId: string,
   owner: string,

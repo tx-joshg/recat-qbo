@@ -240,7 +240,7 @@ beforeEach(() => {
   mocks.getReadiness.mockResolvedValue(readiness);
   mocks.listRuns.mockResolvedValue(runs);
   mocks.patch.mockResolvedValue(overview.settings);
-  mocks.cancelQueued.mockResolvedValue({ cancelled: 4 });
+  mocks.cancelQueued.mockResolvedValue({ cancelled: 4, kept: 0 });
   mocks.enableLive.mockResolvedValue(readiness);
   mocks.pauseLive.mockResolvedValue({
     liveRequested: true,

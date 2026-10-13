@@ -29,6 +29,7 @@ import {
 } from '../attachments/operations.js';
 import {
   candidateAmountRange,
+  hasIdentityEvidence,
   rankReceiptCandidates,
   type MatchableTransaction,
   type ScoredReceiptCandidate,
@@ -963,7 +964,7 @@ function localMatchDecision(
   margin: number,
 ): string | null {
   const first = ranked[0];
-  if (!first || first.score < threshold) return null;
+  if (!first || first.score < threshold || !hasIdentityEvidence(first)) return null;
   const second = ranked[1];
   if (second && first.score - second.score < margin) return null;
   return first.transactionId;

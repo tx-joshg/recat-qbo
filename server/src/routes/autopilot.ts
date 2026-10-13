@@ -47,6 +47,7 @@ import {
   loadLiveReconciliationOperation,
   reconcileLiveMutation,
 } from '../services/agent/liveReconciliation.js';
+import { cancelQueuedAgentJobs } from '../services/agent/jobs.js';
 import { isCanonicalLiveCheckpoint } from '../services/agent/liveCheckpoint.js';
 
 const DEFAULT_PAGE_SIZE = 20;
@@ -1154,18 +1155,6 @@ autopilotRouter.post(
   '/cancel-queued',
   requireRole('admin'),
   asyncHandler(async (req, res) => {
-    const result = await prisma.agentJob.updateMany({
-      where: {
-        companyId: companyId(req),
-        status: { in: ['queued', 'retry'] },
-      },
-      data: {
-        status: 'cancelled',
-        lockOwner: null,
-        leaseExpiresAt: null,
-        lastErrorCode: 'AGENT_CANCELLED_BY_ADMIN',
-      },
-    });
-    res.json({ cancelled: result.count });
+    res.json(await cancelQueuedAgentJobs(companyId(req)));
   }),
 );

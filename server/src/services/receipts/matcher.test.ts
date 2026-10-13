@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   candidateAmountRange,
+  hasIdentityEvidence,
   rankReceiptCandidates,
   scoreReceiptCandidate,
   tokenJaccard,
@@ -128,6 +129,24 @@ describe('deterministic receipt matcher', () => {
       'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
       'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     ]);
+  });
+
+  it('does not treat amount, date and currency alone as identity evidence', () => {
+    const otherVendor = scoreReceiptCandidate(
+      receipt({ paymentIdentifier: null }),
+      transaction({ payee: 'Unrelated Fuel Stop', memo: null }),
+    )!;
+    // Same amount, same day, same currency already clears the default
+    // auto-match threshold of 85...
+    expect(otherVendor.score).toBe(85);
+    // ...but nothing ties this charge to the receipt's vendor.
+    expect(hasIdentityEvidence(otherVendor)).toBe(false);
+
+    expect(hasIdentityEvidence(scoreReceiptCandidate(receipt(), transaction())!)).toBe(true);
+    expect(hasIdentityEvidence(scoreReceiptCandidate(
+      receipt({ vendorName: null }),
+      transaction(),
+    )!)).toBe(true); // payment identifier alone
   });
 });
 

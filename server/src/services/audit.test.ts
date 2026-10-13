@@ -5,6 +5,7 @@ import {
   AUDIT_CSV_HEADER,
   buildAuditCsv,
   csvEscape,
+  csvText,
   writeAudit,
 } from './audit.js';
 
@@ -69,6 +70,27 @@ describe('buildAuditCsv', () => {
     // Quoted newline stays inside the quoted field; naive line count is header + 2
     // but a CSV parser sees exactly one record. Assert the quoting is present.
     expect(csv).toContain('"Split:\nOffice / Meals"');
+  });
+
+  it('neutralises spreadsheet formulas in text columns but keeps negative amounts numeric', () => {
+    const csv = buildAuditCsv([
+      entry({ payee: '=HYPERLINK("http://evil.example","x")', actor: '@SUM(A1)', after: '+1', amount: -42.5 }),
+    ]);
+    const row = csv.trimEnd().split('\n')[1] as string;
+    expect(row).toContain(`"'=HYPERLINK(""http://evil.example"",""x"")"`);
+    expect(row).toContain("'@SUM(A1)");
+    expect(row).toContain(",'+1");
+    expect(row).toContain(',-42.50,');
+  });
+});
+
+describe('csvText', () => {
+  it.each(['=1+1', '+1', '-1', '@x', '\tcmd', '\rcmd'])('prefixes %j with an apostrophe', (value) => {
+    expect(csvText(value).replace(/^"/, '').startsWith("'")).toBe(true);
+  });
+
+  it('leaves ordinary text alone', () => {
+    expect(csvText('Office Supplies')).toBe('Office Supplies');
   });
 });
 

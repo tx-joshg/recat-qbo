@@ -1054,7 +1054,9 @@ export const autopilot = {
       {},
     ),
   cancelQueued: (companyId: string) =>
-    api.post<{ cancelled: number }>(
+    // `kept`: retry jobs left alone because they still own an unfinished
+    // QuickBooks write that only their retry can finish.
+    api.post<{ cancelled: number; kept: number }>(
       `/api/companies/${companyId}/autopilot/cancel-queued`,
     ),
 };
