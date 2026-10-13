@@ -120,6 +120,16 @@ export function scoreReceiptCandidate(
   };
 }
 
+/**
+ * Amount, date and currency alone say only that a charge looks the same size
+ * and time, which a different vendor's charge often does. Auto-matching
+ * also needs something tying the receipt to this transaction: a similar
+ * vendor name or the receipt's payment identifier on the transaction.
+ */
+export function hasIdentityEvidence(candidate: ScoredReceiptCandidate): boolean {
+  return candidate.evidence.vendorPoints > 0 || candidate.evidence.paymentPoints > 0;
+}
+
 export function rankReceiptCandidates(
   receipt: MatchableReceipt,
   transactions: readonly MatchableTransaction[],
