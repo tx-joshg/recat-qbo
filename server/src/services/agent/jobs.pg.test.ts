@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+  cancelQueuedAgentJobs,
   cancelSupersededAgentJob,
   claimShadowJobs,
   discoverShadowJobs,
@@ -656,6 +657,54 @@ describePostgres('shadow agent PostgreSQL jobs', () => {
         leaseExpiresAt: null,
         lastErrorCode: 'AGENT_SUPERSEDED',
         attemptCount: claimed!.attemptCount,
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it('admin cancel keeps a retry job that still owns an unfinished QuickBooks write', async () => {
+    const fixture = await seed(3);
+    try {
+      await discover(fixture);
+      const jobs = await firstClient.agentJob.findMany({
+        where: { companyId: fixture.companyId },
+        orderBy: { transactionId: 'asc' },
+      });
+      expect(jobs).toHaveLength(3);
+      const [owning, plainRetry, queued] = jobs as [typeof jobs[number], typeof jobs[number], typeof jobs[number]];
+      await firstClient.agentJob.updateMany({
+        where: { id: { in: [owning.id, plainRetry.id] } },
+        data: { status: 'retry', attemptCount: 1 },
+      });
+      await firstClient.qboMutationAttempt.create({
+        data: {
+          transactionId: owning.transactionId,
+          requestId: owning.id,
+          operation: 'recategorize',
+          status: 'PREPARED',
+          expectedRevision: owning.revision,
+          expectedSyncToken: '0',
+          requestHash: 'hash',
+          requestPayload: {},
+          beforeSnapshot: {},
+        },
+      });
+
+      await expect(cancelQueuedAgentJobs(fixture.companyId, deps(firstClient)))
+        .resolves.toEqual({ cancelled: 2, kept: 1 });
+
+      const after = new Map((await firstClient.agentJob.findMany({
+        where: { companyId: fixture.companyId },
+      })).map((job) => [job.id, job]));
+      expect(after.get(owning.id)).toMatchObject({ status: 'retry', lastErrorCode: null });
+      expect(after.get(plainRetry.id)).toMatchObject({
+        status: 'cancelled',
+        lastErrorCode: 'AGENT_CANCELLED_BY_ADMIN',
+      });
+      expect(after.get(queued.id)).toMatchObject({
+        status: 'cancelled',
+        lastErrorCode: 'AGENT_CANCELLED_BY_ADMIN',
       });
     } finally {
       await cleanup(fixture);
