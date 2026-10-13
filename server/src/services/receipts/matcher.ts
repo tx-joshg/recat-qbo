@@ -39,6 +39,9 @@ export interface ScoredReceiptCandidate {
   evidence: MatchEvidence;
 }
 
+/** Largest amount difference, as a share of the receipt total, that scores. */
+const AMOUNT_TOLERANCE_RATIO = 0.02;
+
 const MONEY_OUT_TYPES = new Set([
   'expense_receipt',
   'expense',
@@ -147,6 +150,33 @@ export function rankReceiptCandidates(
       || a.transactionId.localeCompare(b.transactionId));
 }
 
+/**
+ * The absolute transaction amounts `amountScore` can accept for a receipt
+ * total, widened by half a cent so stored amounts with extra precision are not
+ * cut off before rounding. Lets the candidate query filter by amount in SQL
+ * instead of scoring only the newest rows in the date window.
+ */
+export function candidateAmountRange(
+  totalAmount: string | null,
+): { min: string; max: string } | null {
+  if (totalAmount === null) return null;
+  const receiptCents = cents(totalAmount);
+  if (receiptCents === null) return null;
+  const absoluteCents = Math.abs(receiptCents);
+  const toleranceCents = Math.max(
+    1,
+    Math.floor(absoluteCents * AMOUNT_TOLERANCE_RATIO),
+  );
+  const min = new Prisma.Decimal(Math.max(0, absoluteCents - toleranceCents))
+    .minus('0.5').dividedBy(100);
+  const max = new Prisma.Decimal(absoluteCents + toleranceCents)
+    .plus('0.5').dividedBy(100);
+  return {
+    min: Prisma.Decimal.max(min, 0).toFixed(3),
+    max: max.toFixed(3),
+  };
+}
+
 function normalizedTokens(value: string | null): Set<string> {
   if (!value) return new Set();
   const normalized = value
@@ -198,7 +228,7 @@ function amountScore(differenceCents: number, receiptCents: number): number {
   if (differenceCents <= 1) return 50;
   const ratio = differenceCents / Math.max(receiptCents, 1);
   if (ratio <= 0.005) return 40;
-  if (ratio <= 0.02) return 25;
+  if (ratio <= AMOUNT_TOLERANCE_RATIO) return 25;
   return -1;
 }
 

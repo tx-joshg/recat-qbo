@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  candidateAmountRange,
   hasIdentityEvidence,
   rankReceiptCandidates,
   scoreReceiptCandidate,
@@ -146,5 +147,33 @@ describe('deterministic receipt matcher', () => {
       receipt({ vendorName: null }),
       transaction(),
     )!)).toBe(true); // payment identifier alone
+  });
+});
+
+describe('candidateAmountRange', () => {
+  it('covers every amount the scorer accepts and excludes the first it rejects', () => {
+    for (const total of ['0.01', '0.49', '11.20', '100.00', '-100.00', '1234.56']) {
+      const range = candidateAmountRange(total);
+      expect(range).not.toBeNull();
+      const min = Number(range!.min);
+      const max = Number(range!.max);
+      const totalCents = Math.round(Math.abs(Number(total)) * 100);
+      for (let delta = -Math.ceil(totalCents * 0.03) - 2; delta <= Math.ceil(totalCents * 0.03) + 2; delta += 1) {
+        const amountCents = totalCents + delta;
+        if (amountCents <= 0) continue;
+        const amount = (amountCents / 100).toFixed(2);
+        const scored = scoreReceiptCandidate(
+          receipt({ totalAmount: total, documentType: null }),
+          transaction({ amount: `-${amount}` }),
+        );
+        const inRange = Number(amount) >= min && Number(amount) <= max;
+        expect({ amount, inRange }).toEqual({ amount, inRange: scored !== null });
+      }
+    }
+  });
+
+  it('returns null when the receipt has no usable total', () => {
+    expect(candidateAmountRange(null)).toBeNull();
+    expect(candidateAmountRange('not-a-number')).toBeNull();
   });
 });

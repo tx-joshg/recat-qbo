@@ -38,6 +38,11 @@ import {
 const GLOBAL_CONCURRENCY = 4;
 const LIVE_RECOVERY_CONCURRENCY = 4;
 const LIVE_RECOVERY_TIMEOUT_MS = 10_000;
+/**
+ * Ticks run about once a minute; a tick that starts a little early must not
+ * push a company's discovery back by a whole extra tick.
+ */
+const DISCOVERY_SLACK_MS = 30_000;
 
 export type AgentSchedulerModelConfig = OpenAiCompatibleAgentModelConfig;
 
@@ -59,15 +64,31 @@ export interface ScheduledShadowCompany {
   readonly companyId: string;
   readonly scheduleMinutes: number;
   readonly liveRequested: boolean;
+  /** Absent or null means discovery has never completed: run now. */
+  readonly lastDiscoveredAt?: Date | null;
 }
 
 interface ScheduledCompanyDb {
   agentCompanyConfig: {
     findMany(args: {
       where: { mode: 'shadow'; company: { disconnectedAt: null } };
-      select: { companyId: true; scheduleMinutes: true; liveRequested: true };
+      select: {
+        companyId: true;
+        scheduleMinutes: true;
+        liveRequested: true;
+        lastDiscoveredAt: true;
+      };
       orderBy: { companyId: 'asc' };
     }): Promise<ScheduledShadowCompany[]>;
+  };
+}
+
+interface DiscoveryMarkDb {
+  agentCompanyConfig: {
+    updateMany(args: {
+      where: { companyId: string; mode: 'shadow' };
+      data: { lastDiscoveredAt: Date };
+    }): Promise<unknown>;
   };
 }
 
@@ -79,6 +100,8 @@ export interface AgentSchedulerDeps {
   readonly guardCompany?: (company: ScheduledShadowCompany) => Promise<void>;
   readonly recoverLiveMutations?: () => Promise<void>;
   readonly discoverJobs: (companyId: string) => Promise<unknown>;
+  /** Records a completed discovery so the next one is measured from it. */
+  readonly markDiscovered?: (companyId: string, at: Date) => Promise<unknown>;
   readonly claimJobs: (
     workerId: string,
     limit: number,
@@ -259,9 +282,12 @@ export function createAgentScheduler(deps: AgentSchedulerDeps): AgentScheduler {
           if (!isCurrentLifecycle()) return;
         }
         await runBoundedSettled(
-          companies.filter((company) => isDue(now, company.scheduleMinutes)),
+          companies.filter((company) => isDue(now, company)),
           deps.globalConcurrency,
-          (company) => deps.discoverJobs(company.companyId),
+          async (company) => {
+            await deps.discoverJobs(company.companyId);
+            await deps.markDiscovered?.(company.companyId, now);
+          },
         );
         if (!isCurrentLifecycle()) return;
 
@@ -277,10 +303,20 @@ export function createAgentScheduler(deps: AgentSchedulerDeps): AgentScheduler {
   };
 }
 
-function isDue(now: Date, scheduleMinutes: number): boolean {
+/**
+ * Due when a full schedule period has passed since the last completed
+ * discovery. Measuring from a stored time (rather than matching wall-clock
+ * minutes) means a skipped, overlapping, or failed tick is caught up on the
+ * next one instead of silently waiting another whole period.
+ */
+function isDue(now: Date, company: ScheduledShadowCompany): boolean {
+  const { scheduleMinutes, lastDiscoveredAt } = company;
   if (!Number.isInteger(scheduleMinutes) || scheduleMinutes < 1) return false;
-  const epochMinute = Math.floor(now.getTime() / 60_000);
-  return epochMinute % scheduleMinutes === 0;
+  if (lastDiscoveredAt === undefined || lastDiscoveredAt === null) return true;
+  const last = lastDiscoveredAt.getTime();
+  // A clock that moved backwards must not stall discovery indefinitely.
+  if (Number.isNaN(last) || last > now.getTime()) return true;
+  return now.getTime() - last >= scheduleMinutes * 60_000 - DISCOVERY_SLACK_MS;
 }
 
 function checkedDate(value: Date): Date {
@@ -353,8 +389,24 @@ export async function listScheduledShadowCompanies(
       mode: 'shadow',
       company: { disconnectedAt: null },
     },
-    select: { companyId: true, scheduleMinutes: true, liveRequested: true },
+    select: {
+      companyId: true,
+      scheduleMinutes: true,
+      liveRequested: true,
+      lastDiscoveredAt: true,
+    },
     orderBy: { companyId: 'asc' },
+  });
+}
+
+export async function markShadowDiscovery(
+  companyId: string,
+  at: Date,
+  db: DiscoveryMarkDb = prisma as unknown as DiscoveryMarkDb,
+): Promise<void> {
+  await db.agentCompanyConfig.updateMany({
+    where: { companyId, mode: 'shadow' },
+    data: { lastDiscoveredAt: at },
   });
 }
 
@@ -465,6 +517,7 @@ const productionScheduler = createAgentScheduler({
   guardCompany: guardScheduledLiveCompany,
   recoverLiveMutations: reconcileScheduledLiveMutations,
   discoverJobs: discoverShadowJobs,
+  markDiscovered: markShadowDiscovery,
   claimJobs: claimShadowJobs,
   runJob: async (job) => runScheduledShadowJob(job, processWorkerId, productionJobDeps),
 });

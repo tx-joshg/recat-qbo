@@ -28,6 +28,111 @@ import {
 
 const CHUNK_READ_PAGE = 16;
 const COMPANY_STORAGE_LOCK_SEED = 1_991_011_991n;
+/**
+ * Quota is reserved in steps while an upload streams, so concurrent uploads
+ * are refused after at most one step each instead of after every byte has
+ * already been written to the database.
+ */
+export const STAGING_RESERVATION_STEP_BYTES = BLOB_CHUNK_BYTES * 8;
+
+type StorageTransaction = Parameters<
+  Parameters<PrismaClient['$transaction']>[0]
+>[0];
+
+async function lockStorage(
+  transaction: StorageTransaction,
+  companyId: string,
+): Promise<void> {
+  await transaction.$queryRaw`
+    SELECT pg_advisory_xact_lock(${ATTACHMENT_STORAGE_INSTANCE_LOCK})::text`;
+  await transaction.$queryRaw`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(${companyId}, ${COMPANY_STORAGE_LOCK_SEED})
+    )::text`;
+}
+
+async function storagePolicyFor(
+  transaction: StorageTransaction,
+  companyId: string,
+  deps?: AttachmentBlobStoreDeps,
+) {
+  const company = await transaction.company.findUnique({
+    where: { id: companyId },
+    select: {
+      attachmentQuotaBytes: true,
+      attachmentRetentionDays: true,
+    },
+  });
+  if (company === null) {
+    throw new AttachmentError(
+      'ATTACHMENT_NOT_FOUND',
+      'Attachment company was not found.',
+    );
+  }
+  return resolveAttachmentStoragePolicy(
+    company,
+    deps?.policyDefaults
+      ?? await getAttachmentStoragePolicyDefaults(
+        transaction as unknown as AttachmentPolicyConfigDb,
+      ),
+  );
+}
+
+/**
+ * Stored bytes plus the reservations of other uploads still streaming. Must
+ * run under `lockStorage`. Expired staging rows are crash leftovers awaiting
+ * cleanup and no longer hold a reservation.
+ */
+async function assertWithinStorageQuota(
+  transaction: StorageTransaction,
+  input: {
+    companyId: string;
+    provisionalBlobId: string;
+    sizeBytes: bigint;
+    now: Date;
+    policy: { instanceQuotaBytes: bigint; companyQuotaBytes: bigint };
+  },
+): Promise<void> {
+  const counted = {
+    OR: [
+      { state: 'READY' as const },
+      {
+        state: 'STAGING' as const,
+        id: { not: input.provisionalBlobId },
+        expiresAt: { gt: input.now },
+      },
+    ],
+  };
+  const [instanceUsage, companyUsage] = await Promise.all([
+    transaction.attachmentBlob.aggregate({
+      where: counted,
+      _sum: { sizeBytes: true },
+    }),
+    transaction.attachmentBlob.aggregate({
+      where: { companyId: input.companyId, ...counted },
+      _sum: { sizeBytes: true },
+    }),
+  ]);
+  if ((instanceUsage._sum.sizeBytes ?? 0n) + input.sizeBytes > input.policy.instanceQuotaBytes) {
+    throw new AttachmentError(
+      'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED',
+      'Attachment storage exceeds the instance quota.',
+    );
+  }
+  if ((companyUsage._sum.sizeBytes ?? 0n) + input.sizeBytes > input.policy.companyQuotaBytes) {
+    throw new AttachmentError(
+      'ATTACHMENT_COMPANY_QUOTA_EXCEEDED',
+      'Attachment storage exceeds the company quota.',
+    );
+  }
+}
+
+function isQuotaError(error: unknown): boolean {
+  return error instanceof AttachmentError && (
+    error.code === 'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED'
+    || error.code === 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED'
+  );
+}
 
 export interface AttachmentBlobStoreDeps {
   readonly db?: PrismaClient;
@@ -190,10 +295,44 @@ export async function stageAttachment(
   const detectionPrefix = new Uint8Array(ATTACHMENT_DETECTION_BYTES);
   let detectionBytes = 0;
   let chunkCount = 0;
+  let reservedBytes = 0;
+  const reserveExactly = async (nextReservation: number): Promise<void> => {
+    const reservedAt = (deps?.now ?? (() => new Date()))();
+    await db.$transaction(async (transaction) => {
+      await lockStorage(transaction, input.companyId);
+      await assertWithinStorageQuota(transaction, {
+        companyId: input.companyId,
+        provisionalBlobId: provisional.id,
+        sizeBytes: BigInt(nextReservation),
+        now: reservedAt,
+        policy: await storagePolicyFor(transaction, input.companyId, deps),
+      });
+      await transaction.attachmentBlob.update({
+        where: { id: provisional.id },
+        data: { sizeBytes: BigInt(nextReservation) },
+      });
+    });
+    reservedBytes = nextReservation;
+  };
+  const reserve = async (neededBytes: number): Promise<void> => {
+    const stepped = Math.min(
+      Math.ceil(neededBytes / STAGING_RESERVATION_STEP_BYTES)
+        * STAGING_RESERVATION_STEP_BYTES,
+      budget.maxBytes,
+    );
+    try {
+      await reserveExactly(stepped);
+    } catch (error) {
+      // Near the quota a whole step may not fit even though the file does.
+      if (stepped === neededBytes || !isQuotaError(error)) throw error;
+      await reserveExactly(neededBytes);
+    }
+  };
 
   try {
     for await (const chunk of rechunkAttachmentContent(input.content)) {
       budget.consume(chunk.byteLength);
+      if (budget.usedBytes > reservedBytes) await reserve(budget.usedBytes);
       hash.update(chunk);
       if (detectionBytes < detectionPrefix.byteLength) {
         const copyBytes = Math.min(
@@ -228,33 +367,8 @@ export async function stageAttachment(
     const finalizedAt = (deps?.now ?? (() => new Date()))();
     const sizeBytes = BigInt(budget.usedBytes);
     const staged = await db.$transaction(async (transaction) => {
-      await transaction.$queryRaw`
-        SELECT pg_advisory_xact_lock(${ATTACHMENT_STORAGE_INSTANCE_LOCK})::text`;
-      await transaction.$queryRaw`
-        SELECT pg_advisory_xact_lock(
-          hashtextextended(${input.companyId}, ${COMPANY_STORAGE_LOCK_SEED})
-        )::text`;
-
-      const company = await transaction.company.findUnique({
-        where: { id: input.companyId },
-        select: {
-          attachmentQuotaBytes: true,
-          attachmentRetentionDays: true,
-        },
-      });
-      if (company === null) {
-        throw new AttachmentError(
-          'ATTACHMENT_NOT_FOUND',
-          'Attachment company was not found.',
-        );
-      }
-      const policy = resolveAttachmentStoragePolicy(
-        company,
-        deps?.policyDefaults
-          ?? await getAttachmentStoragePolicyDefaults(
-            transaction as unknown as AttachmentPolicyConfigDb,
-          ),
-      );
+      await lockStorage(transaction, input.companyId);
+      const policy = await storagePolicyFor(transaction, input.companyId, deps);
       const retentionDeadline = attachmentRetentionDeadline(
         finalizedAt,
         policy.retentionDays,
@@ -312,28 +426,13 @@ export async function stageAttachment(
         return reference;
       }
 
-      const [instanceUsage, companyUsage] = await Promise.all([
-        transaction.attachmentBlob.aggregate({
-          where: { state: 'READY' },
-          _sum: { sizeBytes: true },
-        }),
-        transaction.attachmentBlob.aggregate({
-          where: { companyId: input.companyId, state: 'READY' },
-          _sum: { sizeBytes: true },
-        }),
-      ]);
-      if ((instanceUsage._sum.sizeBytes ?? 0n) + sizeBytes > policy.instanceQuotaBytes) {
-        throw new AttachmentError(
-          'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED',
-          'Attachment storage exceeds the instance quota.',
-        );
-      }
-      if ((companyUsage._sum.sizeBytes ?? 0n) + sizeBytes > policy.companyQuotaBytes) {
-        throw new AttachmentError(
-          'ATTACHMENT_COMPANY_QUOTA_EXCEEDED',
-          'Attachment storage exceeds the company quota.',
-        );
-      }
+      await assertWithinStorageQuota(transaction, {
+        companyId: input.companyId,
+        provisionalBlobId: provisional.id,
+        sizeBytes,
+        now: finalizedAt,
+        policy,
+      });
 
       await transaction.attachmentBlob.update({
         where: { id: provisional.id },

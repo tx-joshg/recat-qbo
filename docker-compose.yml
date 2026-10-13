@@ -3,7 +3,11 @@ services:
     build: .
     image: ghcr.io/tx-joshg/recat-qbo:latest
     ports:
-      - "3001:3001"
+      # Loopback only by default: until the first admin is created, whoever
+      # reaches the setup wizard can claim the instance. Set
+      # RECAT_BIND_ADDRESS=0.0.0.0 to serve other machines, ideally after
+      # setup or with LOCAL_ADMIN_PASSWORD set (see README).
+      - "${RECAT_BIND_ADDRESS:-127.0.0.1}:3001:3001"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/recat
       APP_URL: ${APP_URL:-http://localhost:3001}

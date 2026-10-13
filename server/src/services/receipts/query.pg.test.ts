@@ -596,6 +596,55 @@ describePostgres('receipt library queries', () => {
       .toEqual([first.id, second.id].sort());
   });
 
+  it('groups by edited metadata and leaves receipts without a twin out', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-duplicates-edited-${randomUUID()}`,
+        legalName: 'Synthetic Edited Duplicate Company',
+        nickname: 'Edited Duplicates',
+      },
+    });
+    companyIds.add(company.id);
+    const first = await createSearchableReceipt(
+      company.id,
+      'a'.repeat(64),
+      'Invented Edited Vendor',
+    );
+    const second = await createSearchableReceipt(
+      company.id,
+      'b'.repeat(64),
+      'Invented Edited Vendor',
+    );
+    const unrelated = await createSearchableReceipt(
+      company.id,
+      'c'.repeat(64),
+      'Invented Unrelated Vendor',
+    );
+    await db.receiptExtractionAttempt.updateMany({
+      where: { documentId: { in: [first.id, second.id, unrelated.id] } },
+      data: { receiptDate: new Date('2026-07-01T00:00:00Z') },
+    });
+    await db.receiptExtractionAttempt.updateMany({
+      where: { documentId: first.id },
+      data: { vendorReceiptId: 'synthetic-edited-1' },
+    });
+    await db.receiptExtractionAttempt.updateMany({
+      where: { documentId: { in: [second.id, unrelated.id] } },
+      data: { vendorReceiptId: 'misread-id' },
+    });
+    // A reviewer corrected the second receipt's number to match the first.
+    await db.receiptDocument.update({
+      where: { id: second.id },
+      data: { currentMetadata: { vendorReceiptId: 'SYNTHETIC-EDITED-1' } },
+    });
+
+    const groups = await getReceiptDuplicateGroups(company.id, { db });
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.receipts.map((item) => item.id).sort())
+      .toEqual([first.id, second.id].sort());
+  });
+
   it('batch approves with one audit event per receipt and rejects stale input', async () => {
     const company = await db.company.create({
       data: {

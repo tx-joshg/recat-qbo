@@ -980,41 +980,117 @@ function normalizeIdentityPart(value: string | null): string | null {
   return normalized === '' ? null : normalized;
 }
 
+interface DuplicateIdentityFields {
+  vendorReceiptId: string | null;
+  receiptDate: string | null;
+  currency: string | null;
+  totalAmount: string | null;
+}
+
+function duplicateIdentityKey(
+  extraction: DuplicateIdentityFields | null,
+): string | null {
+  const vendorReceiptId = normalizeIdentityPart(
+    extraction?.vendorReceiptId ?? null,
+  );
+  if (
+    extraction === null
+    || vendorReceiptId === null
+    || extraction.receiptDate === null
+    || extraction.currency === null
+    || extraction.totalAmount === null
+  ) {
+    return null;
+  }
+  let normalizedTotal: string;
+  try {
+    normalizedTotal = new PrismaRuntime.Decimal(
+      extraction.totalAmount,
+    ).toString();
+  } catch {
+    return null;
+  }
+  return [
+    vendorReceiptId,
+    extraction.receiptDate,
+    extraction.currency,
+    normalizedTotal,
+  ].join('|');
+}
+
+const duplicateIdentityOverrideFields = [
+  'vendorReceiptId',
+  'receiptDate',
+  'currency',
+  'totalAmount',
+] as const;
+
 export async function getReceiptDuplicateGroups(
   companyId: string,
   deps?: ReceiptQueryDeps,
 ): Promise<ReceiptDuplicateGroupDto[]> {
   const db = dbOf(deps);
-  const rows = await db.receiptDocument.findMany({
+  // First pass reads only the identity columns, so the full receipt (with its
+  // extracted text) is loaded only for receipts that actually have a twin.
+  const identities = await db.receiptDocument.findMany({
     where: { companyId, deletedAt: null },
+    select: {
+      id: true,
+      generation: true,
+      currentMetadata: true,
+      attempts: {
+        ...receiptListInclude.attempts,
+        select: {
+          generation: true,
+          vendorReceiptId: true,
+          receiptDate: true,
+          currency: true,
+          totalAmount: true,
+        },
+      },
+    },
+  });
+  const idsByKey = new Map<string, string[]>();
+  for (const row of identities) {
+    const attempt = row.attempts.find((candidate) =>
+      candidate.generation === row.generation);
+    if (attempt === undefined) continue;
+    const fields: DuplicateIdentityFields = {
+      vendorReceiptId: attempt.vendorReceiptId,
+      receiptDate: attempt.receiptDate?.toISOString().slice(0, 10) ?? null,
+      currency: attempt.currency,
+      totalAmount: attempt.totalAmount?.toString() ?? null,
+    };
+    const overrides = jsonObject(row.currentMetadata);
+    for (const field of duplicateIdentityOverrideFields) {
+      if (Object.prototype.hasOwnProperty.call(overrides, field)) {
+        const value = overrides[field];
+        fields[field] = typeof value === 'string' || typeof value === 'number'
+          ? String(value)
+          : null;
+      }
+    }
+    const key = duplicateIdentityKey(fields);
+    if (key === null) continue;
+    const ids = idsByKey.get(key) ?? [];
+    ids.push(row.id);
+    idsByKey.set(key, ids);
+  }
+  const candidateIds = [...idsByKey.values()]
+    .filter((ids) => ids.length > 1)
+    .flat();
+  if (candidateIds.length === 0) return [];
+
+  const rows = await db.receiptDocument.findMany({
+    where: { companyId, deletedAt: null, id: { in: candidateIds } },
     orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
     include: receiptListInclude,
   });
   const byKey = new Map<string, ReceiptDto[]>();
   for (const row of rows) {
     const dto = toProjectedReceiptDto(row);
-    const extraction = dto.currentExtraction;
-    const vendorReceiptId = normalizeIdentityPart(
-      extraction?.vendorReceiptId ?? null,
-    );
-    if (
-      extraction === null
-      || vendorReceiptId === null
-      || extraction.receiptDate === null
-      || extraction.currency === null
-      || extraction.totalAmount === null
-    ) {
-      continue;
-    }
-    const normalizedTotal = new PrismaRuntime.Decimal(
-      extraction.totalAmount,
-    ).toString();
-    const key = [
-      vendorReceiptId,
-      extraction.receiptDate,
-      extraction.currency,
-      normalizedTotal,
-    ].join('|');
+    const key = duplicateIdentityKey(dto.currentExtraction);
+    if (key === null) continue;
     const group = byKey.get(key) ?? [];
     group.push(dto);
     byKey.set(key, group);

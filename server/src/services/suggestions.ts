@@ -168,6 +168,7 @@ async function aiSuggestion(
   txn: { payee: string; memo?: string | null; amount: number },
   settings: CategoryProviderSettings | null,
   optionsIn?: CategoryOption[],
+  signal?: AbortSignal,
 ): Promise<SuggestionDto | null> {
   if (settings === null) return null;
   const options = optionsIn ?? await categoryOptions(companyId);
@@ -198,7 +199,7 @@ async function aiSuggestion(
   ].join('\n');
 
   // The request and its cache entry must use the same settings snapshot.
-  const answer = await completeCategory(prompt, settings);
+  const answer = await completeCategory(prompt, settings, signal);
   // Only accept an exact (case-insensitive) category name — anything else is
   // a hallucination and must not reach the queue.
   const hit = options.find((o) => o.name.toLowerCase() === answer?.toLowerCase());
@@ -267,37 +268,60 @@ export async function suggestForMany(
   return txns.map((t) => pickSuggestion(t.payee, rules, history, historyEnabled));
 }
 
+/**
+ * Total time one sync may spend waiting on AI suggestions. Calls run one at a
+ * time, so without a budget a hung endpoint would stall the sync for 30 s per
+ * pending transaction.
+ */
+export const AI_REFRESH_BUDGET_MS = 60_000;
+
 /** Recompute the suggestion snapshot for every PENDING txn (called by sync). */
-export async function refreshSuggestions(companyId: string): Promise<void> {
+export async function refreshSuggestions(
+  companyId: string,
+  options: { aiBudgetMs?: number } = {},
+): Promise<void> {
   const settings = await loadSettings();
   const historyEnabled = settings.suggestionSource !== 'off';
   const rules = await loadRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
   const pending = await prisma.transaction.findMany({ where: { companyId, status: 'PENDING' } });
   let aiOptions: CategoryOption[] | undefined;
+  const aiBudget = new AbortController();
+  const budgetTimer = setTimeout(
+    () => aiBudget.abort(),
+    options.aiBudgetMs ?? AI_REFRESH_BUDGET_MS,
+  );
 
-  for (const t of pending) {
-    const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
-    let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
-    if (!suggestion && settings.suggestionSource === 'ai') {
-      aiOptions ??= await categoryOptions(companyId);
-      suggestion = await aiSuggestion(companyId, input, settings.aiSettings, aiOptions);
+  try {
+    for (const t of pending) {
+      const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
+      let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
+      if (!suggestion && settings.suggestionSource === 'ai') {
+        // Out of budget: keep this row's stored snapshot for the next sync
+        // rather than replacing it with nothing.
+        if (aiBudget.signal.aborted) continue;
+        aiOptions ??= await categoryOptions(companyId);
+        suggestion = await aiSuggestion(companyId, input, settings.aiSettings, aiOptions, aiBudget.signal);
+        if (suggestion === null && aiBudget.signal.aborted) continue;
+      }
+      const current = JSON.stringify(t.suggestion ?? null);
+      const next = JSON.stringify(suggestion);
+      if (current === next) continue;
+      // A stored history hint stays valid guidance even when the local posting
+      // history can't currently reproduce it (e.g. demo seed, pruned data) —
+      // only replace it with something better, never with nothing.
+      if (suggestion === null) {
+        const existing = t.suggestion as { source?: string } | null;
+        if (existing && existing.source === 'history') continue;
+      }
+      await prisma.transaction.update({
+        where: { id: t.id },
+        data: {
+          suggestion: suggestion === null ? Prisma.DbNull : (suggestion as unknown as Prisma.InputJsonValue),
+        },
+      });
     }
-    const current = JSON.stringify(t.suggestion ?? null);
-    const next = JSON.stringify(suggestion);
-    if (current === next) continue;
-    // A stored history hint stays valid guidance even when the local posting
-    // history can't currently reproduce it (e.g. demo seed, pruned data) —
-    // only replace it with something better, never with nothing.
-    if (suggestion === null) {
-      const existing = t.suggestion as { source?: string } | null;
-      if (existing && existing.source === 'history') continue;
-    }
-    await prisma.transaction.update({
-      where: { id: t.id },
-      data: {
-        suggestion: suggestion === null ? Prisma.DbNull : (suggestion as unknown as Prisma.InputJsonValue),
-      },
-    });
+  } finally {
+    clearTimeout(budgetTimer);
   }
 }
