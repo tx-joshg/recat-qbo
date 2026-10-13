@@ -27,5 +27,8 @@ RUN npx prisma generate
 COPY shared ./shared
 COPY --from=build /app/server/dist ./server/dist
 COPY --from=build /app/client/dist ./client/dist
+# Everything above stays root-owned and read-only to the app. Attachments and
+# receipts live in Postgres, so the server needs no writable paths of its own.
+USER node
 EXPOSE 3001
 CMD ["sh", "-c", "npx prisma migrate deploy && node server/dist/index.js"]
