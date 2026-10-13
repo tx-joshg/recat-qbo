@@ -154,8 +154,19 @@ export function validateSplits(txnAmount: number, splits: { amount: number }[]):
       };
     }
   }
-  const sum = splits.reduce((acc, s) => acc + s.amount, 0);
-  if (Math.abs(sum - txnAmount) > 0.005) {
+  // Compare in whole cents. Split lines are stored to the cent, so a staged
+  // -10.004 would pass a half-cent float tolerance here and then fail this
+  // same check at post time once storage had rounded it.
+  const splitCents: number[] = [];
+  for (const s of splits) {
+    const cents = Math.round(s.amount * 100);
+    if (Math.abs(s.amount * 100 - cents) > 1e-6) {
+      return { ok: false, message: 'Split amounts must be whole cents.' };
+    }
+    splitCents.push(cents);
+  }
+  const sum = splitCents.reduce((acc, cents) => acc + cents, 0);
+  if (sum !== Math.round(txnAmount * 100)) {
     return { ok: false, message: 'Split amounts must add up to the transaction amount.' };
   }
   return { ok: true };

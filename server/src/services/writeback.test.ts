@@ -44,6 +44,12 @@ describe('validateSplits (split sum + per-line sign guard)', () => {
     expect(validateSplits(-0.3, [{ amount: -0.1 }, { amount: -0.2 }]).ok).toBe(true);
   });
 
+  it('rejects fractions of a cent that would round away once stored', () => {
+    const result = validateSplits(-20, [{ amount: -10.004 }, { amount: -9.998 }]);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/whole cents/);
+  });
+
   it('rejects splits that do not sum to the amount', () => {
     const result = validateSplits(-486.12, [{ amount: -400 }, { amount: -86.0 }]);
     expect(result.ok).toBe(false);
