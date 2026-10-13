@@ -11,6 +11,7 @@ import {
   createAgentScheduler,
   guardScheduledLiveCompany,
   listScheduledShadowCompanies,
+  markShadowDiscovery,
   reconcileScheduledLiveMutations,
   runScheduledShadowJob,
   type AgentSchedulerDeps,
@@ -179,8 +180,24 @@ describe('shadow agent scheduler', () => {
         mode: 'shadow',
         company: { disconnectedAt: null },
       },
-      select: { companyId: true, scheduleMinutes: true, liveRequested: true },
+      select: {
+        companyId: true,
+        scheduleMinutes: true,
+        liveRequested: true,
+        lastDiscoveredAt: true,
+      },
       orderBy: { companyId: 'asc' },
+    });
+  });
+
+  it('records discovery only for active shadow configs', async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+
+    await markShadowDiscovery('company-1', NOW, { agentCompanyConfig: { updateMany } });
+
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { companyId: 'company-1', mode: 'shadow' },
+      data: { lastDiscoveredAt: NOW },
     });
   });
 
@@ -215,26 +232,69 @@ describe('shadow agent scheduler', () => {
     expect(listShadowCompanies).toHaveBeenCalledTimes(2);
   });
 
-  it('discovers only deterministic due companies and remains restart-safe', async () => {
+  it('discovers companies whose schedule period has elapsed since the last discovery', async () => {
+    const minutesAgo = (minutes: number) => new Date(NOW.getTime() - minutes * 60_000);
     const listShadowCompanies = vi.fn(async () => [
-      { companyId: 'due-10', scheduleMinutes: 10, liveRequested: false },
-      { companyId: 'not-due-7', scheduleMinutes: 7, liveRequested: false },
-      { companyId: 'due-4', scheduleMinutes: 4, liveRequested: false },
+      { companyId: 'never', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: null },
+      { companyId: 'elapsed', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: minutesAgo(10) },
+      { companyId: 'recent', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: minutesAgo(9) },
+      // A tick that fires a few seconds early still counts as on schedule.
+      { companyId: 'early-tick', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: new Date(NOW.getTime() - 599_990) },
+      { companyId: 'future-clock', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: new Date(NOW.getTime() + 60_000) },
+      { companyId: 'invalid', scheduleMinutes: 0, liveRequested: false, lastDiscoveredAt: null },
     ]);
-    const firstDiscover = vi.fn(async (_companyId: string) => undefined);
-    const secondDiscover = vi.fn(async () => undefined);
+    const discoverJobs = vi.fn(async (_companyId: string) => undefined);
+    const markDiscovered = vi.fn(async (_companyId: string, _at: Date) => undefined);
 
     await createAgentScheduler(schedulerDeps({
       listShadowCompanies,
-      discoverJobs: firstDiscover,
-    })).tick();
-    await createAgentScheduler(schedulerDeps({
-      listShadowCompanies,
-      discoverJobs: secondDiscover,
+      discoverJobs,
+      markDiscovered,
     })).tick();
 
-    expect(firstDiscover.mock.calls.map(([companyId]) => companyId)).toEqual(['due-10', 'due-4']);
-    expect(secondDiscover.mock.calls).toEqual(firstDiscover.mock.calls);
+    const due = ['never', 'elapsed', 'early-tick', 'future-clock'];
+    expect(discoverJobs.mock.calls.map(([companyId]) => companyId)).toEqual(due);
+    expect(markDiscovered.mock.calls).toEqual(due.map((companyId) => [companyId, NOW]));
+  });
+
+  it('catches up a daily schedule after a skipped tick instead of waiting another day', async () => {
+    let now = new Date('2026-07-29T00:00:00.000Z');
+    let lastDiscoveredAt: Date | null = new Date('2026-07-28T00:00:00.000Z');
+    const discoverJobs = vi.fn(async (_companyId: string) => undefined);
+    const scheduler = createAgentScheduler(schedulerDeps({
+      now: () => now,
+      listShadowCompanies: async () => [
+        { companyId: 'daily', scheduleMinutes: 1_440, liveRequested: false, lastDiscoveredAt },
+      ],
+      discoverJobs,
+      markDiscovered: async (_companyId, at) => { lastDiscoveredAt = at; },
+    }));
+
+    // The 00:00 tick never ran (an earlier tick was still busy); 00:01 catches up.
+    now = new Date('2026-07-29T00:01:00.000Z');
+    await scheduler.tick();
+    expect(discoverJobs).toHaveBeenCalledTimes(1);
+    expect(lastDiscoveredAt).toEqual(now);
+
+    now = new Date('2026-07-29T00:02:00.000Z');
+    await scheduler.tick();
+    expect(discoverJobs).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not record discovery that failed, so the next tick retries it', async () => {
+    const discoverJobs = vi.fn(async () => { throw new Error('database unavailable'); });
+    const markDiscovered = vi.fn(async () => undefined);
+
+    await createAgentScheduler(schedulerDeps({
+      listShadowCompanies: async () => [
+        { companyId: 'company-1', scheduleMinutes: 10, liveRequested: false, lastDiscoveredAt: null },
+      ],
+      discoverJobs,
+      markDiscovered,
+    })).tick();
+
+    expect(discoverJobs).toHaveBeenCalledOnce();
+    expect(markDiscovered).not.toHaveBeenCalled();
   });
 
   it('guards every company each cycle and isolates one unhealthy company', async () => {
