@@ -1,4 +1,5 @@
 import { prisma } from '../../lib/prisma.js';
+import { normalizePayee } from '../suggestions.js';
 import type { AgentSnapshotSource } from './core/snapshot.js';
 
 const MAX_RETAINED_ITEMS = 20;
@@ -6,6 +7,18 @@ const MAX_QUERY_ITEMS = 100;
 const REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/u;
 const ASSIGNED_CURRENCY_CODES = new Set(Intl.supportedValuesOf('currency'));
+// SQL mirror of normalizePayee: uppercase, treat '#', '*' and '·' as
+// separators, split on the same whitespace set as JS \s, and drop tokens
+// containing a digit. Verified history is evidence only when its payee
+// normalizes to the same key as the current transaction.
+const NORMALIZED_PAYEE_SQL = `array_to_string(ARRAY(
+  SELECT token.value
+  FROM regexp_split_to_table(upper(translate(txn."payee", '#*·', '   ')),
+    '[\\s\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]+')
+    WITH ORDINALITY AS token(value, ord)
+  WHERE token.value <> '' AND token.value !~ '[0-9]'
+  ORDER BY token.ord
+), ' ')`;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export interface AgentSnapshotQueryDb {
@@ -171,6 +184,7 @@ export async function loadAgentSnapshotSourceInTransaction(
   const current = currentRows[0];
   if (current === undefined) invalid();
   const currentSourceAccountId = reference(current.sourceAccountQboId);
+  const payeeKey = typeof current.payee === 'string' ? normalizePayee(current.payee) : '';
 
   const [accounts, taxRows, tagRows, ruleRows, historyRows] = await Promise.all([
     tx.$queryRawUnsafe<AccountRow[]>(
@@ -227,45 +241,48 @@ export async function loadAgentSnapshotSourceInTransaction(
       companyId,
       text(current.payee, 160),
     ),
-    tx.$queryRawUnsafe<HistoryRow[]>(
-      `/* agent-snapshot:history */
-       WITH latest_verified AS (
-         SELECT DISTINCT ON (attempt."transactionId")
-           attempt."transactionId", attempt."status" AS "mutationStatus",
-           attempt."operation", attempt."expectedRevision",
-           attempt."updatedAt" AS "verifiedAt"
-         FROM "QboMutationAttempt" AS attempt
-         WHERE attempt."status" = 'VERIFIED'
-           AND attempt."operation" = 'recategorize'
-         ORDER BY attempt."transactionId", attempt."updatedAt" DESC, attempt."id" DESC
-       )
-       SELECT txn."id" AS "transactionId", txn."companyId", txn."revision",
-         txn."status", verified."mutationStatus", verified."operation",
-         verified."expectedRevision", txn."date",
-         txn."amount"::text AS "signedAmount",
-         txn."rawData" #>> '{CurrencyRef,value}' AS "currency",
-         txn."payee", txn."memo", txn."taxCalculation",
-         txn."categoryQboId", txn."taxCodeQboId",
-         COALESCE(
-           array_agg(txn_tag."tagId" ORDER BY txn_tag."tagId")
-             FILTER (WHERE txn_tag."tagId" IS NOT NULL),
-           ARRAY[]::text[]
-         ) AS "tagIds",
-         verified."verifiedAt"
-       FROM latest_verified AS verified
-       JOIN "Transaction" AS txn ON txn."id" = verified."transactionId"
-       LEFT JOIN "TxnTag" AS txn_tag ON txn_tag."txnId" = txn."id"
-       WHERE txn."companyId" = $1
-         AND txn."id" <> $2
-         AND txn."status" = 'POSTED'
-         AND txn."revision" = verified."expectedRevision"
-       GROUP BY txn."id", verified."mutationStatus", verified."operation",
-         verified."expectedRevision", verified."verifiedAt"
-       ORDER BY verified."verifiedAt" DESC, txn."id"
-       LIMIT ${MAX_QUERY_ITEMS}`,
-      companyId,
-      transactionId,
-    ),
+    payeeKey === ''
+      ? Promise.resolve<HistoryRow[]>([])
+      : tx.$queryRawUnsafe<HistoryRow[]>(
+        `/* agent-snapshot:history */
+         SELECT txn."id" AS "transactionId", txn."companyId", txn."revision",
+           txn."status", verified."mutationStatus", verified."operation",
+           verified."expectedRevision", txn."date",
+           txn."amount"::text AS "signedAmount",
+           txn."rawData" #>> '{CurrencyRef,value}' AS "currency",
+           txn."payee", txn."memo", txn."taxCalculation",
+           txn."categoryQboId", txn."taxCodeQboId",
+           COALESCE(
+             array_agg(txn_tag."tagId" ORDER BY txn_tag."tagId")
+               FILTER (WHERE txn_tag."tagId" IS NOT NULL),
+             ARRAY[]::text[]
+           ) AS "tagIds",
+           verified."verifiedAt"
+         FROM "Transaction" AS txn
+         CROSS JOIN LATERAL (
+           SELECT attempt."status" AS "mutationStatus", attempt."operation",
+             attempt."expectedRevision", attempt."updatedAt" AS "verifiedAt"
+           FROM "QboMutationAttempt" AS attempt
+           WHERE attempt."transactionId" = txn."id"
+             AND attempt."status" = 'VERIFIED'
+             AND attempt."operation" = 'recategorize'
+           ORDER BY attempt."updatedAt" DESC, attempt."id" DESC
+           LIMIT 1
+         ) AS verified
+         LEFT JOIN "TxnTag" AS txn_tag ON txn_tag."txnId" = txn."id"
+         WHERE txn."companyId" = $1
+           AND txn."id" <> $2
+           AND txn."status" = 'POSTED'
+           AND txn."revision" = verified."expectedRevision"
+           AND ${NORMALIZED_PAYEE_SQL} = $3
+         GROUP BY txn."id", verified."mutationStatus", verified."operation",
+           verified."expectedRevision", verified."verifiedAt"
+         ORDER BY verified."verifiedAt" DESC, txn."id"
+         LIMIT ${MAX_QUERY_ITEMS}`,
+        companyId,
+        transactionId,
+        payeeKey,
+      ),
   ]);
 
   const historyIds = historyRows
@@ -326,6 +343,7 @@ function mapSource(input: {
   const currency = currencyCode(current.currency);
   const sourceAccountId = reference(current.sourceAccountQboId);
   const holdingIds = new Set(stringArray(current.holdingAccountIds).filter(isReference));
+  const payeeKey = typeof current.payee === 'string' ? normalizePayee(current.payee) : '';
 
   const normalizedAccounts = input.accounts.flatMap((row) => {
     if (
@@ -444,6 +462,8 @@ function mapSource(input: {
         && row.expectedRevision !== undefined
         && row.revision !== row.expectedRevision
       )
+      || typeof row.payee !== 'string'
+      || normalizePayee(row.payee) !== payeeKey
     ) return [];
     const amount = maybeCents(row.signedAmount);
     const historyCurrency = maybeCurrency(row.currency);

@@ -158,7 +158,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         qboType: 'Purchase',
         qboSyncToken: '2',
         date: new Date('2026-07-20T00:00:00.000Z'),
-        payee: 'Earlier verified merchant',
+        payee: 'GENERIC\u00a0MERCHANT #4471',
         amount: '-10.00',
         bankAccount: 'Sensitive source label',
         status: 'POSTED',
@@ -188,6 +188,48 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         expectedRevision: 2,
         expectedSyncToken: '1',
         requestHash: `verified-${suffix}`,
+        requestPayload: {},
+        beforeSnapshot: {},
+        verification: { outcome: 'VERIFIED', status: 'POSTED' },
+      },
+    });
+    const unrelatedHistory = await firstClient.transaction.create({
+      data: {
+        companyId: company.id,
+        qboId: `unrelated-history-${suffix}`,
+        qboType: 'Purchase',
+        qboSyncToken: '2',
+        date: new Date('2026-07-21T00:00:00.000Z'),
+        payee: 'Unrelated verified vendor',
+        amount: '-10.00',
+        bankAccount: 'Sensitive source label',
+        status: 'POSTED',
+        revision: 2,
+        taxCalculation: 'NotApplicable',
+        rawData: {
+          CurrencyRef: { value: 'XDR' },
+          AccountRef: { value: 'source-bank' },
+        },
+        splitLines: {
+          create: [{
+            idx: 0,
+            amount: '-10.00',
+            category: 'Expenses · Generic expense',
+            categoryQboId: 'expense-a',
+            taxCodeQboId: null,
+          }],
+        },
+      },
+    });
+    await firstClient.qboMutationAttempt.create({
+      data: {
+        transactionId: unrelatedHistory.id,
+        requestId: `unrelated-history-${suffix}`,
+        operation: 'recategorize',
+        status: 'VERIFIED',
+        expectedRevision: 2,
+        expectedSyncToken: '1',
+        requestHash: `unrelated-${suffix}`,
         requestPayload: {},
         beforeSnapshot: {},
         verification: { outcome: 'VERIFIED', status: 'POSTED' },
