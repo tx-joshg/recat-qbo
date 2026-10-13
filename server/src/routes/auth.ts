@@ -2,7 +2,7 @@
 // the current-session endpoint. Mount this router at the app root — it owns
 // both /auth/* and /api/session paths.
 
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import type { Membership, User } from '@prisma/client';
 import type { SessionDto, UserDto } from '@recat/shared';
@@ -112,10 +112,74 @@ authRouter.post(
   }),
 );
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+/**
+ * The emailed link lands here, but opening it does not sign anyone in. Mail
+ * scanners prefetch links, which would burn a single-use token before the
+ * person clicks it, and a GET that creates a session lets another site sign a
+ * visitor into the attacker's account (login CSRF). The page instead posts the
+ * token back from this origin, which originCheck verifies.
+ */
+export function magicLinkConfirmPage(token: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sign in — Recat</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f1efe8; color: #22211d; font-family: system-ui, sans-serif; }
+  form { background: #fff; border: 1px solid #e9e5db; border-radius: 10px; padding: 28px 32px; text-align: center; }
+  p { margin: 0 0 18px; color: #6d685c; }
+  button { font: inherit; font-weight: 600; color: #fff; background: #2f5d50; border: 0; border-radius: 6px; padding: 10px 22px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <form method="post" action="/auth/callback">
+    <p>Continue to sign in to Recat.</p>
+    <input type="hidden" name="token" value="${escapeHtml(token)}">
+    <button type="submit" autofocus>Sign in</button>
+  </form>
+</body>
+</html>`;
+}
+
 authRouter.get(
   '/auth/callback',
   asyncHandler(async (req, res) => {
     const token = typeof req.query.token === 'string' ? req.query.token : '';
+    if (token === '') {
+      res.redirect(`${await resolvePublicUrl()}/?auth=invalid`);
+      return;
+    }
+    // same-origin, not no-referrer: a no-referrer page makes the browser send
+    // `Origin: null` on the form post, which originCheck rightly rejects.
+    res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+    res.type('html').send(magicLinkConfirmPage(token));
+  }),
+);
+
+authRouter.post(
+  '/auth/callback',
+  express.urlencoded({ extended: false, limit: '4kb' }),
+  asyncHandler(async (req, res) => {
+    const body = req.body as { token?: unknown } | undefined;
+    const token = typeof body?.token === 'string' ? body.token : '';
     const user = token !== '' ? await consumeMagicLink(token) : null;
     if (!user) {
       res.redirect(`${await resolvePublicUrl()}/?auth=invalid`);

@@ -542,14 +542,21 @@ export default function Setup() {
     return flow[flow.indexOf('admin') + 1] ?? 'email';
   };
 
-  // Dev shortcut: consume the magic link in place (the callback sets the
-  // session cookie), then resume at the next step without leaving /setup.
+  // Dev shortcut: consume the magic link in place (the callback's POST sets
+  // the session cookie; its GET only shows a confirm page), then resume at the
+  // next step without leaving /setup.
   const openSignInLink = async () => {
     if (!devLink || busy) return;
     setBusy(true);
     let fetched = false;
     try {
-      await fetch(devLink, { credentials: 'include' });
+      const link = new URL(devLink, window.location.href);
+      await fetch(`${link.origin}${link.pathname}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token: link.searchParams.get('token') ?? '' }),
+      });
       fetched = true;
       const s = await auth.session();
       setSession(s.user);
