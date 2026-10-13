@@ -603,11 +603,18 @@ export interface QboClient {
   ): Promise<QboWriteResult>;
 
   /**
-   * Undo: replace the lines posting to `fromAccountQboIds` (the categories a
-   * previous post wrote) with a single line back to `accountQboId` (holding),
-   * preserving every other line verbatim.
+   * Undo of a legacy post: prepare a write that replaces exactly the lines the
+   * post wrote (`postedLines`, matched by category and exact cents) with one
+   * line back to `holdingAccountQboId`, preserving every other line verbatim.
+   * Throws LineRestoreError when those lines cannot be identified safely.
+   * Send the result with sendPreparedLineWrite.
    */
-  moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult>;
+  prepareLineRestore(
+    txn: QboTxn,
+    postedLines: QboLineWriteSplit[],
+    holdingAccountQboId: string,
+    requestId: string,
+  ): Promise<QboPreparedLineWrite>;
 
   /**
    * QBO's OWN P&L / Balance Sheet numbers via the Reports API — drift-free by

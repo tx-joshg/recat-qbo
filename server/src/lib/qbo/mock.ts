@@ -6,7 +6,7 @@
 // (design_handoff_recat/Recat.dc.html): Harbor & Main Coffee Co. and
 // Bluebird Salon LLC. State is a module-level singleton so it survives across
 // requests within one server process, and it is MUTABLE: recategorize moves a
-// txn's lines out of the holding account, moveToAccount puts them back,
+// txn's lines out of the holding account, an undo's prepared restore puts them back,
 // createTransfer records an entity, and every write bumps the SyncToken —
 // stale tokens throw QboSyncTokenConflict just like the real API.
 
@@ -53,11 +53,9 @@ import {
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
 import {
+  buildPreparedLineRestore,
   buildPreparedLineWrite,
   hashLineWriteContent,
-  rebuildDepositLines,
-  rebuildJournalEntryLines,
-  rebuildPurchaseLines,
   validatePreparedLineWrite,
   verifyLineWriteResult,
 } from './lineWrite.js';
@@ -2107,71 +2105,6 @@ export class MockQboClient implements QboClient {
 
   // ---- writes (all bump SyncToken; stale tokens conflict, like real QBO) ----
 
-  /**
-   * Shared write path mirroring RealQboClient.replaceLines: replace ONLY the
-   * lines posting to `replaceIds`, preserving every other line verbatim.
-   */
-  private replaceLines(
-    txn: QboTxn,
-    replaceIds: ReadonlySet<string>,
-    newLines: { amount: number; accountQboId: string; memo?: string }[],
-  ): QboWriteResult {
-    const entity = this.findEntity(txn.qboType, txn.qboId);
-    if (!entity) throw new Error(`Mock QBO: ${txn.qboType} ${txn.qboId} not found`);
-    if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
-    for (const s of newLines) {
-      if (!this.accountById(s.accountQboId)) {
-        throw new Error(`Mock QBO: unknown account id "${s.accountQboId}" in realm ${this.realmId}`);
-      }
-    }
-    const currentRaw =
-      txn.qboType === 'Deposit' || txn.qboType === 'JournalEntry'
-        ? this.lineWriteBody(entity)
-        : null;
-    const keep = entity.lines.filter((l) => !replaceIds.has(l.accountQboId));
-    const nextLines = [
-      ...keep,
-      ...newLines.map((s, i) => ({
-        id: String(keep.length + i + 1),
-        amount: round2(Math.abs(s.amount)),
-        accountQboId: s.accountQboId,
-        memo: s.memo,
-      })),
-    ];
-    if (currentRaw) {
-      const rebuiltLines =
-        txn.qboType === 'Deposit'
-          ? rebuildDepositLines(
-              currentRaw as unknown as RawDeposit,
-              replaceIds,
-              newLines,
-            )
-          : rebuildJournalEntryLines(
-              currentRaw as unknown as RawJournalEntry,
-              replaceIds,
-              newLines,
-            );
-      const firstNewRawIndex = rebuiltLines.length - newLines.length;
-      const nextRawLines = rebuiltLines.map((line, index) => {
-        if (index < firstNewRawIndex) return line;
-        const newLineIndex = index - firstNewRawIndex;
-        return {
-          ...line,
-          Id: nextLines[keep.length + newLineIndex]!.id,
-        };
-      });
-      entity.rawLineWriteBody = {
-        ...currentRaw,
-        SyncToken: String(entity.syncToken + 1),
-        Line: nextRawLines,
-      };
-    }
-    entity.lines = nextLines;
-    entity.syncToken += 1;
-    entity.lastUpdated = new Date().toISOString();
-    return { ok: true, newSyncToken: String(entity.syncToken) };
-  }
-
   async recategorize(
     txn: QboTxn,
     splits: { amount: number; accountQboId: string; memo?: string }[],
@@ -2185,22 +2118,26 @@ export class MockQboClient implements QboClient {
     return { ok: true, newSyncToken: result.newSyncToken };
   }
 
-  async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {
+  async prepareLineRestore(
+    txn: QboTxn,
+    postedLines: { amount: number; accountQboId: string; memo?: string }[],
+    holdingAccountQboId: string,
+    requestId: string,
+  ): Promise<QboPreparedLineWrite> {
     await ensureMockRealmsHydrated();
-    const replaceIds = new Set(fromAccountQboIds);
     const entity = this.findEntity(txn.qboType, txn.qboId);
-    if (!entity) throw new Error(`Mock QBO: ${txn.qboType} ${txn.qboId} not found`);
-    const sum = round2(
-      entity.lines.reduce((a, l) => (replaceIds.has(l.accountQboId) ? a + l.amount : a), 0),
-    );
-    if (sum <= 0) {
-      throw new Error(
-        'Undo found no lines posting to the previously chosen categories — this transaction was edited in QuickBooks. Verify it there.',
-      );
+    if (!entity) {
+      throw new Error(`Mock QBO: ${txn.qboType} ${txn.qboId} not found`);
     }
-    const result = this.replaceLines(txn, replaceIds, [{ amount: sum, accountQboId }]);
-    await persistMockRealm(this.realmId);
-    return result;
+    if (String(entity.syncToken) !== txn.syncToken) {
+      throw new QboSyncTokenConflict();
+    }
+    return buildPreparedLineRestore({
+      txn: { ...txn, raw: this.lineWriteBody(entity) },
+      postedLines,
+      holdingAccountQboId,
+      requestId,
+    });
   }
 
   async createTransfer(args: {
