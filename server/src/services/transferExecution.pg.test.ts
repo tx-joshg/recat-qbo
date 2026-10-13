@@ -139,7 +139,6 @@ function provider(fixture: Fixture): ProviderHarness {
   harness.client = {
     fetchTxn: vi.fn(async (_qboType: QboTxn['qboType'], qboId: string) =>
       clone(fixture.fresh.get(qboId) ?? null)),
-    fetchWriteSafety: vi.fn(async () => ({ bookCloseDate: null })),
     prepareLineRecategorization: vi.fn(async (
       txn: QboTxn,
       splits: { amount: number; accountQboId: string; memo?: string }[],

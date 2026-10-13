@@ -8,7 +8,6 @@ import {
   validatePreparedLineTransformation,
   validatePreparedLineWrite,
 } from '../lib/qbo/lineWrite.js';
-import { assertFreshTxnWriteAllowed } from '../lib/qbo/txnWriteSafety.js';
 import { prisma } from '../lib/prisma.js';
 import {
   fenceEntityLeaseOwnerships,
@@ -818,7 +817,6 @@ async function prepareLegs(
     }
     const fresh = await client.fetchTxn(txn.qboType, txn.qboId);
     assertFreshEvidence(txn, fresh);
-    await assertFreshTxnWriteAllowed(client, fresh!);
     const amountCents = exactCents(fresh!.amount);
     const requestId = `${operationId}-t${index}`;
     const splits = [{

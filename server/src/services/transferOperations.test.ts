@@ -370,10 +370,8 @@ function fixture(overrides: Partial<TransferOperationDeps> = {}) {
   const sendPreparedLineWrite = vi.fn(async () => {
     throw new Error('preparation must never send');
   });
-  const fetchWriteSafety = vi.fn(async () => ({ bookCloseDate: null as string | null }));
   const client = {
     fetchTxn,
-    fetchWriteSafety,
     prepareLineRecategorization,
     sendPreparedLineWrite,
   } as unknown as QboClient;
@@ -402,7 +400,6 @@ function fixture(overrides: Partial<TransferOperationDeps> = {}) {
     db,
     fresh,
     fetchTxn,
-    fetchWriteSafety,
     prepareLineRecategorization,
     sendPreparedLineWrite,
     authorize,
@@ -533,33 +530,6 @@ describe('prepareTransfer', () => {
     expect(f.fetchTxn).not.toHaveBeenCalled();
     expect(f.db.operations).toEqual([]);
     expect(f.db.attempts).toEqual([]);
-  });
-
-  it('refuses to prepare a transfer dated inside QuickBooks closed books', async () => {
-    const f = fixture();
-    f.fetchWriteSafety.mockResolvedValue({ bookCloseDate: '2099-12-31' });
-
-    await expect(prepareTransfer(input(), f.deps))
-      .rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
-
-    expect(f.fetchWriteSafety).toHaveBeenCalledWith(expect.objectContaining({
-      qboType: 'Deposit',
-      qboId: 'qbo-a-in',
-    }));
-    expect(f.prepareLineRecategorization).not.toHaveBeenCalled();
-    expect(f.db.operations).toHaveLength(0);
-    expect(f.db.attempts).toHaveLength(0);
-  });
-
-  it('checks each leg against the book-close date with its own payment account', async () => {
-    const f = fixture();
-
-    await prepareTransfer(input(), f.deps);
-
-    expect(f.fetchWriteSafety.mock.calls.map(([target]) => target)).toEqual([
-      expect.objectContaining({ qboType: 'Deposit', qboId: 'qbo-a-in', bankAccountQboId: expect.any(String) }),
-      expect.objectContaining({ qboType: 'Purchase', qboId: 'qbo-z-out', bankAccountQboId: expect.any(String) }),
-    ]);
   });
 
   it('returns an exact authorized replay before mutable revision and status validation', async () => {

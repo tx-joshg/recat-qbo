@@ -598,12 +598,10 @@ function fixture(overrides: {
     splits: { amount: number; accountQboId: string; memo?: string }[],
     requestId: string,
   ) => prepared(txn, splits[0]!.accountQboId, requestId));
-  const fetchWriteSafety = vi.fn(async () => ({ bookCloseDate: null as string | null }));
   const client = {
     sendPreparedLineWrite,
     fetchLineWriteSnapshot,
     fetchTxn,
-    fetchWriteSafety,
     prepareLineRecategorization,
   } as unknown as QboClient;
   const authorize = vi.fn(async (
@@ -697,7 +695,6 @@ function fixture(overrides: {
     sendPreparedLineWrite,
     fetchLineWriteSnapshot,
     fetchTxn,
-    fetchWriteSafety,
     prepareLineRecategorization,
     getClient,
     authorize,
@@ -2138,27 +2135,6 @@ describe('retryTransferOperation', () => {
       'PREPARED',
       'PREPARED',
     ]);
-  });
-
-  it('refuses a retry once QuickBooks has closed the books through the transfer date', async () => {
-    const f = fixture();
-    for (const attempt of f.db.attempts) {
-      attempt.status = 'RETRYABLE';
-      attempt.errorCode = 'OPERATION_EXPIRED';
-      attempt.errorMessage = 'expired';
-    }
-    f.fetchWriteSafety.mockResolvedValue({ bookCloseDate: '2099-12-31' });
-
-    await expect(retryTransferOperation(
-      OPERATION_ID,
-      ACTOR,
-      undefined,
-      f.deps,
-    )).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
-
-    expect(f.prepareLineRecategorization).not.toHaveBeenCalled();
-    expect(f.db.operations).toHaveLength(1);
-    expect(f.db.attempts).toHaveLength(2);
   });
 
   it('inherits and re-proves a VERIFIED first leg while creating only the safe replacement leg', async () => {

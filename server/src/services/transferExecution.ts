@@ -12,8 +12,6 @@ import type {
   QboPreparedLineWrite,
   QboTxn,
 } from '../lib/qbo/types.js';
-import { assertFreshTxnWriteAllowed } from '../lib/qbo/txnWriteSafety.js';
-import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import type { AuditInput, MutationAuditInput } from './audit.js';
 import {
   EntityLeaseError,
@@ -2408,11 +2406,9 @@ async function executePreparedLeg(
 
 function isKnownExecutionError(
   error: unknown,
-): error is TransferExecutionError | EntityLeaseError | QboWriteSafetyError {
+): error is TransferExecutionError | EntityLeaseError {
   return error instanceof TransferExecutionError
-    || error instanceof EntityLeaseError
-    // A closed period is a definite refusal the caller must see as such.
-    || error instanceof QboWriteSafetyError;
+    || error instanceof EntityLeaseError;
 }
 
 function retryDto(
@@ -2676,7 +2672,6 @@ async function prepareRetryLegs(
       fresh,
       transaction.qboSyncToken,
     );
-    await assertFreshTxnWriteAllowed(client, fresh);
     const requestId = `${operationId}-t${index}`;
     const splits = [{
       amount: fresh.amount,

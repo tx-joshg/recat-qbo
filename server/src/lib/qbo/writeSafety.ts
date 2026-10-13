@@ -7,11 +7,10 @@ export interface QboWriteSafetyEvidence {
 }
 
 export interface QboWriteSafetyTarget {
-  readonly qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  readonly qboType: 'Purchase' | 'Deposit';
   readonly qboId: string;
   readonly txnDate: string;
-  /** The payment/deposit account; null only for a JournalEntry, which has none. */
-  readonly bankAccountQboId: string | null;
+  readonly bankAccountQboId: string;
 }
 
 export class QboWriteSafetyError extends Error {
@@ -39,7 +38,10 @@ export function assertQboWriteAllowed(
   evidence: QboWriteSafetyEvidence,
 ): void {
   if (
-    !validWriteSafetyTarget(target)
+    (target.qboType !== 'Purchase' && target.qboType !== 'Deposit')
+    || !nonEmpty(target.qboId)
+    || !nonEmpty(target.bankAccountQboId)
+    || !dateOnly(target.txnDate)
     || (evidence.bookCloseDate !== null && !dateOnly(evidence.bookCloseDate))
   ) {
     throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
@@ -50,22 +52,6 @@ export function assertQboWriteAllowed(
       `QuickBooks has closed books through ${evidence.bookCloseDate}.`,
     );
   }
-}
-
-export function validWriteSafetyTarget(target: QboWriteSafetyTarget): boolean {
-  const bankAccountValid = target.bankAccountQboId === null
-    ? target.qboType === 'JournalEntry'
-    : nonEmpty(target.bankAccountQboId);
-  return (
-    (
-      target.qboType === 'Purchase'
-      || target.qboType === 'Deposit'
-      || target.qboType === 'JournalEntry'
-    )
-    && nonEmpty(target.qboId)
-    && bankAccountValid
-    && dateOnly(target.txnDate)
-  );
 }
 
 function dateOnly(value: string): boolean {

@@ -1326,10 +1326,7 @@ export class MockQboClient implements QboClient {
     if (
       !entity
       || entity.date !== target.txnDate
-      || (
-        target.bankAccountQboId !== null
-        && entity.bankAccountQboId !== target.bankAccountQboId
-      )
+      || entity.bankAccountQboId !== target.bankAccountQboId
     ) {
       throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
     }

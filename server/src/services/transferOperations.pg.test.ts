@@ -324,7 +324,6 @@ describePostgres('transfer operation PostgreSQL durability', () => {
     const qbo = {
       fetchTxn: vi.fn(async (_type: QboTxn['qboType'], qboId: string) =>
         structuredClone(fixture.fresh.get(qboId) ?? null)),
-      fetchWriteSafety: vi.fn(async () => ({ bookCloseDate: null })),
       prepareLineRecategorization: vi.fn(async (
         txn: QboTxn,
         splits: { amount: number; accountQboId: string; memo?: string }[],
