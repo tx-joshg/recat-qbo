@@ -9,6 +9,7 @@ import {
 import type { RequestHandler } from 'express';
 import { sha256Hex } from '../lib/crypto.js';
 import { prisma } from '../lib/prisma.js';
+import { devLoginAllowed } from '../services/devLogin.js';
 
 export const RECAT_MCP_SCOPE = 'recat:mcp';
 
@@ -32,6 +33,7 @@ interface McpTokenAuthRow {
   prefix: string;
   expiresAt: Date;
   revokedAt: Date | null;
+  viaExposedSession?: boolean;
   user: {
     id: string;
     isInstanceAdmin: boolean;
@@ -60,6 +62,7 @@ interface RecatTokenVerifierDependencies {
   db?: McpTokenAuthStore;
   now?: () => Date;
   onLastUsedError?: (error: unknown) => void;
+  devLoginAllowed?: () => Promise<boolean>;
 }
 
 function invalidToken(): OAuthError {
@@ -88,6 +91,7 @@ export function createRecatTokenVerifier(
 ): OAuthTokenVerifier {
   const db = dependencies.db ?? (prisma as unknown as McpTokenAuthStore);
   const now = dependencies.now ?? (() => new Date());
+  const isDevLoginAllowed = dependencies.devLoginAllowed ?? devLoginAllowed;
 
   return {
     async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -105,6 +109,9 @@ export function createRecatTokenVerifier(
       ) {
         throw invalidToken();
       }
+      // Minted from a demo-mode devLink session: dies with that session once
+      // real books are connected (see requireUser).
+      if (row.viaExposedSession === true && !(await isDevLoginAllowed())) throw invalidToken();
 
       const principal = safePrincipal(row);
       void Promise.resolve()

@@ -8,6 +8,8 @@ declare global {
     interface Request {
       user?: User & { memberships: Membership[] };
       company?: Company;
+      /** The session was signed in through a demo-mode devLink — see requireUser. */
+      sessionViaExposedLink?: boolean;
     }
   }
 }

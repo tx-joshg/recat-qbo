@@ -7,6 +7,7 @@ import { env } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
+import { devLoginAllowed } from './devLogin.js';
 import { resolvePublicUrl } from './publicUrl.js';
 
 export const MAGIC_LINK_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -20,6 +21,12 @@ export interface IssueMagicLinkOptions {
   invite?: boolean;
   /** Set false for trusted operator flows that must not depend on SMTP. */
   deliver?: boolean;
+  /**
+   * The caller will hand the link back in a response body (the demo-mode
+   * devLink). Recorded on the token and on any session it mints, so both stop
+   * working once a real company is connected.
+   */
+  exposed?: boolean;
 }
 
 /**
@@ -48,6 +55,7 @@ export async function issueMagicLink(
       tokenHash: sha256Hex(token),
       userId: user.id,
       expiresAt: new Date(Date.now() + MAGIC_LINK_TTL_MS),
+      exposed: options.exposed === true,
     },
   });
   const link = await magicLinkUrl(token);
@@ -67,14 +75,17 @@ export async function issueMagicLink(
 
 /**
  * Verify and consume a magic-link token: must exist, be unused, and be
- * unexpired. Marks it used and clears the user's invitePending flag.
- * Returns the user, or null if the token is invalid in any way.
+ * unexpired. An exposed (response-body) token is also refused once dev login
+ * has locked, i.e. a real company is connected. Marks it used and clears the
+ * user's invitePending flag. Returns the user and whether the token was
+ * exposed, or null if the token is invalid in any way.
  */
-export async function consumeMagicLink(token: string): Promise<User | null> {
+export async function consumeMagicLink(token: string): Promise<{ user: User; exposed: boolean } | null> {
   const record = await prisma.magicLinkToken.findUnique({
     where: { tokenHash: sha256Hex(token) },
   });
   if (!record || record.usedAt !== null || record.expiresAt.getTime() <= Date.now()) return null;
+  if (record.exposed && !(await devLoginAllowed())) return null;
 
   // Guarded claim: only one concurrent request can flip usedAt from null.
   const claimed = await prisma.magicLinkToken.updateMany({
@@ -83,8 +94,9 @@ export async function consumeMagicLink(token: string): Promise<User | null> {
   });
   if (claimed.count === 0) return null;
 
-  return prisma.user.update({
+  const user = await prisma.user.update({
     where: { id: record.userId },
     data: { invitePending: false },
   });
+  return { user, exposed: record.exposed };
 }
