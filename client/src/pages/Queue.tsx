@@ -4,6 +4,7 @@
 // All filtering, sorting and row-state transitions happen client-side on the
 // locally-held transaction list, exactly like the prototype.
 
+import { mergeRefreshedRows, TXN_REFRESH_BATCH } from './queue/refreshRows';
 import { createRowStageCoordinator, sameDesired, type DesiredStage, type RowStageView } from './queue/rowStageCoordinator';
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -346,6 +347,16 @@ export default function Queue() {
     return all;
   }, []);
 
+  /** Reloads just the named rows; a full reload is reserved for mount and sync. */
+  const fetchTxnsByIds = useCallback(async (companyId: string, ids: readonly string[]): Promise<TransactionDto[]> => {
+    const all: TransactionDto[] = [];
+    for (let start = 0; start < ids.length; start += TXN_REFRESH_BATCH) {
+      const res = await txnApi.list(companyId, { ids: ids.slice(start, start + TXN_REFRESH_BATCH) });
+      all.push(...res.transactions);
+    }
+    return all;
+  }, []);
+
   useEffect(() => {
     if (!activeCompanyId) return;
     let cancelled = false;
@@ -683,7 +694,7 @@ export default function Queue() {
           },
           reload: async () => {
             if (!companyId) return null;
-            const latestRows = await fetchAllTxns(companyId);
+            const latestRows = await fetchTxnsByIds(companyId, [t.id]);
             if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return null;
             const latest = latestRows.find((row) => row.id === t.id) ?? null;
             const latestDesired = latest ? stageBodyFor(latest, initialTaxState(latest)) : null;
@@ -725,7 +736,7 @@ export default function Queue() {
       }
       coordinator.update(desired);
     },
-    [hasActiveMutation, taxReadyFor, stageBodyFor, fetchAllTxns, patchRow],
+    [hasActiveMutation, taxReadyFor, stageBodyFor, fetchTxnsByIds, patchRow],
   );
 
   useEffect(() => {
@@ -1056,7 +1067,7 @@ export default function Queue() {
 
             let freshRows: TransactionDto[];
             try {
-              freshRows = await fetchAllTxns(companyId);
+              freshRows = await fetchTxnsByIds(companyId, [t.id]);
             } catch {
               markUnresolved();
               return;
@@ -1077,7 +1088,7 @@ export default function Queue() {
                 markUnresolved();
                 return;
               }
-              setRows(freshRows);
+              setRows((prev) => mergeRefreshedRows(prev, freshRows, [t.id]));
               updateTaxState(fresh, (state) => ({
                 ...state,
                 mutation: {
@@ -1096,7 +1107,7 @@ export default function Queue() {
               return;
             }
 
-            setRows(freshRows);
+            setRows((prev) => mergeRefreshedRows(prev, freshRows, [t.id]));
             try {
               const replay = mutation.kind === 'undo'
                 ? txnApi.undoCategorization(t.id, mutation.requestId)
@@ -1130,7 +1141,7 @@ export default function Queue() {
       updateTaxState,
       recordTaxMutation,
       activeCompanyId,
-      fetchAllTxns,
+      fetchTxnsByIds,
       toast,
     ],
   );
@@ -1434,12 +1445,12 @@ export default function Queue() {
     for (let attempt = 0; attempt < 8; attempt++) {
       let fresh: TransactionDto[];
       try {
-        fresh = await fetchAllTxns(activeCompanyId);
+        fresh = await fetchTxnsByIds(activeCompanyId, ids);
       } catch {
         break;
       }
       if (!aliveRef.current) return;
-      setRows(fresh);
+      setRows((prev) => mergeRefreshedRows(prev, fresh, ids));
       setSel((prev) => {
         const next = { ...prev };
         for (const id of ids) {
@@ -1459,7 +1470,7 @@ export default function Queue() {
     taxReadyFor,
     usesTaxLifecycleFor,
     tagsRequired,
-    fetchAllTxns,
+    fetchTxnsByIds,
     toast,
   ]);
 

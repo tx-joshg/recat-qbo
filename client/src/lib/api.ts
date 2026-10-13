@@ -252,6 +252,8 @@ export interface TransactionListParams {
   search?: string;
   account?: string;
   cursor?: string;
+  /** Refresh only these rows (server caps a request at 200 ids). */
+  ids?: string[];
   /** true → server may return an empty `transactions` array; `pendingCount` is still filled. */
   countOnly?: boolean;
 }
