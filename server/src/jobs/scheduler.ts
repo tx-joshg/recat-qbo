@@ -92,19 +92,57 @@ export async function sweepStuckPosting(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Once-a-day claims — the in-process date guards stop a single process from
 // repeating a daily job, but several app instances sharing one database would
-// each run it. The claim is one atomic upsert on AppConfig: only the instance
-// that moves the stored date forward runs the job.
+// each run it. The run is claimed with one atomic upsert on AppConfig and
+// marked done when it finishes. A claim whose instance died before finishing
+// is reclaimable once its 15-minute lease runs out, so a crash does not skip
+// the day.
 // ---------------------------------------------------------------------------
 
-export async function claimDailyRun(job: 'nightly' | 'digest', day: string): Promise<boolean> {
-  const rows = await prisma.$queryRaw<{ key: string }[]>`
+export type DailyRunClaim = 'claimed' | 'done' | 'busy';
+
+export async function claimDailyRun(job: 'nightly' | 'digest', day: string): Promise<DailyRunClaim> {
+  const key = `jobs.lastRun.${job}`;
+  const claimed = await prisma.$queryRaw<{ key: string }[]>`
     INSERT INTO "AppConfig" ("key", "value", "encrypted", "updatedAt")
-    VALUES (${`jobs.lastRun.${job}`}, ${day}, false, now())
+    VALUES (${key}, ${`${day}|running`}, false, now())
     ON CONFLICT ("key") DO UPDATE
       SET "value" = EXCLUDED."value", "updatedAt" = now()
-      WHERE "AppConfig"."value" <> EXCLUDED."value"
+      WHERE split_part("AppConfig"."value", '|', 1) <> ${day}
+         OR (
+           split_part("AppConfig"."value", '|', 2) = 'running'
+           AND "AppConfig"."updatedAt" < now() - interval '15 minutes'
+         )
     RETURNING "key"`;
-  return rows.length === 1;
+  if (claimed.length === 1) return 'claimed';
+  const row = await prisma.appConfig.findUnique({ where: { key } });
+  return row?.value === `${day}|running` ? 'busy' : 'done';
+}
+
+export async function completeDailyRun(job: 'nightly' | 'digest', day: string): Promise<void> {
+  await prisma.appConfig.updateMany({
+    where: { key: `jobs.lastRun.${job}`, value: `${day}|running` },
+    data: { value: `${day}|done` },
+  });
+}
+
+/**
+ * Runs `work` at most once per day across instances. Returns true once the
+ * day's run is settled here (ran, or another instance already finished it);
+ * false while another instance holds the claim, so the caller tries again on
+ * a later tick.
+ */
+async function runDailyOnce(
+  job: 'nightly' | 'digest',
+  day: string,
+  work: () => Promise<void>,
+): Promise<boolean> {
+  const claim = await claimDailyRun(job, day);
+  if (claim === 'busy') return false;
+  if (claim === 'claimed') {
+    await work();
+    await completeDailyRun(job, day);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +167,11 @@ async function pollTick(now: Date): Promise<void> {
 
 async function nightlyTick(now: Date): Promise<void> {
   if (now.getHours() !== NIGHTLY_HOUR || lastNightlyDate === dateKey(now)) return;
-  lastNightlyDate = dateKey(now);
-  if (!(await claimDailyRun('nightly', dateKey(now)))) return;
-  const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
-  for (const c of companies) runSync(c.id, 'nightly');
+  const settled = await runDailyOnce('nightly', dateKey(now), async () => {
+    const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
+    for (const c of companies) runSync(c.id, 'nightly');
+  });
+  if (settled) lastNightlyDate = dateKey(now);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +180,10 @@ async function nightlyTick(now: Date): Promise<void> {
 
 async function digestTick(now: Date): Promise<void> {
   if (now.getHours() !== env.DIGEST_HOUR || lastDigestDate === dateKey(now)) return;
-  lastDigestDate = dateKey(now);
-  if (!(await claimDailyRun('digest', dateKey(now)))) return;
+  if (await runDailyOnce('digest', dateKey(now), sendDigest)) lastDigestDate = dateKey(now);
+}
 
+async function sendDigest(): Promise<void> {
   const companies = await prisma.company.findMany({ where: { disconnectedAt: null } });
   const lines: string[] = [];
   for (const c of companies) {

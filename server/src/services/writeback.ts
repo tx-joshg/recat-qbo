@@ -159,8 +159,11 @@ export function validateSplits(txnAmount: number, splits: { amount: number }[]):
   // same check at post time once storage had rounded it.
   const splitCents: number[] = [];
   for (const s of splits) {
+    // Exact-cent check without an epsilon: an integer over 100 rounds to the
+    // same double as the decimal literal it stands for, so a whole-cent
+    // amount round-trips even where amount * 100 picks up float noise.
     const cents = Math.round(s.amount * 100);
-    if (Math.abs(s.amount * 100 - cents) > 1e-6) {
+    if (cents / 100 !== s.amount) {
       return { ok: false, message: 'Split amounts must be whole cents.' };
     }
     splitCents.push(cents);
@@ -3616,8 +3619,12 @@ async function commitStagedCategorizationInternal(
         }
         client = await d.getClient(input.companyId);
       } catch (error) {
+        // A person's request keeps its PREPARED attempt to finish later. An
+        // autopilot job takes the usual bounded retry path instead, so the
+        // attempt is retired rather than stranded if its retries run out.
         if (
-          error instanceof WritebackLifecycleError
+          autopilot === undefined
+          && error instanceof WritebackLifecycleError
           && error.code === 'DRY_RUN_PREPARED_WRITE'
         ) {
           throw error;

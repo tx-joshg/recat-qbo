@@ -44,6 +44,11 @@ describe('validateSplits (split sum + per-line sign guard)', () => {
     expect(validateSplits(-0.3, [{ amount: -0.1 }, { amount: -0.2 }]).ok).toBe(true);
   });
 
+  it('accepts large whole-cent amounts whose float scaling is inexact', () => {
+    // 551683882.81 * 100 === 55168388280.99999 in binary floating point.
+    expect(validateSplits(-551683892.81, [{ amount: -551683882.81 }, { amount: -10 }]).ok).toBe(true);
+  });
+
   it('rejects fractions of a cent that would round away once stored', () => {
     const result = validateSplits(-20, [{ amount: -10.004 }, { amount: -9.998 }]);
     expect(result.ok).toBe(false);

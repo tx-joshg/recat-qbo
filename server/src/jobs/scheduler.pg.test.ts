@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
 import { prisma } from '../lib/prisma.js';
-import { claimDailyRun, sweepStuckPosting } from './scheduler.js';
+import { claimDailyRun, completeDailyRun, sweepStuckPosting } from './scheduler.js';
 
 const describePostgres = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -15,11 +15,25 @@ describePostgres('background job scheduler (PostgreSQL)', () => {
     const day = `test-${randomUUID()}`;
     const claims = await Promise.all([...Array(6)].map(() => claimDailyRun('digest', day)));
 
-    expect(claims.filter(Boolean)).toHaveLength(1);
-    await expect(claimDailyRun('digest', day)).resolves.toBe(false);
-    await expect(claimDailyRun('digest', `${day}-next`)).resolves.toBe(true);
+    expect(claims.filter((claim) => claim === 'claimed')).toHaveLength(1);
+    expect(claims.filter((claim) => claim === 'busy')).toHaveLength(5);
+    await completeDailyRun('digest', day);
+    await expect(claimDailyRun('digest', day)).resolves.toBe('done');
+    await expect(claimDailyRun('digest', `${day}-next`)).resolves.toBe('claimed');
     // Each job keeps its own claim.
-    await expect(claimDailyRun('nightly', day)).resolves.toBe(true);
+    await expect(claimDailyRun('nightly', day)).resolves.toBe('claimed');
+  });
+
+  it('lets another instance take over a run whose claimant died before finishing', async () => {
+    const day = `test-${randomUUID()}`;
+    await expect(claimDailyRun('nightly', day)).resolves.toBe('claimed');
+    await expect(claimDailyRun('nightly', day)).resolves.toBe('busy');
+
+    await prisma.$executeRaw`
+      UPDATE "AppConfig" SET "updatedAt" = now() - interval '16 minutes'
+       WHERE "key" = 'jobs.lastRun.nightly'`;
+
+    await expect(claimDailyRun('nightly', day)).resolves.toBe('claimed');
   });
 
   it('does not sweep a transaction whose post finished after it was read', async () => {
