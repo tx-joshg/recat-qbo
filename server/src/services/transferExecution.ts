@@ -6,6 +6,7 @@ import {
   verifyLineWriteResult,
 } from '../lib/qbo/lineWrite.js';
 import { prisma } from '../lib/prisma.js';
+import { assertTxnWriteSafety } from '../lib/qbo/writeSafety.js';
 import type {
   QboClient,
   QboLineWriteSnapshot,
@@ -2672,6 +2673,7 @@ async function prepareRetryLegs(
       fresh,
       transaction.qboSyncToken,
     );
+    await assertTxnWriteSafety(client, fresh);
     const requestId = `${operationId}-t${index}`;
     const splits = [{
       amount: fresh.amount,

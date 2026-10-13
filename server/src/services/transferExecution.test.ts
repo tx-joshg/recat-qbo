@@ -598,10 +598,14 @@ function fixture(overrides: {
     splits: { amount: number; accountQboId: string; memo?: string }[],
     requestId: string,
   ) => prepared(txn, splits[0]!.accountQboId, requestId));
+  const fetchWriteSafety = vi.fn<QboClient['fetchWriteSafety']>(
+    async () => ({ bookCloseDate: null }),
+  );
   const client = {
     sendPreparedLineWrite,
     fetchLineWriteSnapshot,
     fetchTxn,
+    fetchWriteSafety,
     prepareLineRecategorization,
   } as unknown as QboClient;
   const authorize = vi.fn(async (

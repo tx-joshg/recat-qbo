@@ -8,6 +8,8 @@ import {
   validatePreparedLineTransformation,
   validatePreparedLineWrite,
   verifyLineWriteResult,
+  buildPreparedLineRestore,
+  findPostedLineIds,
 } from './lineWrite.js';
 import type { QboTxn } from './types.js';
 
@@ -638,5 +640,79 @@ describe('verifyLineWriteResult', () => {
   ])('rejects a readback with %s', (_name, snapshot) => {
     const prepared = validPrepared();
     expect(() => verifyLineWriteResult(prepared, snapshot(prepared))).toThrow();
+  });
+});
+
+describe('buildPreparedLineRestore', () => {
+  function journal(lines: { id: string; posting: 'Debit' | 'Credit'; account: string; amount: number }[]): QboTxn {
+    return {
+      qboId: 'je-1',
+      qboType: 'JournalEntry',
+      syncToken: '3',
+      date: '2026-08-01',
+      payee: 'Generic payee',
+      amount: 0,
+      bankAccount: 'Generic bank',
+      lines: [],
+      raw: {
+        Id: 'je-1',
+        SyncToken: '3',
+        Line: lines.map((l) => ({
+          Id: l.id,
+          Amount: l.amount,
+          DetailType: 'JournalEntryLineDetail',
+          JournalEntryLineDetail: { PostingType: l.posting, AccountRef: { value: l.account } },
+        })),
+      },
+    };
+  }
+
+  it('replaces only the posted split lines with one holding line', () => {
+    const txn = journal([
+      { id: '1', posting: 'Debit', account: 'office', amount: 20 },
+      { id: '2', posting: 'Debit', account: 'office', amount: 30 },
+      { id: '3', posting: 'Debit', account: 'meals', amount: 5 },
+      { id: '4', posting: 'Credit', account: 'bank', amount: 55 },
+    ]);
+    const prepared = buildPreparedLineRestore({
+      txn,
+      postedLines: [
+        { amount: -30, accountQboId: 'office' },
+        { amount: -5, accountQboId: 'meals' },
+      ],
+      holdingAccountQboId: 'holding',
+      requestId: 'undo-1',
+    });
+    const lines = prepared.body.Line as { Id?: string; Amount: number; JournalEntryLineDetail: unknown }[];
+    expect(lines.map((l) => [l.Id, l.Amount, l.JournalEntryLineDetail])).toEqual([
+      ['1', 20, { PostingType: 'Debit', AccountRef: { value: 'office' } }],
+      ['4', 55, { PostingType: 'Credit', AccountRef: { value: 'bank' } }],
+      [undefined, 35, { PostingType: 'Debit', AccountRef: { value: 'holding' } }],
+    ]);
+    expect(prepared.requestId).toBe('undo-1');
+    expect(prepared.before.syncToken).toBe('3');
+  });
+
+  it('never matches the credit side', () => {
+    const txn = journal([
+      { id: '1', posting: 'Debit', account: 'office', amount: 30 },
+      { id: '2', posting: 'Credit', account: 'office', amount: 30 },
+    ]);
+    expect(findPostedLineIds(txn, [{ amount: -30, accountQboId: 'office' }])).toEqual(['1']);
+  });
+
+  it.each([
+    ['missing', [{ id: '1', posting: 'Debit' as const, account: 'office', amount: 31 }], 'POSTED_LINES_CHANGED'],
+    ['ambiguous', [
+      { id: '1', posting: 'Debit' as const, account: 'office', amount: 30 },
+      { id: '2', posting: 'Debit' as const, account: 'office', amount: 30 },
+    ], 'POSTED_LINES_AMBIGUOUS'],
+  ])('refuses when the posted line is %s', (_label, lines, code) => {
+    expect(() => buildPreparedLineRestore({
+      txn: journal(lines),
+      postedLines: [{ amount: -30, accountQboId: 'office' }],
+      holdingAccountQboId: 'holding',
+      requestId: 'undo-1',
+    })).toThrow(expect.objectContaining({ code }));
   });
 });

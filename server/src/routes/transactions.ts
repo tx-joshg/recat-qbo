@@ -445,6 +445,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
     message: 'This transaction has a prepared write that must be resumed or verified.',
   },
   PREWRITE_PERSISTENCE_FAILED: { status: 503, message: 'The prepared write was not sent. Retry with a new request.' },
+  QBO_AMOUNT_CHANGED: {
+    status: 409,
+    message: 'The amount changed in QuickBooks. Review the new amount, then retry.',
+  },
   QBO_AMOUNT_UNSAFE: { status: 400, message: 'The transaction amount cannot be categorized safely.' },
   QBO_DEPOSIT_UNSUPPORTED: { status: 400, message: 'This transaction cannot use tax-aware Deposit writeback.' },
   QBO_ENTITY_UNSUPPORTED: { status: 400, message: 'This transaction type cannot use tax-aware writeback.' },
@@ -876,12 +880,18 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    let result;
     try {
-      await undoPost(id, actorFor(user));
+      result = await undoPost(id, actorFor(user));
     } catch (err) {
       const mapped = mappedServiceHttpError(err);
       if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
+    }
+    if (!result.ok) {
+      // The undo may have reached QuickBooks; the row is ERROR with a
+      // verify-first message rather than reported as undone.
+      throw new HttpError(409, result.error?.message ?? 'The undo could not be confirmed.', 'UNDO_FAILED');
     }
     res.json(await dtoById(id));
   }),

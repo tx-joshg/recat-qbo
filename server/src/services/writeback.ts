@@ -20,6 +20,8 @@ import {
   type QboClient,
   type QboDepositPreparedWrite,
   type QboDepositSnapshot,
+  type QboLineWriteSnapshot,
+  type QboPreparedLineWrite,
   type QboPreparedWrite,
   type QboPurchasePreparedWrite,
   type QboPurchaseSnapshot,
@@ -67,6 +69,7 @@ import {
 } from './categorizationEvidence.js';
 import {
   assertQboWriteAllowed,
+  assertTxnWriteSafety,
   QboWriteSafetyError,
   type QboWriteSafetyTarget,
 } from '../lib/qbo/writeSafety.js';
@@ -274,6 +277,63 @@ async function markSuperseded(
 // postTransaction
 // ---------------------------------------------------------------------------
 
+function legacyCents(value: number | { toString(): string }): number {
+  return Math.round(Number(value.toString()) * 100);
+}
+
+function formatCents(cents: number): string {
+  const sign = cents < 0 ? '-' : '';
+  return `${sign}$${(Math.abs(cents) / 100).toFixed(2)}`;
+}
+
+/**
+ * Refuse a legacy post when QuickBooks' holding-line total no longer equals the
+ * cached amount the splits were built from. The row goes to ERROR with the
+ * fresh amount and SyncToken mirrored, so a human reviews the new amount (and
+ * re-splits if needed) before retrying.
+ */
+async function refuseChangedAmount(
+  d: WritebackDeps,
+  txn: { id: string; companyId: string; payee: string; amount: number | { toString(): string } },
+  fresh: QboTxn,
+  actor: Actor,
+): Promise<PostResult | null> {
+  const cachedCents = legacyCents(txn.amount);
+  const freshCents = legacyCents(fresh.amount);
+  if (cachedCents === freshCents) return null;
+  const info = {
+    code: 'QBO_AMOUNT_CHANGED',
+    message:
+      `QuickBooks now shows ${formatCents(freshCents)} for this transaction, not ${formatCents(cachedCents)}. ` +
+      'Review the new amount, then retry.',
+  };
+  await d.db.$transaction(async (tx) => {
+    await tx.transaction.update({
+      where: { id: txn.id },
+      data: {
+        status: 'ERROR',
+        amount: freshCents / 100,
+        qboSyncToken: fresh.syncToken,
+        errorCode: info.code,
+        errorMessage: info.message,
+      },
+    });
+    await d.audit(tx, {
+      companyId: txn.companyId,
+      actorId: actor.id,
+      actorLabel: actor.label,
+      txnId: txn.id,
+      payee: txn.payee,
+      amount: cachedCents / 100,
+      action: 'error',
+      before: formatCents(cachedCents),
+      after: formatCents(freshCents),
+      payload: { qboAmount: freshCents / 100, cachedAmount: cachedCents / 100, error: info },
+    });
+  });
+  return { id: txn.id, ok: false, status: 'ERROR', error: info };
+}
+
 async function legacyNeedsStaging(
   db: PrismaClient,
   txn: {
@@ -371,7 +431,15 @@ export async function postTransaction(
     }
   }
 
-  await d.db.transaction.update({ where: { id: txnId }, data: { status: 'POSTING' } });
+  // Compare-and-swap into POSTING so two racing posts (or a post racing
+  // auto-post) cannot both reach QuickBooks for the same row.
+  const claimed = await d.db.transaction.updateMany({
+    where: { id: txnId, status: { in: ['PENDING', 'ERROR'] } },
+    data: { status: 'POSTING' },
+  });
+  if (claimed.count !== 1) {
+    throw new WritebackLifecycleError('INVALID_STATUS', 'This transaction is already being posted.');
+  }
 
   const holdingIds = jsonStringArray(company.holdingAccountIds);
   const baseTxn = { id: txn.id, companyId: txn.companyId, payee: txn.payee, amount };
@@ -388,6 +456,11 @@ export async function postTransaction(
       return await markSuperseded(d, baseTxn, before);
     }
     const before = holdingLine.accountName;
+    // The splits below carry the locally cached amount. If QuickBooks now
+    // holds a different amount (edited since the last sync), writing them
+    // would silently rewrite the entity's total.
+    const amountChanged = await refuseChangedAmount(d, txn, fresh, actor);
+    if (amountChanged) return amountChanged;
 
     // ---- build the write payload ----
     const writeSplits: WriteSplit[] = [];
@@ -459,6 +532,10 @@ export async function postTransaction(
         const refetched = await client.fetchTxn(txn.qboType as QboTxn['qboType'], txn.qboId);
         const stillHolding = refetched?.lines.some((l) => holdingIds.includes(l.accountQboId));
         if (!refetched || !stillHolding) return await markSuperseded(d, baseTxn, before);
+        // A conflict means someone just edited the entity: re-prove the amount
+        // before resending the same splits.
+        const changedOnRetry = await refuseChangedAmount(d, txn, refetched, actor);
+        if (changedOnRetry) return changedOnRetry;
         payload.syncToken = refetched.syncToken;
         await assertTxnWriteSafety(client, refetched);
         result = await client.recategorize(refetched, writeSplits);
@@ -564,6 +641,37 @@ export async function postTransaction(
 
 const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
+type LineWriteFailureOutcome =
+  | { kind: 'applied'; syncToken: string }
+  | { kind: 'not-applied' }
+  | { kind: 'uncertain' };
+
+async function classifyLineWriteFailure(
+  client: QboClient,
+  prepared: QboPreparedLineWrite,
+): Promise<LineWriteFailureOutcome> {
+  let current: QboLineWriteSnapshot | null;
+  try {
+    current = await client.fetchLineWriteSnapshot(prepared.qboType, prepared.qboId);
+  } catch {
+    return { kind: 'uncertain' };
+  }
+  if (current === null) return { kind: 'uncertain' };
+  if (
+    current.contentHash === prepared.expected.contentHash
+    && current.syncToken !== prepared.before.syncToken
+  ) {
+    return { kind: 'applied', syncToken: current.syncToken };
+  }
+  if (
+    current.syncToken === prepared.before.syncToken
+    && current.contentHash === prepared.before.contentHash
+  ) {
+    return { kind: 'not-applied' };
+  }
+  return { kind: 'uncertain' };
+}
+
 export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps): Promise<PostResult> {
   const d = deps ?? (await defaultDeps());
 
@@ -609,23 +717,67 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
       // the queue — fail loudly instead.
       throw new Error('This transaction no longer exists in QuickBooks.');
     }
-    // Pull back exactly the category lines the post wrote; any other lines on
-    // the entity are preserved verbatim by moveToAccount.
-    const fromIds: string[] = [];
-    if (splits && splits.length > 0) {
-      for (const s of splits) {
-        const acct = await resolveCategoryAccount(d.db, company.id, s.categoryQboId, s.category);
-        if (acct) fromIds.push(acct.qboId);
-      }
-    } else {
-      const acct = await resolveCategoryAccount(d.db, company.id, txn.categoryQboId, txn.category ?? '');
-      if (acct) fromIds.push(acct.qboId);
+    // The post recorded the SyncToken QuickBooks returned. Any other token
+    // means the entity was edited after the post, so restoring the holding
+    // line could overwrite that edit.
+    if (fresh.syncToken !== txn.qboSyncToken) {
+      throw new WritebackLifecycleError(
+        'QBO_EDITED_SINCE_POST',
+        'This transaction was edited in QuickBooks after it was posted. Undo it in QuickBooks instead.',
+      );
     }
-    if (fromIds.length === 0) {
-      throw new Error('Cannot undo — the posted category could not be resolved. Re-sync the chart of accounts.');
+    // Pull back exactly the lines the post wrote, matched by category and
+    // cents; lines the bookkeeper categorized themselves stay untouched.
+    const postedLines: { amount: number; accountQboId: string }[] = [];
+    const postedSplits = splits && splits.length > 0
+      ? splits.map((s) => ({ amount: s.amount, categoryQboId: s.categoryQboId, category: s.category }))
+      : [{ amount, categoryQboId: txn.categoryQboId, category: txn.category ?? '' }];
+    for (const s of postedSplits) {
+      const acct = await resolveCategoryAccount(d.db, company.id, s.categoryQboId, s.category);
+      if (!acct) {
+        throw new Error('Cannot undo — the posted category could not be resolved. Re-sync the chart of accounts.');
+      }
+      postedLines.push({ amount: s.amount, accountQboId: acct.qboId });
     }
     await assertTxnWriteSafety(client, fresh);
-    const result = await client.moveToAccount(fresh, holdingId, fromIds);
+    const prepared = await client.prepareLineRestore(fresh, postedLines, holdingId, randomUUID());
+    let result: { newSyncToken: string };
+    try {
+      result = await client.sendPreparedLineWrite(prepared);
+    } catch (err) {
+      if (err instanceof QboSyncTokenConflict) throw err;
+      // The request may have reached QuickBooks. Read back the entity: the
+      // exact restored content means the undo landed; the untouched
+      // before-image means it did not. Anything else is unknown.
+      const outcome = await classifyLineWriteFailure(client, prepared);
+      if (outcome.kind === 'not-applied') throw err;
+      if (outcome.kind === 'uncertain') {
+        const info = {
+          code: 'UNDO_UNCERTAIN',
+          message: 'QuickBooks may have applied the undo — verify in QuickBooks, then retry.',
+        };
+        await d.db.$transaction(async (tx) => {
+          await tx.transaction.update({
+            where: { id: txnId },
+            data: { status: 'ERROR', errorCode: info.code, errorMessage: info.message },
+          });
+          await d.audit(tx, {
+            companyId: company.id,
+            actorId: actor.id,
+            actorLabel: actor.label,
+            txnId,
+            payee: txn.payee,
+            amount,
+            action: 'error',
+            before: beforeLabel,
+            after: `${holdingName} (undo)`,
+            payload: { requestId: prepared.requestId, error: info },
+          });
+        });
+        return { id: txnId, ok: false, status: 'ERROR', error: info };
+      }
+      result = { newSyncToken: outcome.syncToken };
+    }
     newSyncToken = result.newSyncToken;
     qboWrote = true;
   }
@@ -3254,36 +3406,6 @@ async function assertPreparedWriteSafety(
   prepared: QboPreparedWrite,
 ): Promise<void> {
   const target = preparedWriteSafetyTarget(prepared);
-  const evidence = await client.fetchWriteSafety(target);
-  assertQboWriteAllowed(target, evidence);
-}
-
-function txnWriteSafetyTarget(txn: QboTxn): QboWriteSafetyTarget | null {
-  if (txn.qboType === 'JournalEntry') return null;
-  const raw = txn.raw;
-  const accountRef = raw && typeof raw === 'object'
-    ? (raw as Record<string, unknown>)[txn.qboType === 'Purchase' ? 'AccountRef' : 'DepositToAccountRef']
-    : undefined;
-  const bankAccountQboId = accountRef && typeof accountRef === 'object'
-    ? (accountRef as Record<string, unknown>).value
-    : undefined;
-  if (typeof bankAccountQboId !== 'string' || bankAccountQboId.length === 0) {
-    throw new QboWriteSafetyError(
-      'QBO_WRITE_SAFETY_UNAVAILABLE',
-      'QuickBooks payment-account identity is unavailable for the safety check.',
-    );
-  }
-  return {
-    qboType: txn.qboType,
-    qboId: txn.qboId,
-    txnDate: txn.date,
-    bankAccountQboId,
-  };
-}
-
-async function assertTxnWriteSafety(client: QboClient, txn: QboTxn): Promise<void> {
-  const target = txnWriteSafetyTarget(txn);
-  if (!target) return;
   const evidence = await client.fetchWriteSafety(target);
   assertQboWriteAllowed(target, evidence);
 }

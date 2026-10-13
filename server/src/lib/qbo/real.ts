@@ -74,11 +74,9 @@ import {
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
 import {
+  buildPreparedLineRestore,
   buildPreparedLineWrite,
   hashLineWriteContent,
-  rebuildDepositLines,
-  rebuildJournalEntryLines,
-  rebuildPurchaseLines,
   serializeLineWriteRequest,
   validatePreparedLineWrite,
   verifyLineWriteResult,
@@ -96,6 +94,7 @@ import {
 } from './depositTax.js';
 import {
   QboWriteSafetyError,
+  isWriteSafetyType,
   type QboWriteSafetyEvidence,
   type QboWriteSafetyTarget,
 } from './writeSafety.js';
@@ -1426,7 +1425,7 @@ export class RealQboClient implements QboClient {
 
   async fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence> {
     if (
-      (target.qboType !== 'Purchase' && target.qboType !== 'Deposit')
+      !isWriteSafetyType(target.qboType)
       || target.qboId.trim() === ''
       || target.bankAccountQboId.trim() === ''
       || !/^\d{4}-\d{2}-\d{2}$/u.test(target.txnDate)
@@ -1913,56 +1912,18 @@ export class RealQboClient implements QboClient {
     return { ok: true, newSyncToken: result.newSyncToken };
   }
 
-  async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {
-    // Undo = the posting update in reverse: replace the lines posting to the
-    // categories a previous post wrote with one line back to the holding
-    // account, summing exactly what those lines carry — every other line is
-    // preserved verbatim.
-    const replaceIds = new Set(fromAccountQboIds);
-    const sum = sumLinesPostingTo(txn, replaceIds);
-    if (sum <= 0) {
-      throw new Error(
-        'Undo found no lines posting to the previously chosen categories — this transaction was edited in QuickBooks. Verify it there.',
-      );
-    }
-    return this.replaceLines(txn, replaceIds, [{ amount: sum, accountQboId }]);
-  }
-
-  private async replaceLines(
+  async prepareLineRestore(
     txn: QboTxn,
-    replaceIds: ReadonlySet<string>,
-    newLines: QboWriteLine[],
-  ): Promise<QboWriteResult> {
-    if (txn.qboType === 'Purchase') {
-      const raw = txn.raw as RawPurchase;
-      const body: RawPurchase = {
-        ...raw,
-        SyncToken: txn.syncToken,
-        Line: rebuildPurchaseLines(raw, replaceIds, newLines),
-      };
-      const res = await this.request<{ Purchase?: RawPurchase }>('POST', '/purchase', body);
-      return { ok: true, newSyncToken: res.Purchase?.SyncToken ?? txn.syncToken };
-    }
-    if (txn.qboType === 'Deposit') {
-      const raw = txn.raw as RawDeposit;
-      const body: RawDeposit = {
-        ...raw,
-        SyncToken: txn.syncToken,
-        Line: rebuildDepositLines(raw, replaceIds, newLines),
-      };
-      const res = await this.request<{ Deposit?: RawDeposit }>('POST', '/deposit', body);
-      return { ok: true, newSyncToken: res.Deposit?.SyncToken ?? txn.syncToken };
-    }
-    // JournalEntry: replace only the matching Debit lines; the Credit side and
-    // any other Debit lines are kept.
-    const raw = txn.raw as RawJournalEntry;
-    const body: RawJournalEntry = {
-      ...raw,
-      SyncToken: txn.syncToken,
-      Line: rebuildJournalEntryLines(raw, replaceIds, newLines),
-    };
-    const res = await this.request<{ JournalEntry?: RawJournalEntry }>('POST', '/journalentry', body);
-    return { ok: true, newSyncToken: res.JournalEntry?.SyncToken ?? txn.syncToken };
+    postedLines: QboLineWriteSplit[],
+    holdingAccountQboId: string,
+    requestId: string,
+  ): Promise<QboPreparedLineWrite> {
+    return buildPreparedLineRestore({
+      txn,
+      postedLines,
+      holdingAccountQboId,
+      requestId,
+    });
   }
 
   async getStatement(
