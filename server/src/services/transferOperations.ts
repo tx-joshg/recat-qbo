@@ -9,6 +9,7 @@ import {
   validatePreparedLineWrite,
 } from '../lib/qbo/lineWrite.js';
 import { prisma } from '../lib/prisma.js';
+import { assertTxnWriteSafety } from '../lib/qbo/writeSafety.js';
 import {
   fenceEntityLeaseOwnerships,
   withEntityLeases,
@@ -817,6 +818,8 @@ async function prepareLegs(
     }
     const fresh = await client.fetchTxn(txn.qboType, txn.qboId);
     assertFreshEvidence(txn, fresh);
+    // Same closed-books guard as a categorization write.
+    await assertTxnWriteSafety(client, fresh!);
     const amountCents = exactCents(fresh!.amount);
     const requestId = `${operationId}-t${index}`;
     const splits = [{

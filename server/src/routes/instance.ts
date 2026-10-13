@@ -404,9 +404,10 @@ setupRouter.post(
       create: { email, isInstanceAdmin: true, invitePending: false },
       update: { isInstanceAdmin: true, invitePending: false },
     });
-    const { link } = await issueMagicLink(user);
     const smtp = await isSmtpConfigured();
-    const devLink = !smtp && (await devLoginAllowed()) ? link : undefined;
+    const exposed = !smtp && (await devLoginAllowed());
+    const { link } = await issueMagicLink(user, { exposed });
+    const devLink = exposed ? link : undefined;
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
   }),
 );

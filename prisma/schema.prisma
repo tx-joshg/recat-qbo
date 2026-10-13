@@ -129,6 +129,10 @@ model MagicLinkToken {
   expiresAt DateTime
   usedAt    DateTime?
   createdAt DateTime  @default(now())
+  /// The link was handed back in an API response body (the demo-mode devLink)
+  /// rather than only emailed or logged. Such a link stops working once a real
+  /// company is connected — see devLoginAllowed.
+  exposed   Boolean   @default(false)
 
   /// Issuance prunes this user's spent and expired tokens before creating a
   /// new one. Without this the cleanup scans the whole table on every public
@@ -143,6 +147,9 @@ model Session {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   expiresAt DateTime
   createdAt DateTime @default(now())
+  /// Signed in through an exposed (response-body) magic link. Revoked on its
+  /// next use once a real company is connected — see devLoginAllowed.
+  viaExposedLink Boolean @default(false)
 }
 
 model McpToken {
@@ -156,6 +163,9 @@ model McpToken {
   createdAt  DateTime  @default(now())
   lastUsedAt DateTime?
   revokedAt  DateTime?
+  /// Created from a session signed in through an exposed (demo-mode devLink)
+  /// magic link. Refused once a real company is connected, like the session.
+  viaExposedSession Boolean @default(false)
 
   @@index([userId, createdAt])
 }

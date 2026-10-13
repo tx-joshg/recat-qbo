@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { assertQboWriteAllowed, type QboWriteSafetyTarget } from './writeSafety.js';
+import { assertQboWriteAllowed, txnWriteSafetyTarget, type QboWriteSafetyTarget } from './writeSafety.js';
+import type { QboTxn } from './types.js';
 
 const purchase: QboWriteSafetyTarget = {
   qboType: 'Purchase',
@@ -46,6 +47,49 @@ describe('QuickBooks write safety', () => {
     [{ ...purchase, bankAccountQboId: '' }, { bookCloseDate: null, cleared: false, reconciled: false }],
   ])('fails closed on malformed safety input', (target, evidence) => {
     expect(() => assertQboWriteAllowed(target, evidence))
+      .toThrow(expect.objectContaining({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' }));
+  });
+});
+
+describe('txnWriteSafetyTarget', () => {
+  const base = {
+    qboId: 'entity-1',
+    syncToken: '0',
+    date: '2026-08-01',
+    payee: 'Generic payee',
+    amount: -10,
+    bankAccount: 'Generic bank',
+    lines: [],
+  };
+
+  it('uses the first credit account as a JournalEntry funding side', () => {
+    const txn: QboTxn = {
+      ...base,
+      qboType: 'JournalEntry',
+      raw: {
+        Line: [
+          { JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: 'holding-1' } } },
+          { JournalEntryLineDetail: { PostingType: 'Credit', AccountRef: { value: 'bank-1' } } },
+        ],
+      },
+    };
+    expect(txnWriteSafetyTarget(txn)).toEqual({
+      qboType: 'JournalEntry',
+      qboId: 'entity-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    });
+    expect(() => assertQboWriteAllowed(txnWriteSafetyTarget(txn), { bookCloseDate: '2026-08-01' }))
+      .toThrow(expect.objectContaining({ code: 'QBO_PERIOD_CLOSED' }));
+  });
+
+  it('fails closed when a JournalEntry has no credit account', () => {
+    const txn: QboTxn = {
+      ...base,
+      qboType: 'JournalEntry',
+      raw: { Line: [{ JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: 'holding-1' } } }] },
+    };
+    expect(() => txnWriteSafetyTarget(txn))
       .toThrow(expect.objectContaining({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' }));
   });
 });

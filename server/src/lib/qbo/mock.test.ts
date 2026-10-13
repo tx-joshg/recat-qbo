@@ -102,7 +102,7 @@ describe('MockQboClient multi-line entity safety', () => {
     expect(total).toBeCloseTo(536.12, 2);
   });
 
-  it('moveToAccount pulls back only the previously posted category lines (undo)', async () => {
+  it('a prepared restore pulls back only the previously posted category lines (undo)', async () => {
     addCategorizedLine();
     const c = client();
     const txn = await c.fetchTxn('Purchase', '2');
@@ -111,7 +111,9 @@ describe('MockQboClient multi-line entity safety', () => {
 
     const posted = await c.fetchTxn('Purchase', '2');
     if (!posted) throw new Error('missing posted txn');
-    await c.moveToAccount(posted, '4', ['17']);
+    await c.sendPreparedLineWrite(
+      await c.prepareLineRestore(posted, [{ amount: -486.12, accountQboId: '17' }], '4', 'undo-1'),
+    );
 
     const entity = getMockRealm(MOCK_REALM_HARBOR).txns.find((t) => t.qboId === '2');
     if (!entity) throw new Error('missing entity');
@@ -122,11 +124,34 @@ describe('MockQboClient multi-line entity safety', () => {
     expect(entity.lines.reduce((a, l) => a + l.amount, 0)).toBeCloseTo(536.12, 2);
   });
 
-  it('moveToAccount fails loudly when no lines post to the given categories', async () => {
+  it('undo keeps a bookkeeper line that shares the posted category', async () => {
+    addCategorizedLine();
     const c = client();
     const txn = await c.fetchTxn('Purchase', '2');
     if (!txn) throw new Error('missing txn');
-    await expect(c.moveToAccount(txn, '4', ['17'])).rejects.toThrow(/no lines posting/);
+    // Post the holding portion to the same category as the existing $50 line.
+    await c.recategorize(txn, [{ amount: -486.12, accountQboId: '10' }]);
+
+    const posted = await c.fetchTxn('Purchase', '2');
+    if (!posted) throw new Error('missing posted txn');
+    await c.sendPreparedLineWrite(
+      await c.prepareLineRestore(posted, [{ amount: -486.12, accountQboId: '10' }], '4', 'undo-1'),
+    );
+
+    const entity = getMockRealm(MOCK_REALM_HARBOR).txns.find((t) => t.qboId === '2');
+    if (!entity) throw new Error('missing entity');
+    expect(entity.lines.filter((l) => l.accountQboId === '4' && l.amount === 486.12)).toHaveLength(1);
+    expect(entity.lines.filter((l) => l.accountQboId === '10' && l.amount === 50)).toHaveLength(1);
+    expect(entity.lines).toHaveLength(2);
+  });
+
+  it('a prepared restore fails closed when the posted lines are not on the entity', async () => {
+    const c = client();
+    const txn = await c.fetchTxn('Purchase', '2');
+    if (!txn) throw new Error('missing txn');
+    await expect(
+      c.prepareLineRestore(txn, [{ amount: -486.12, accountQboId: '17' }], '4', 'undo-1'),
+    ).rejects.toMatchObject({ code: 'POSTED_LINES_CHANGED' });
   });
 
   it('listTxnsInAccounts filters lines by the ids given (wizard candidate probing)', async () => {
@@ -901,7 +926,14 @@ describe('MockQboClient prepared transfer line writes', () => {
       const posted = await fixture.client.fetchTxn(qboType, fixture.qboId);
       if (!posted) throw new Error('generic posted line-write fixture missing');
 
-      await fixture.client.moveToAccount(posted, '4', ['17']);
+      await fixture.client.sendPreparedLineWrite(
+        await fixture.client.prepareLineRestore(
+          posted,
+          [{ amount: original.amount, accountQboId: '17' }],
+          '4',
+          'undo-1',
+        ),
+      );
 
       const undone = await fixture.client.fetchTxn(qboType, fixture.qboId);
       const snapshot = await fixture.client.fetchLineWriteSnapshot(

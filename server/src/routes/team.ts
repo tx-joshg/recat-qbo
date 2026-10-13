@@ -116,8 +116,9 @@ teamRouter.post(
     // New users get an invite link; existing users already sign in on their own.
     let devLink: string | undefined;
     if (isNew) {
-      const { link } = await issueMagicLink(user, { invite: true });
-      if (!(await isSmtpConfigured()) && (await devLoginAllowed())) devLink = link;
+      const exposed = !(await isSmtpConfigured()) && (await devLoginAllowed());
+      const { link } = await issueMagicLink(user, { invite: true, exposed });
+      if (exposed) devLink = link;
     }
 
     const member = toMemberDto(user, role);

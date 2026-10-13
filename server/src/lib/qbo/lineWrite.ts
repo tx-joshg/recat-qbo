@@ -270,11 +270,18 @@ export function rebuildPurchaseLines(
   replaceIds: ReadonlySet<string>,
   newLines: QboLineWriteSplit[],
 ): RawPurchaseLine[] {
-  const lines = raw.Line ?? [];
-  const isReplaced = (line: RawPurchaseLine): boolean => {
+  return rebuildPurchaseLinesWhere(raw, (line) => {
     const id = line.AccountBasedExpenseLineDetail?.AccountRef?.value;
     return id !== undefined && replaceIds.has(id);
-  };
+  }, newLines);
+}
+
+function rebuildPurchaseLinesWhere(
+  raw: RawPurchase,
+  isReplaced: (line: RawPurchaseLine) => boolean,
+  newLines: QboLineWriteSplit[],
+): RawPurchaseLine[] {
+  const lines = raw.Line ?? [];
   const replaced = lines.filter(isReplaced);
   if (replaced.length === 1 && newLines.length === 1) {
     const split = newLines[0]!;
@@ -315,10 +322,17 @@ export function rebuildDepositLines(
   replaceIds: ReadonlySet<string>,
   newLines: QboLineWriteSplit[],
 ): RawDepositLine[] {
-  const isReplaced = (line: RawDepositLine): boolean => {
+  return rebuildDepositLinesWhere(raw, (line) => {
     const id = line.DepositLineDetail?.AccountRef?.value;
     return id !== undefined && replaceIds.has(id);
-  };
+  }, newLines);
+}
+
+function rebuildDepositLinesWhere(
+  raw: RawDeposit,
+  isReplaced: (line: RawDepositLine) => boolean,
+  newLines: QboLineWriteSplit[],
+): RawDepositLine[] {
   const lines = raw.Line ?? [];
   const replaced = lines.filter(isReplaced);
   if (replaced.length === 1 && newLines.length === 1) {
@@ -362,8 +376,7 @@ export function rebuildJournalEntryLines(
   replaceIds: ReadonlySet<string>,
   newLines: QboLineWriteSplit[],
 ): RawJournalEntryLine[] {
-  const lines = raw.Line ?? [];
-  const isReplaced = (line: RawJournalEntryLine): boolean => {
+  return rebuildJournalEntryLinesWhere(raw, (line) => {
     const detail = line.JournalEntryLineDetail;
     const id = detail?.AccountRef?.value;
     return (
@@ -371,7 +384,15 @@ export function rebuildJournalEntryLines(
       && id !== undefined
       && replaceIds.has(id)
     );
-  };
+  }, newLines);
+}
+
+function rebuildJournalEntryLinesWhere(
+  raw: RawJournalEntry,
+  isReplaced: (line: RawJournalEntryLine) => boolean,
+  newLines: QboLineWriteSplit[],
+): RawJournalEntryLine[] {
+  const lines = raw.Line ?? [];
   const replaced = lines.filter(isReplaced);
   if (replaced.length === 1 && newLines.length === 1) {
     const split = newLines[0]!;
@@ -496,6 +517,167 @@ export function buildPreparedLineWrite(args: {
             txn.raw as unknown as RawJournalEntry,
             holdingIds,
             splits,
+          ),
+  };
+  return validatePreparedLineWrite({
+    operation: 'transfer',
+    qboType: txn.qboType,
+    qboId: txn.qboId,
+    requestId,
+    requestHash: hashLineWriteRequest(body),
+    body,
+    before: {
+      qboType: txn.qboType,
+      qboId: txn.qboId,
+      syncToken: txn.syncToken,
+      contentHash: hashLineWriteContent(txn.raw),
+    },
+    expected: {
+      qboType: txn.qboType,
+      qboId: txn.qboId,
+      contentHash: hashLineWriteContent(body),
+    },
+  });
+}
+
+export type LineRestoreErrorCode =
+  | 'POSTED_LINES_CHANGED'
+  | 'POSTED_LINES_AMBIGUOUS';
+
+const LINE_RESTORE_MESSAGES: Readonly<Record<LineRestoreErrorCode, string>> = {
+  POSTED_LINES_CHANGED:
+    'The lines this post wrote are no longer on the transaction in QuickBooks. Undo it there instead.',
+  POSTED_LINES_AMBIGUOUS:
+    'This transaction has another line with the same category and amount, so it is not clear which line the post wrote. Undo it in QuickBooks instead.',
+};
+
+export class LineRestoreError extends Error {
+  constructor(readonly code: LineRestoreErrorCode) {
+    super(LINE_RESTORE_MESSAGES[code]);
+    this.name = 'LineRestoreError';
+  }
+}
+
+interface CategoryLine {
+  id: string | undefined;
+  accountQboId: string | undefined;
+  amountCents: number;
+}
+
+function categoryLines(txn: QboTxn): CategoryLine[] {
+  const cents = (amount: number | undefined): number =>
+    Math.round(Math.abs(amount ?? 0) * 100);
+  if (txn.qboType === 'Purchase') {
+    return ((txn.raw as RawPurchase).Line ?? []).map((line) => ({
+      id: line.Id,
+      accountQboId: line.AccountBasedExpenseLineDetail?.AccountRef?.value,
+      amountCents: cents(line.Amount),
+    }));
+  }
+  if (txn.qboType === 'Deposit') {
+    return ((txn.raw as RawDeposit).Line ?? []).map((line) => ({
+      id: line.Id,
+      accountQboId: line.DepositLineDetail?.AccountRef?.value,
+      amountCents: cents(line.Amount),
+    }));
+  }
+  return ((txn.raw as RawJournalEntry).Line ?? [])
+    .filter((line) => line.JournalEntryLineDetail?.PostingType === 'Debit')
+    .map((line) => ({
+      id: line.Id,
+      accountQboId: line.JournalEntryLineDetail?.AccountRef?.value,
+      amountCents: cents(line.Amount),
+    }));
+}
+
+/**
+ * The QBO line ids a previous post wrote, matched by exact category and cents.
+ * Lines the bookkeeper categorized themselves are never selected: if a posted
+ * line cannot be found, or another line has the same category and amount,
+ * the undo is refused rather than guessing.
+ */
+export function findPostedLineIds(
+  txn: QboTxn,
+  postedLines: readonly QboLineWriteSplit[],
+): string[] {
+  const needed = new Map<string, number>();
+  for (const line of postedLines) {
+    const key = `${line.accountQboId}|${Math.round(Math.abs(line.amount) * 100)}`;
+    needed.set(key, (needed.get(key) ?? 0) + 1);
+  }
+  const available = new Map<string, string[]>();
+  for (const line of categoryLines(txn)) {
+    if (line.accountQboId === undefined) continue;
+    const key = `${line.accountQboId}|${line.amountCents}`;
+    if (!needed.has(key)) continue;
+    if (!isNonEmptyString(line.id)) throw new LineRestoreError('POSTED_LINES_CHANGED');
+    available.set(key, [...(available.get(key) ?? []), line.id]);
+  }
+  const ids: string[] = [];
+  for (const [key, count] of needed) {
+    const found = available.get(key) ?? [];
+    if (found.length < count) throw new LineRestoreError('POSTED_LINES_CHANGED');
+    if (found.length > count) throw new LineRestoreError('POSTED_LINES_AMBIGUOUS');
+    ids.push(...found);
+  }
+  return ids;
+}
+
+/**
+ * Undo of a legacy post: replace exactly the lines that post wrote with one
+ * line back to the holding account, preserving every other line verbatim.
+ */
+export function buildPreparedLineRestore(args: {
+  txn: QboTxn;
+  postedLines: QboLineWriteSplit[];
+  holdingAccountQboId: string;
+  requestId: string;
+}): QboPreparedLineWrite {
+  const { txn, requestId, holdingAccountQboId } = args;
+  if (!isRecord(txn.raw)) {
+    throw new Error('QuickBooks transaction raw body is not a JSON object.');
+  }
+  if (
+    txn.raw.Id !== txn.qboId
+    || txn.raw.SyncToken !== txn.syncToken
+    || !isNonEmptyString(requestId)
+    || !isNonEmptyString(holdingAccountQboId)
+    || args.postedLines.length === 0
+  ) {
+    throw new Error('Line restore input is invalid.');
+  }
+  const lineIds = new Set(findPostedLineIds(txn, args.postedLines));
+  const restoredCents = args.postedLines.reduce(
+    (sum, line) => sum + Math.round(Math.abs(line.amount) * 100),
+    0,
+  );
+  const restore: QboLineWriteSplit[] = [{
+    amount: restoredCents / 100,
+    accountQboId: holdingAccountQboId,
+  }];
+  const body: Record<string, unknown> = {
+    ...txn.raw,
+    Id: txn.qboId,
+    SyncToken: txn.syncToken,
+    Line: txn.qboType === 'Purchase'
+      ? rebuildPurchaseLinesWhere(
+          txn.raw as unknown as RawPurchase,
+          (line) => line.Id !== undefined && lineIds.has(line.Id),
+          restore,
+        )
+      : txn.qboType === 'Deposit'
+        ? rebuildDepositLinesWhere(
+            txn.raw as unknown as RawDeposit,
+            (line) => line.Id !== undefined && lineIds.has(line.Id),
+            restore,
+          )
+        : rebuildJournalEntryLinesWhere(
+            txn.raw as unknown as RawJournalEntry,
+            (line) =>
+              line.JournalEntryLineDetail?.PostingType === 'Debit'
+              && line.Id !== undefined
+              && lineIds.has(line.Id),
+            restore,
           ),
   };
   return validatePreparedLineWrite({

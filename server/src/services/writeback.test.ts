@@ -13,6 +13,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTxn,
 } from '../lib/qbo/types.js';
+import { buildPreparedLineRestore } from '../lib/qbo/lineWrite.js';
 import {
   bulkPost,
   commitStagedCategorization,
@@ -237,6 +238,16 @@ function makeFakeDb(row: FakeTxnRow) {
         Object.assign(row, args.data);
         return row;
       }),
+      updateMany: vi.fn(async (args: {
+        where: { status?: { in: string[] } };
+        data: Record<string, unknown>;
+      }) => {
+        if (args.where.status && !args.where.status.in.includes(row.status)) {
+          return { count: 0 };
+        }
+        Object.assign(row, args.data);
+        return { count: 1 };
+      }),
     },
     qboAccount: {
       findFirst: vi.fn(async () => ({
@@ -460,6 +471,79 @@ describe('legacy write safety', () => {
   });
 });
 
+describe('postTransaction stale amount and status claim', () => {
+  it('refuses to write cached splits when QuickBooks holds a different amount', async () => {
+    const row = makeTxnRow({ amount: -50 });
+    const recategorize = vi.fn();
+    const fresh = { ...freshQboTxn('3'), amount: -55, lines: [{ id: '1', amount: 55, accountQboId: '4', accountName: 'Ask My Accountant' }] };
+    const { deps, audit } = makeDeps(row, { fetchTxn: async () => fresh, recategorize });
+
+    const result = await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(result).toMatchObject({ ok: false, status: 'ERROR', error: { code: 'QBO_AMOUNT_CHANGED' } });
+    expect(result.error?.message).toContain('-$55.00');
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(row).toMatchObject({ status: 'ERROR', amount: -55, qboSyncToken: '3', errorCode: 'QBO_AMOUNT_CHANGED' });
+    expect(audit.mock.calls.map((c) => (c[1] as { action: string }).action)).toEqual(['error']);
+  });
+
+  it('re-proves the amount after a SyncToken conflict instead of resending stale splits', async () => {
+    const row = makeTxnRow();
+    const fetchTxn = vi.fn()
+      .mockResolvedValueOnce(freshQboTxn('1'))
+      .mockResolvedValueOnce({ ...freshQboTxn('2'), amount: -31, lines: [{ id: '1', amount: 31, accountQboId: '4', accountName: 'Ask My Accountant' }] });
+    const recategorize = vi.fn().mockRejectedValueOnce(new QboSyncTokenConflict());
+    const { deps } = makeDeps(row, { fetchTxn, recategorize });
+
+    const result = await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(result).toMatchObject({ ok: false, status: 'ERROR', error: { code: 'QBO_AMOUNT_CHANGED' } });
+    expect(recategorize).toHaveBeenCalledTimes(1);
+    expect(row.amount).toBe(-31);
+  });
+
+  it('loses the POSTING claim to a concurrent post without touching QuickBooks', async () => {
+    const row = makeTxnRow();
+    const fetchTxn = vi.fn(async () => freshQboTxn());
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, recategorize });
+    db.transaction.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    await expect(postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps))
+      .rejects.toMatchObject({ code: 'INVALID_STATUS' });
+    expect(fetchTxn).not.toHaveBeenCalled();
+    expect(recategorize).not.toHaveBeenCalled();
+  });
+
+  it('applies the closed-books guard to a JournalEntry post', async () => {
+    const row = makeTxnRow({ qboType: 'JournalEntry' });
+    const recategorize = vi.fn();
+    const fetchWriteSafety = vi.fn(async () => ({ bookCloseDate: '2026-07-31' }));
+    const fresh: QboTxn = {
+      ...freshQboTxn(),
+      qboType: 'JournalEntry',
+      raw: {
+        Line: [
+          { Id: '1', Amount: 29, JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: '4' } } },
+          { Id: '2', Amount: 29, JournalEntryLineDetail: { PostingType: 'Credit', AccountRef: { value: 'payment-generic' } } },
+        ],
+      },
+    };
+    const { deps } = makeDeps(row, { fetchTxn: async () => fresh, fetchWriteSafety, recategorize });
+
+    const result = await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(result).toMatchObject({ ok: false, status: 'PENDING', error: { code: 'QBO_PERIOD_CLOSED' } });
+    expect(fetchWriteSafety).toHaveBeenCalledWith({
+      qboType: 'JournalEntry',
+      qboId: '6',
+      txnDate: '2026-07-05',
+      bankAccountQboId: 'payment-generic',
+    });
+    expect(recategorize).not.toHaveBeenCalled();
+  });
+});
+
 describe('postTransaction dual-write honesty', () => {
   it('marks ERROR with a "verify in QuickBooks" message when the DB commit fails after a successful QBO write', async () => {
     const row = makeTxnRow();
@@ -482,51 +566,258 @@ describe('postTransaction dual-write honesty', () => {
   });
 });
 
+function postedQboTxn(
+  syncToken = '4',
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry' = 'Purchase',
+  categoryLines: { id: string; accountQboId: string; amount: number }[] = [
+    { id: '1', accountQboId: '25', amount: 29 },
+  ],
+): QboTxn {
+  const line = (l: { id: string; accountQboId: string; amount: number }) =>
+    qboType === 'Purchase'
+      ? {
+          Id: l.id,
+          Amount: l.amount,
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: { AccountRef: { value: l.accountQboId } },
+        }
+      : qboType === 'Deposit'
+        ? { Id: l.id, Amount: l.amount, DetailType: 'DepositLineDetail', DepositLineDetail: { AccountRef: { value: l.accountQboId } } }
+        : {
+            Id: l.id,
+            Amount: l.amount,
+            DetailType: 'JournalEntryLineDetail',
+            JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: l.accountQboId } },
+          };
+  const total = categoryLines.reduce((sum, l) => sum + l.amount, 0);
+  const raw: Record<string, unknown> = {
+    Id: '6',
+    SyncToken: syncToken,
+    TxnDate: '2026-07-05',
+    Line: [
+      ...categoryLines.map(line),
+      ...(qboType === 'JournalEntry'
+        ? [{
+            Id: '99',
+            Amount: total,
+            DetailType: 'JournalEntryLineDetail',
+            JournalEntryLineDetail: { PostingType: 'Credit', AccountRef: { value: 'payment-generic' } },
+          }]
+        : []),
+    ],
+    ...(qboType === 'Purchase' ? { AccountRef: { value: 'payment-generic' } } : {}),
+    ...(qboType === 'Deposit' ? { DepositToAccountRef: { value: 'payment-generic' } } : {}),
+  };
+  return {
+    qboId: '6',
+    qboType,
+    syncToken,
+    date: '2026-07-05',
+    payee: 'WEBFLOW.COM',
+    amount: 0,
+    bankAccount: 'Visa ·0392',
+    lines: [],
+    raw,
+  };
+}
+
+const restoreClient = {
+  prepareLineRestore: async (
+    txn: QboTxn,
+    postedLines: { amount: number; accountQboId: string }[],
+    holdingAccountQboId: string,
+    requestId: string,
+  ) => buildPreparedLineRestore({ txn, postedLines, holdingAccountQboId, requestId }),
+};
+
+type SendPrepared = QboClient['sendPreparedLineWrite'];
+
+function sentLines(send: ReturnType<typeof vi.fn<SendPrepared>>): unknown {
+  const prepared = send.mock.calls[0]?.[0];
+  return (prepared?.body as { Line?: unknown } | undefined)?.Line;
+}
+
 describe('undoPost', () => {
   const postedCompany = { id: 'co-1', dryRun: true, tagsRequired: false, holdingAccountIds: ['4'] };
 
-  it.each(['Purchase', 'Deposit'] as const)(
-    'undoes a reconciled %s in an open period',
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
+    'undoes a posted %s in an open period with a prepared, request-id write',
     async (qboType) => {
-      const row = makeTxnRow({ qboType, status: 'POSTED', postedAt: new Date(), company: postedCompany });
-      const moveToAccount = vi.fn().mockResolvedValue({ ok: true, newSyncToken: '5' });
+      const row = makeTxnRow({ qboType, qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+      const sendPreparedLineWrite = vi.fn<SendPrepared>().mockResolvedValue({
+        ok: true,
+        newSyncToken: '5',
+        snapshot: { qboType, qboId: '6', syncToken: '5', contentHash: 'a'.repeat(64) },
+      });
+      const fetchWriteSafety = vi.fn(async () => ({ bookCloseDate: null }));
       const { deps } = makeDeps(row, {
-        fetchTxn: async () => freshQboTxn('4', qboType),
-        fetchWriteSafety: async () => ({ bookCloseDate: null }),
-        moveToAccount,
+        ...restoreClient,
+        fetchTxn: async () => postedQboTxn('4', qboType),
+        fetchWriteSafety,
+        sendPreparedLineWrite,
       });
       await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
         .resolves.toMatchObject({ ok: true, status: 'PENDING' });
-      expect(moveToAccount).toHaveBeenCalledTimes(1);
+      expect(sendPreparedLineWrite).toHaveBeenCalledTimes(1);
+      expect(sendPreparedLineWrite.mock.calls[0]?.[0].requestId).toMatch(/\S/);
+      expect(fetchWriteSafety).toHaveBeenCalledWith(expect.objectContaining({
+        qboType,
+        bankAccountQboId: 'payment-generic',
+      }));
       expect(row.qboSyncToken).toBe('5');
+      expect(row.status).toBe('PENDING');
     },
   );
 
-  it.each(['Purchase', 'Deposit'] as const)(
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
     'blocks a closed-period %s before legacy undo and preserves POSTED state',
     async (qboType) => {
       const row = makeTxnRow({
         qboType,
+        qboSyncToken: '4',
         status: 'POSTED',
         postedAt: new Date(),
         company: postedCompany,
       });
-      const moveToAccount = vi.fn();
+      const sendPreparedLineWrite = vi.fn();
       const { deps } = makeDeps(row, {
-        fetchTxn: async () => freshQboTxn('4', qboType),
+        ...restoreClient,
+        fetchTxn: async () => postedQboTxn('4', qboType),
         fetchWriteSafety: async () => ({
           bookCloseDate: '2026-07-05',
         }),
-        moveToAccount,
+        sendPreparedLineWrite,
       });
 
       await expect(
         undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps),
       ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
-      expect(moveToAccount).not.toHaveBeenCalled();
+      expect(sendPreparedLineWrite).not.toHaveBeenCalled();
       expect(row.status).toBe('POSTED');
     },
   );
+
+  it('refuses when the entity was edited in QuickBooks after the post', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('7'),
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .rejects.toMatchObject({ code: 'QBO_EDITED_SINCE_POST' });
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
+    expect(row.status).toBe('POSTED');
+  });
+
+  it('restores only the posted line and keeps a bookkeeper line in the same category', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn<SendPrepared>().mockResolvedValue({
+      ok: true,
+      newSyncToken: '5',
+      snapshot: { qboType: 'Purchase', qboId: '6', syncToken: '5', contentHash: 'a'.repeat(64) },
+    });
+    const { deps } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4', 'Purchase', [
+        { id: '1', accountQboId: '25', amount: 20 },
+        { id: '2', accountQboId: '25', amount: 29 },
+      ]),
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .resolves.toMatchObject({ ok: true, status: 'PENDING' });
+    expect(sentLines(sendPreparedLineWrite)).toEqual([
+      expect.objectContaining({
+        Id: '1',
+        Amount: 20,
+        AccountBasedExpenseLineDetail: { AccountRef: { value: '25' } },
+      }),
+      expect.objectContaining({
+        Id: '2',
+        Amount: 29,
+        AccountBasedExpenseLineDetail: { AccountRef: { value: '4' } },
+      }),
+    ]);
+  });
+
+  it('refuses when another line has the same category and amount as the posted line', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4', 'Purchase', [
+        { id: '1', accountQboId: '25', amount: 29 },
+        { id: '2', accountQboId: '25', amount: 29 },
+      ]),
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .rejects.toMatchObject({ code: 'POSTED_LINES_AMBIGUOUS' });
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
+    expect(row.status).toBe('POSTED');
+  });
+
+  it('finalizes the undo when a timed-out send is read back as applied', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn<SendPrepared>().mockRejectedValue(new QboRequestTimeout());
+    const fetchLineWriteSnapshot = vi.fn<QboClient['fetchLineWriteSnapshot']>(async () => {
+      const prepared = sendPreparedLineWrite.mock.calls[0]![0];
+      return { ...prepared.expected, syncToken: '5' };
+    });
+    const { deps } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4'),
+      fetchLineWriteSnapshot,
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .resolves.toMatchObject({ ok: true, status: 'PENDING' });
+    expect(row.status).toBe('PENDING');
+    expect(row.qboSyncToken).toBe('5');
+  });
+
+  it('keeps POSTED and rethrows when a failed send is read back as not applied', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn<SendPrepared>().mockRejectedValue(new QboRequestTimeout());
+    const fetchLineWriteSnapshot = vi.fn<QboClient['fetchLineWriteSnapshot']>(async () =>
+      sendPreparedLineWrite.mock.calls[0]![0].before);
+    const { deps } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4'),
+      fetchLineWriteSnapshot,
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .rejects.toBeInstanceOf(QboRequestTimeout);
+    expect(row.status).toBe('POSTED');
+  });
+
+  it('marks ERROR with a verify-first message when the undo outcome is unknown', async () => {
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn<SendPrepared>().mockRejectedValue(new QboRequestTimeout());
+    const fetchLineWriteSnapshot = vi.fn<QboClient['fetchLineWriteSnapshot']>(async () => {
+      throw new Error('network down');
+    });
+    const { deps, audit } = makeDeps(row, {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4'),
+      fetchLineWriteSnapshot,
+      sendPreparedLineWrite,
+    });
+
+    await expect(undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps))
+      .resolves.toMatchObject({ ok: false, status: 'ERROR', error: { code: 'UNDO_UNCERTAIN' } });
+    expect(row.status).toBe('ERROR');
+    expect(row.errorMessage).toMatch(/verify in QuickBooks/);
+    expect(audit.mock.calls.map((c) => (c[1] as { action: string }).action)).toEqual(['error']);
+  });
 
   it('blocks a tax-ready Purchase before legacy undo status or QBO work', async () => {
     const row = makeTxnRow({
@@ -542,8 +833,8 @@ describe('undoPost', () => {
       },
     });
     const fetchTxn = vi.fn();
-    const moveToAccount = vi.fn();
-    const { deps, db } = makeDeps(row, { fetchTxn, moveToAccount });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, sendPreparedLineWrite });
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
@@ -553,7 +844,7 @@ describe('undoPost', () => {
     });
     expect(db.transaction.update).not.toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
     expect(row.status).toBe('PENDING');
   });
 
@@ -582,8 +873,8 @@ describe('undoPost', () => {
       },
     });
     const fetchTxn = vi.fn();
-    const moveToAccount = vi.fn();
-    const { deps, db } = makeDeps(row, { fetchTxn, moveToAccount });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, sendPreparedLineWrite });
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
@@ -593,7 +884,7 @@ describe('undoPost', () => {
     });
     expect(db.transaction.update).not.toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
   });
 
   it('keeps a staged Deposit out of legacy undo after sales-tax readiness is lost', async () => {
@@ -614,8 +905,8 @@ describe('undoPost', () => {
       },
     });
     const fetchTxn = vi.fn();
-    const moveToAccount = vi.fn();
-    const { deps, db } = makeDeps(row, { fetchTxn, moveToAccount });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, sendPreparedLineWrite });
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
@@ -624,7 +915,7 @@ describe('undoPost', () => {
     });
     expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -653,31 +944,37 @@ describe('undoPost', () => {
       },
     });
     const fetchTxn = vi.fn();
-    const moveToAccount = vi.fn();
-    const { deps } = makeDeps(row, { fetchTxn, moveToAccount });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps } = makeDeps(row, { fetchTxn, sendPreparedLineWrite });
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
     ).resolves.toMatchObject({ ok: true, status: 'PENDING' });
     expect(fetchTxn).not.toHaveBeenCalled();
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
   });
 
   it('always reverses a POSTED txn in QBO, even when dry-run is enabled NOW', async () => {
-    const row = makeTxnRow({ status: 'POSTED', postedAt: new Date(), company: postedCompany });
-    const moveToAccount = vi.fn(async (_txn: unknown, _accountQboId: string, _fromIds: string[]) => ({
-      ok: true as const,
+    const row = makeTxnRow({ qboSyncToken: '4', status: 'POSTED', postedAt: new Date(), company: postedCompany });
+    const sendPreparedLineWrite = vi.fn<SendPrepared>().mockResolvedValue({
+      ok: true,
       newSyncToken: '5',
-    }));
-    const client: Partial<QboClient> = { fetchTxn: async () => freshQboTxn('4'), moveToAccount };
+      snapshot: { qboType: 'Purchase', qboId: '6', syncToken: '5', contentHash: 'a'.repeat(64) },
+    });
+    const client: Partial<QboClient> = {
+      ...restoreClient,
+      fetchTxn: async () => postedQboTxn('4'),
+      sendPreparedLineWrite,
+    };
     const { deps } = makeDeps(row, client, true); // env DRY_RUN also on
 
     const result = await undoPost('txn-1', { id: 'u-1', label: 'Maria K.' }, deps);
 
-    expect(moveToAccount).toHaveBeenCalledTimes(1);
-    // Pulls back exactly the category lines the post wrote.
-    expect(moveToAccount.mock.calls[0]?.[1]).toBe('4');
-    expect(moveToAccount.mock.calls[0]?.[2]).toEqual(['25']);
+    expect(sendPreparedLineWrite).toHaveBeenCalledTimes(1);
+    // Pulls the posted category line back into holding.
+    expect(sentLines(sendPreparedLineWrite)).toEqual([
+      expect.objectContaining({ Id: '1', Amount: 29, AccountBasedExpenseLineDetail: { AccountRef: { value: '4' } } }),
+    ]);
     expect(result).toMatchObject({ ok: true, status: 'PENDING' });
     expect(row.status).toBe('PENDING');
     expect(row.qboSyncToken).toBe('5');
@@ -685,24 +982,24 @@ describe('undoPost', () => {
 
   it('never writes to QBO when undoing a DRY_RUN post', async () => {
     const row = makeTxnRow({ status: 'DRY_RUN', postedAt: new Date(), company: postedCompany });
-    const moveToAccount = vi.fn();
+    const sendPreparedLineWrite = vi.fn();
     const fetchTxn = vi.fn();
-    const { deps } = makeDeps(row, { fetchTxn, moveToAccount });
+    const { deps } = makeDeps(row, { fetchTxn, sendPreparedLineWrite });
 
     const result = await undoPost('txn-1', { id: 'u-1', label: 'Maria K.' }, deps);
 
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
     expect(result).toMatchObject({ ok: true, status: 'PENDING' });
   });
 
   it('throws (instead of silently re-queuing) when a POSTED txn no longer exists in QuickBooks', async () => {
     const row = makeTxnRow({ status: 'POSTED', postedAt: new Date() });
-    const moveToAccount = vi.fn();
-    const { deps } = makeDeps(row, { fetchTxn: async () => null, moveToAccount });
+    const sendPreparedLineWrite = vi.fn();
+    const { deps } = makeDeps(row, { fetchTxn: async () => null, sendPreparedLineWrite });
 
     await expect(undoPost('txn-1', { id: 'u-1', label: 'Maria K.' }, deps)).rejects.toThrow(/no longer exists/);
-    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(sendPreparedLineWrite).not.toHaveBeenCalled();
     expect(row.status).toBe('POSTED');
   });
 });

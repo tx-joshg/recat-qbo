@@ -61,6 +61,7 @@ interface McpTokenTransaction extends SecurityAuditWriter {
         prefix: string;
         label: string;
         expiresAt: Date;
+        viaExposedSession: boolean;
       };
     }): Promise<McpTokenRow>;
     findFirst(args: {
@@ -104,6 +105,11 @@ export interface CreateMcpTokenInput {
   userId: string;
   label: string;
   expiresInDays?: number;
+  /**
+   * Minted from a demo-mode devLink session. The token then stops working once
+   * a real company is connected, so it cannot outlive the session it came from.
+   */
+  viaExposedSession?: boolean;
 }
 
 export interface ListMcpTokensInput {
@@ -242,6 +248,7 @@ export async function createMcpToken(
             prefix,
             label,
             expiresAt,
+            viaExposedSession: input.viaExposedSession === true,
           },
         });
         await writeSecurityAudit(transaction, {

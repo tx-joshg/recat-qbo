@@ -17,6 +17,7 @@ vi.mock('../middleware/auth.js', () => ({
       return;
     }
     req.user = { id: userId, memberships: [] } as unknown as NonNullable<typeof req.user>;
+    req.sessionViaExposedLink = req.header('x-test-exposed') === '1';
     next();
   }) satisfies RequestHandler,
 }));
@@ -91,7 +92,18 @@ describe('/api/me/mcp-tokens', () => {
       userId: USER_ID,
       label: 'Automation',
       expiresInDays: 30,
+      viaExposedSession: false,
     });
+  });
+
+  it('marks a token created from a demo-mode devLink session', async () => {
+    await request(app())
+      .post('/api/me/mcp-tokens')
+      .set('x-test-user-id', USER_ID)
+      .set('x-test-exposed', '1')
+      .send({ label: 'Automation' })
+      .expect(201);
+    expect(mocks.create).toHaveBeenCalledWith(expect.objectContaining({ viaExposedSession: true }));
   });
 
   it('bounds and strictly validates list pagination before the service', async () => {

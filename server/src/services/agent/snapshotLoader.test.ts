@@ -66,7 +66,7 @@ describe('agent snapshot loader', () => {
           date: new Date('2026-07-20T00:00:00.000Z'),
           signedAmount: '-123.45',
           currency: 'CAD',
-          payee: 'Earlier merchant',
+          payee: 'BOUNDED MERCHANT #0042',
           memo: null,
           taxCalculation: 'TaxExcluded',
           tagIds: [TAG_ID],
@@ -114,7 +114,7 @@ describe('agent snapshot loader', () => {
         date: '2026-07-20',
         signedAmountCents: -12_345,
         currency: 'CAD',
-        payee: 'Earlier merchant',
+        payee: 'BOUNDED MERCHANT #0042',
         taxCalculation: 'TaxExcluded',
         lines: [{
           signedGrossCents: -12_345,
@@ -141,6 +141,100 @@ describe('agent snapshot loader', () => {
     expect(currentSql).toContain("'{JournalEntryLineDetail,AccountRef,value}'");
     expect(currentSql).toContain('COUNT(DISTINCT credit."accountQboId") = 1');
     expect(currentSql).not.toContain('txn."bankAccount"');
+    const historyCall = query.mock.calls
+      .find(([sql]) => sql.includes('agent-snapshot:history') && !sql.includes('history-lines'));
+    expect(historyCall?.slice(1)).toEqual([COMPANY_ID, TRANSACTION_ID, 'BOUNDED MERCHANT']);
+    expect(historyCall?.[0]).toContain('WHERE attempt."transactionId" = txn."id"');
+  });
+
+  it('only keeps verified history whose payee normalizes to the current payee', async () => {
+    const historyRow = (transactionId: string, payee: string) => ({
+      transactionId,
+      companyId: COMPANY_ID,
+      status: 'POSTED',
+      mutationStatus: 'VERIFIED',
+      date: new Date('2026-07-20T00:00:00.000Z'),
+      signedAmount: '-1.00',
+      currency: 'USD',
+      payee,
+      memo: null,
+      taxCalculation: 'NotApplicable',
+      categoryQboId: 'expense-a',
+      taxCodeQboId: null,
+      tagIds: [],
+      verifiedAt: new Date('2026-07-21T00:00:00.000Z'),
+    });
+    const db = {
+      $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({
+        $queryRawUnsafe: async (sql: string) => {
+          if (sql.includes('agent-snapshot:current')) return [{
+            id: TRANSACTION_ID,
+            companyId: COMPANY_ID,
+            revision: 1,
+            status: 'PENDING',
+            date: new Date('2026-07-28T00:00:00.000Z'),
+            amount: '-1.00',
+            currency: 'USD',
+            sourceAccountQboId: 'source-bank',
+            payee: 'Sysco Foods #212',
+            memo: null,
+            holdingAccountIds: [],
+            taxSupportStatus: 'needs_setup',
+            taxUsingSalesTax: null,
+            configVersion: 'config-v1',
+          }];
+          if (sql.includes('agent-snapshot:accounts')) return [
+            { qboId: 'source-bank', fullName: 'Source', classification: 'Bank', accountType: 'Bank', active: true },
+            { qboId: 'expense-a', fullName: 'Expense A', classification: 'Expenses', accountType: 'Expense', active: true },
+          ];
+          if (sql.includes('agent-snapshot:history-lines')) return [];
+          if (sql.includes('agent-snapshot:history')) return [
+            historyRow(HISTORY_ID, 'SYSCO FOODS #9'),
+            historyRow('66666666-6666-4666-8666-666666666666', 'Unrelated vendor'),
+          ];
+          return [];
+        },
+      }),
+    } as AgentSnapshotLoaderDb;
+
+    const source = await loadAgentSnapshotSource(COMPANY_ID, TRANSACTION_ID, db);
+
+    expect(source.similarVerifiedTransactions.map((entry) => entry.transactionId))
+      .toEqual([HISTORY_ID]);
+  });
+
+  it('skips the history query when the payee has no comparable tokens', async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('agent-snapshot:current')) return [{
+        id: TRANSACTION_ID,
+        companyId: COMPANY_ID,
+        revision: 1,
+        status: 'PENDING',
+        date: new Date('2026-07-28T00:00:00.000Z'),
+        amount: '-1.00',
+        currency: 'USD',
+        sourceAccountQboId: 'source-bank',
+        payee: '#12345',
+        memo: null,
+        holdingAccountIds: [],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: null,
+        configVersion: 'config-v1',
+      }];
+      if (sql.includes('agent-snapshot:accounts')) return [
+        { qboId: 'source-bank', fullName: 'Source', classification: 'Bank', accountType: 'Bank', active: true },
+      ];
+      return [];
+    });
+    const db = {
+      $transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
+        callback({ $queryRawUnsafe: query }),
+    } as AgentSnapshotLoaderDb;
+
+    const source = await loadAgentSnapshotSource(COMPANY_ID, TRANSACTION_ID, db);
+
+    expect(source.similarVerifiedTransactions).toEqual([]);
+    expect(query.mock.calls.some(([sql]) => sql.includes('agent-snapshot:history'))).toBe(false);
   });
 
   it.each([
