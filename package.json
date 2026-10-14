@@ -29,5 +29,8 @@
   },
   "dependencies": {
     "prisma": "^6.10.0"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.2"
   }
 }
