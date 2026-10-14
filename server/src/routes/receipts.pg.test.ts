@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import request from 'supertest';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../lib/db.js';
 import {
   afterAll,
   afterEach,

@@ -13,7 +13,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import type { RawPurchase, RawDeposit } from '../lib/qbo/real.js';
-import type { PrismaClient, Prisma } from '@prisma/client';
+import type { PrismaClient, Prisma } from '../lib/db.js';
 import { QBO_NOT_APPLICABLE_TAX_CODE, type AuditAction, type SplitDto, type StagedCategorization, type TaxDisposition, type TxnStatus } from '@recat/shared';
 import {
   QboSyncTokenConflict,

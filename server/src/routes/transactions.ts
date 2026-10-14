@@ -7,8 +7,8 @@
 
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { Prisma } from '@prisma/client';
-import type { User } from '@prisma/client';
+import { Prisma } from '../lib/db.js';
+import type { User } from '../lib/db.js';
 import {
   MAX_EXPECTED_TRANSACTION_REVISION,
   type CategorizationMutationResult,

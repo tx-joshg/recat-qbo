@@ -957,7 +957,7 @@ async function stageWithOwner<T>(
     await fence(key, owner, tx);
     if (authority !== undefined) {
       await assertLiveStageAuthority(
-        tx as unknown as import('@prisma/client').Prisma.TransactionClient,
+        tx as unknown as import('../lib/db.js').Prisma.TransactionClient,
         authority.context,
         authority.proof,
         parsed.data,

@@ -4,8 +4,8 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { Prisma } from '@prisma/client';
-import type { Company, User } from '@prisma/client';
+import { Prisma } from '../lib/db.js';
+import type { Company, User } from '../lib/db.js';
 import type { DashboardWidget } from '@recat/shared';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';

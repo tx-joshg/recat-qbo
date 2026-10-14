@@ -11,7 +11,7 @@ import {
   expect,
   it,
 } from 'vitest';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../lib/db.js';
 import { errorMiddleware } from '../lib/http.js';
 import { createSession, SESSION_COOKIE } from '../middleware/auth.js';
 import {

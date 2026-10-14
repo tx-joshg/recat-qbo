@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../../lib/db.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import type { DurableMutationResult } from '../writeback.js';

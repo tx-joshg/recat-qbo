@@ -7,7 +7,7 @@
 //                endpoint is configured. Sends payee/memo/amount + the category
 //                name list, NEVER the books. Cached per (companyId, payee).
 
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../lib/db.js';
 import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { completeCategory, type CategoryProviderSettings } from './ai/provider.js';

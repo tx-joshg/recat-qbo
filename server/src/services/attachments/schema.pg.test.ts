@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../../lib/db.js';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;

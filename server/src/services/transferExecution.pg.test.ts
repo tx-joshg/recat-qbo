@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   PrismaClient,
   type Prisma,
-} from '@prisma/client';
+} from '../lib/db.js';
 import {
   afterAll,
   beforeAll,

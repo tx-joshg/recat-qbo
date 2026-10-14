@@ -5,7 +5,7 @@ import type {
   ReceiptDocumentStatus,
   ReceiptSourceKind,
   TransactionAttachment,
-} from '@prisma/client';
+} from '../lib/db.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { streamToResponse } from '../lib/responseStream.js';

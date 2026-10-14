@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '../../lib/db.js';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { runSerializableTransaction } from '../../lib/serializableTransaction.js';
 import type { AttachmentActor } from '../attachments/operations.js';

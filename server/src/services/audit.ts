@@ -3,7 +3,7 @@
 // commits atomically with the status change (CLAUDE.md requirement).
 // There is intentionally no update or delete API for this table.
 
-import type { AuditEntry, Prisma, PrismaClient } from '@prisma/client';
+import type { AuditEntry, Prisma, PrismaClient } from '../lib/db.js';
 import type { AuditAction, AuditEntryDto } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 

@@ -2,7 +2,7 @@
 // after 15 minutes, and are single-use (claimed with a guarded updateMany so
 // concurrent clicks can't both win).
 
-import type { User } from '@prisma/client';
+import type { User } from '../lib/db.js';
 import { env } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { sendMail } from '../lib/mailer.js';

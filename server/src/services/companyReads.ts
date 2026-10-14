@@ -1,7 +1,7 @@
 import { categorizationSourceGrossCents } from './tax/sourceGross.js';
 import { CategorizationError } from './categorizationError.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../lib/db.js';
 import type {
   CompanyDto,
   QboAccountDto,

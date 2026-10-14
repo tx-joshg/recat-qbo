@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../../lib/db.js';
 import { describe, expect, it, vi } from 'vitest';
 import { rebuildRuleCandidates } from './ruleCandidatePersistence.js';
 

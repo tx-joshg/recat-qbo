@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../../lib/db.js';
 import {
   LIVE_POLICY_VERSION,
   LiveGateError,
