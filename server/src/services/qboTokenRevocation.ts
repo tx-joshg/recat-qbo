@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../lib/db.js';
 import { prisma } from '../lib/prisma.js';
 import type { QboRevocationSource } from '../lib/qbo/types.js';
 

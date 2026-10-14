@@ -7,6 +7,7 @@ COPY server/package.json server/
 COPY client/package.json client/
 RUN npm ci
 COPY prisma ./prisma
+COPY prisma.config.ts ./
 RUN npx prisma generate
 COPY shared ./shared
 COPY server ./server
@@ -23,6 +24,7 @@ COPY server/package.json server/
 COPY client/package.json client/
 RUN npm ci --omit=dev
 COPY prisma ./prisma
+COPY prisma.config.ts ./
 RUN npx prisma generate
 COPY shared ./shared
 COPY --from=build /app/server/dist ./server/dist

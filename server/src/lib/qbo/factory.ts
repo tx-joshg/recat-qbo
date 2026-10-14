@@ -7,7 +7,7 @@
 // Cross-agent modules (lib/crypto, services/instanceSettings) are imported
 // lazily so the demo seed can run before they exist.
 
-import type { Company } from '@prisma/client';
+import type { Company } from '../db.js';
 import type { QboConnectionTestDto, QboPreflightDto } from '@recat/shared';
 import type {
   QboClient,

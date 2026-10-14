@@ -1,4 +1,4 @@
-import type { Company, Prisma } from '@prisma/client';
+import type { Company, Prisma } from '../lib/db.js';
 import { HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import type {

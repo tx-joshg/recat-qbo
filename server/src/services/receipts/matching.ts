@@ -3,7 +3,7 @@ import type {
   Prisma,
   PrismaClient,
   ReceiptDocumentStatus,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import type {
   AttachmentOperationDto,
   ReceiptDetailDto,

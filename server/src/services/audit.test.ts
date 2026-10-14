@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../lib/db.js';
 import type { AuditEntryDto } from '@recat/shared';
 import {
   AUDIT_CSV_HEADER,

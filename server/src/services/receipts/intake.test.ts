@@ -1,4 +1,4 @@
-import type { ReceiptSourceKind } from '@prisma/client';
+import type { ReceiptSourceKind } from '../../lib/db.js';
 import { describe, expect, it } from 'vitest';
 import type { AttachmentActor } from '../attachments/operations.js';
 import {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../lib/db.js';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../lib/prisma.js';
 import * as qboFactory from '../lib/qbo/factory.js';

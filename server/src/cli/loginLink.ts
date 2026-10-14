@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { User } from '@prisma/client';
+import type { User } from '../lib/db.js';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import { issueMagicLink } from '../services/magicLink.js';

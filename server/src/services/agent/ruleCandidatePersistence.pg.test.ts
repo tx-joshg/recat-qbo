@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '../../lib/db.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type {
   VerifiedCategorizationOutcome,

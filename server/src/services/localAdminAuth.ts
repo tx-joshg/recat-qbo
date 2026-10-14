@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import type { Membership, User } from '@prisma/client';
+import type { Membership, User } from '../lib/db.js';
 import { localAdminConfig } from '../env.js';
 import { prisma } from '../lib/prisma.js';
 import type { LocalAdminConfig } from './localAdminConfig.js';

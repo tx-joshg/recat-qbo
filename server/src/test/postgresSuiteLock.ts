@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../lib/db.js';
 
 const AGENT_JOB_SUITE_LOCK = 728_202_603;
 

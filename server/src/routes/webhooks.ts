@@ -9,7 +9,7 @@
 
 import express, { Router } from 'express';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../lib/db.js';
 import { env } from '../env.js';
 import { asyncHandler } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';

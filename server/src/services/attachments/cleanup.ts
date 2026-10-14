@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../../lib/db.js';
 import { prisma } from '../../lib/prisma.js';
 import { AttachmentError } from './types.js';
 

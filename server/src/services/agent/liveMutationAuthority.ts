@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../../lib/db.js';
 import type { StageCategorizationInput } from '@recat/shared';
 import type { EntityLeaseKey } from '../entityLease.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';

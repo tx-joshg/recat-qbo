@@ -4,7 +4,7 @@
 
 import express, { Router } from 'express';
 import { z } from 'zod';
-import type { Membership, User } from '@prisma/client';
+import type { Membership, User } from '../lib/db.js';
 import type { SessionDto, UserDto } from '@recat/shared';
 import { env } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';

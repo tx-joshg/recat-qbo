@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../../lib/db.js';
 import type { AttachmentUploadGrantDto } from '@recat/shared';
 import { randomToken, sha256Hex } from '../../lib/crypto.js';
 import { prisma } from '../../lib/prisma.js';

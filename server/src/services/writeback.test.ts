@@ -1,6 +1,6 @@
 import { mapPurchaseTaxSnapshot, preparePurchaseRecategorization, preparePurchaseRestore } from '../lib/qbo/purchaseTax.js';
 import { describe, expect, it, vi } from 'vitest';
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '../lib/db.js';
 import type { StagedCategorization } from '@recat/shared';
 import {
   QboRequestTimeout,

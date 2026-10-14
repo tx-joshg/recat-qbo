@@ -4,7 +4,7 @@ import type {
   Prisma,
   PrismaClient,
   TransactionAttachment,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import type {
   ReceiptExtractionDto,
 } from '@recat/shared';

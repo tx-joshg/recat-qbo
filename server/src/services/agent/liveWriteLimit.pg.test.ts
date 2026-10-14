@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../../lib/db.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
 import { issueLiveWritePermit } from './liveWriteLimit.js';

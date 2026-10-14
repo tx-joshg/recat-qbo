@@ -1,5 +1,5 @@
 import type { LivePauseStateDto } from '@recat/shared';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../../lib/db.js';
 import { prisma } from '../../lib/prisma.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
 import { TAX_REFERENCE_TTL_MS } from '../tax/reference.js';

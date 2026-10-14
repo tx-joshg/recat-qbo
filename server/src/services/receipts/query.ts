@@ -3,10 +3,10 @@ import type {
   PrismaClient,
   ReceiptDocumentStatus,
   ReceiptSourceKind,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import {
   Prisma as PrismaRuntime,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import { z } from 'zod';
 import type {
   AttachmentDto,

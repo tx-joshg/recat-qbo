@@ -6,7 +6,7 @@ import type {
   AttachmentStatus as StoredAttachmentStatus,
   Prisma,
   PrismaClient,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import type {
   AttachmentDto,
   AttachmentOperationDto,

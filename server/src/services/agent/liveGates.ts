@@ -5,7 +5,7 @@ import type {
   LiveReadinessDto,
   TaxReadinessDto,
 } from '@recat/shared';
-import type { Prisma } from '@prisma/client';
+import type { Prisma } from '../../lib/db.js';
 import { prisma } from '../../lib/prisma.js';
 import { env } from '../../env.js';
 import { decrypt } from '../../lib/crypto.js';

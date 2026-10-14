@@ -7,7 +7,7 @@
 // auto-post rules, and record a SyncLog row. QBO is always the source of truth.
 
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../lib/db.js';
 import type { SuggestionDto } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import type { QboTxn } from '../lib/qbo/types.js';

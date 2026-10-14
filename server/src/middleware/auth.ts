@@ -3,7 +3,7 @@
 
 import type { RequestHandler } from 'express';
 import type { Role } from '@recat/shared';
-import type { User } from '@prisma/client';
+import type { User } from '../lib/db.js';
 import { env, isProd } from '../env.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { asyncHandler, HttpError } from '../lib/http.js';
