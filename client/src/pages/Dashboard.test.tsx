@@ -49,7 +49,7 @@ function dashboardData(overrides: Partial<DashboardDataDto> = {}): DashboardData
 
 function renderDashboard() {
   return render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+    <MemoryRouter>
       <Dashboard />
     </MemoryRouter>,
   );
@@ -148,7 +148,7 @@ it('discards a previous company response after switching companies', async () =>
   mocks.dashboard.mockResolvedValue(dashboardData({ breakdown: [{ name: 'Current company category', amount: 800 }] }));
   const view = renderDashboard();
   mocks.companyId = 'COMPANY_SECOND';
-  view.rerender(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><Dashboard /></MemoryRouter>);
+  view.rerender(<MemoryRouter><Dashboard /></MemoryRouter>);
   expect(await screen.findByText('Current company category')).toBeVisible();
   await act(async () => finishOld(dashboardData({ breakdown: [{ name: 'Previous company category', amount: 800 }] })));
   expect(screen.queryByText('Previous company category')).not.toBeInTheDocument();
