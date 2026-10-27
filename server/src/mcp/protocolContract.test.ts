@@ -28,14 +28,14 @@ describe('MCP protocol dependency contract', () => {
     };
 
     expect(packageJson.dependencies).toMatchObject({
-      '@modelcontextprotocol/express': '2.0.0',
-      '@modelcontextprotocol/node': '2.0.0',
-      '@modelcontextprotocol/server': '2.0.0',
+      '@modelcontextprotocol/express': '2.0.2',
+      '@modelcontextprotocol/node': '2.1.2',
+      '@modelcontextprotocol/server': '2.4.0',
       zod: '^3.24.1',
-      'zod-v4': 'npm:zod@4.2.0',
+      'zod-v4': 'npm:zod@4.6.7',
     });
     expect(packageJson.devDependencies).toMatchObject({
-      '@modelcontextprotocol/client': '2.0.0',
+      '@modelcontextprotocol/client': '2.4.0',
       '@modelcontextprotocol/conformance': '0.2.0-alpha.10',
     });
 
