@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../../lib/db.js';
 import { z } from 'zod';
 import { env } from '../../env.js';
 import type { AttachmentBlobReader } from '../attachments/types.js';

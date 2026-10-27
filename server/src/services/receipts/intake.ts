@@ -4,7 +4,7 @@ import type {
   PrismaClient,
   ReceiptDocumentStatus,
   ReceiptSourceKind,
-} from '@prisma/client';
+} from '../../lib/db.js';
 import type {
   CreateReceiptsResult,
   ReceiptDto,

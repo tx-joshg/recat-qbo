@@ -5,7 +5,7 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import type { Company } from '@prisma/client';
+import type { Company } from '../lib/db.js';
 import {
   isHoldingAccountName,
   type CompanyDto,

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '../../lib/db.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { env } from '../../env.js';
 import { prisma } from '../../lib/prisma.js';

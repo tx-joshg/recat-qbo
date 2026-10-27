@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import Busboy from 'busboy';
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import type { User, Membership, TransactionAttachment } from '@prisma/client';
+import type { User, Membership, TransactionAttachment } from '../lib/db.js';
 import type {
   AttachmentOperationDto,
   AttachmentSourceInput,

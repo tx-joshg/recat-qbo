@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient, type Prisma } from '@prisma/client';
+import { PrismaClient, type Prisma } from '../../lib/db.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import {

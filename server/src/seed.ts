@@ -6,7 +6,7 @@
 // prototype's txn extras, audit entries, sync log, and the demo financial
 // series used by dashboard/reports in mock mode.
 
-import { Prisma } from '@prisma/client';
+import { Prisma } from './lib/db.js';
 import { prisma } from './lib/prisma.js';
 import { env } from './env.js';
 import { MockQboClient, MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR } from './lib/qbo/mock.js';

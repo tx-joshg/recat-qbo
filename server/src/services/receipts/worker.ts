@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma, type PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '../../lib/db.js';
 import { prisma } from '../../lib/prisma.js';
 import { openAttachmentBlob } from '../attachments/blobStore.js';
 import { AttachmentError } from '../attachments/types.js';
