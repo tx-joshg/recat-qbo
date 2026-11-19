@@ -5,7 +5,7 @@ import type {
   ReceiptDetailDto,
   ReceiptListResponse,
 } from '@recat/shared';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import { issueAttachmentUploadGrant } from '../services/attachments/grants.js';
 import { QBO_MAX_UPLOAD_REQUEST_BYTES } from '../services/attachments/validation.js';
 import { createReceipts } from '../services/receipts/intake.js';

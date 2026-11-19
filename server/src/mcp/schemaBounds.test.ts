@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import {
   MCP_SCHEMA_BOUNDS,
   McpSchemaBoundsError,

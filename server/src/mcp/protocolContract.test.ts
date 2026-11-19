@@ -3,8 +3,7 @@ import { describe, expect, it } from 'vitest';
 import * as mcpExpress from '@modelcontextprotocol/express';
 import * as mcpNode from '@modelcontextprotocol/node';
 import * as mcpServer from '@modelcontextprotocol/server';
-import * as zodV3 from 'zod';
-import * as zodV4 from 'zod-v4';
+import * as zod from 'zod';
 import { receiptToolDefinitions } from './receiptTools.js';
 import {
   MCP_AUTHORED_SCHEMA_BOUNDS,
@@ -21,7 +20,7 @@ describe('MCP protocol dependency contract', () => {
     expect(mcpExpress.requireBearerAuth).toBeTypeOf('function');
   });
 
-  it('pins the final split packages and keeps Zod 4 isolated from application Zod 3', async () => {
+  it('pins the final split packages and a single Zod 4 for the application and MCP', async () => {
     const packageJson = JSON.parse(await readFile(packageJsonUrl, 'utf8')) as {
       dependencies: Record<string, string>;
       devDependencies: Record<string, string>;
@@ -31,17 +30,16 @@ describe('MCP protocol dependency contract', () => {
       '@modelcontextprotocol/express': '2.0.2',
       '@modelcontextprotocol/node': '2.1.2',
       '@modelcontextprotocol/server': '2.4.0',
-      zod: '^3.24.1',
-      'zod-v4': 'npm:zod@4.6.7',
+      zod: '^4.6.7',
     });
     expect(packageJson.devDependencies).toMatchObject({
       '@modelcontextprotocol/client': '2.4.0',
       '@modelcontextprotocol/conformance': '0.2.0-alpha.10',
     });
 
-    expect(zodV3.ZodFirstPartyTypeKind).toBeDefined();
-    expect(zodV4.toJSONSchema).toBeTypeOf('function');
-    expect(zodV4).not.toBe(zodV3);
+    expect(packageJson.dependencies).not.toHaveProperty('zod-v4');
+    expect(packageJson.dependencies).not.toHaveProperty('zod-to-json-schema');
+    expect(zod.toJSONSchema).toBeTypeOf('function');
   });
 
   it('serializes every receipt schema as a strict bounded MCP 2.0 contract', () => {

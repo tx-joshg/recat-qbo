@@ -6,7 +6,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { randomUUID } from 'node:crypto';
 import type { Tracer } from '@opentelemetry/api';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import type { McpPrincipal } from './auth.js';
 import {
   DEFAULT_READ_LIMIT,

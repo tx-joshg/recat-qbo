@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 
 const MAX_LINES = 20;
 const MAX_TAGS = 20;
@@ -25,7 +24,7 @@ function providerText(minimum: number, maximum: number) {
     .regex(CANONICAL_TEXT_PATTERN)
     .superRefine((value, context) => {
       if (Array.from(value).length > maximum) {
-        context.addIssue({ code: z.ZodIssueCode.too_big, type: 'string', maximum, inclusive: true, message: 'Text is too long.' });
+        context.addIssue({ code: 'too_big', origin: 'string', maximum, inclusive: true, input: value, message: 'Text is too long.' });
       }
     })
     .describe(`${PROVIDER_TEXT_MARKER_PREFIX}${maximum}`);
@@ -116,17 +115,14 @@ export const agentDecisionSchema = z.object({ decision }).strict();
 export type AgentDecision = z.infer<typeof decision>;
 export type AgentDecisionEnvelope = z.infer<typeof agentDecisionSchema>;
 
-const generatedAgentDecisionJsonSchema = zodToJsonSchema(agentDecisionSchema, {
-  $refStrategy: 'none',
-  rejectedAdditionalProperties: false,
-  postProcess: (jsonSchema, definition) => {
-    const description = definition.description;
-    if (!jsonSchema || typeof description !== 'string' || !description.startsWith(PROVIDER_TEXT_MARKER_PREFIX)) {
-      return jsonSchema;
-    }
-    const maximum = Number(description.slice(PROVIDER_TEXT_MARKER_PREFIX.length));
-    const { description: _marker, ...providerSchema } = jsonSchema;
-    return { ...providerSchema, maxLength: maximum };
+const generatedAgentDecisionJsonSchema = z.toJSONSchema(agentDecisionSchema, {
+  target: 'draft-7',
+  reused: 'inline',
+  override: ({ jsonSchema }) => {
+    const description = jsonSchema.description;
+    if (typeof description !== 'string' || !description.startsWith(PROVIDER_TEXT_MARKER_PREFIX)) return;
+    delete jsonSchema.description;
+    jsonSchema.maxLength = Number(description.slice(PROVIDER_TEXT_MARKER_PREFIX.length));
   },
 });
 

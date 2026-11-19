@@ -8,7 +8,6 @@ const coreDirectory = dirname(fileURLToPath(import.meta.url));
 const allowedProductionModules = new Set([
   'node:buffer',
   'zod',
-  'zod-to-json-schema',
   './decision.js',
   './fakeModel.js',
   './model.js',

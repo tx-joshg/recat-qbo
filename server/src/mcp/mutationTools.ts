@@ -1,6 +1,6 @@
 import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import {
   prepareMcpCategorization,
   type PrepareMcpCategorizationInput,
