@@ -10,7 +10,7 @@ import type {
   McpRequestContext,
 } from '@modelcontextprotocol/server';
 import type { RequestHandler } from 'express';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import type { McpPrincipal } from './auth.js';
 import {
   companyReads,

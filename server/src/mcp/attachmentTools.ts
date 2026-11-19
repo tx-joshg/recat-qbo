@@ -5,7 +5,7 @@ import type {
   AttachmentSourceInput,
   AttachmentUploadGrantDto,
 } from '@recat/shared';
-import { z } from 'zod-v4';
+import { z } from 'zod';
 import {
   attachTransactionFiles,
   deleteTransactionAttachment,
