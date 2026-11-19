@@ -74,8 +74,10 @@ works as soon as setup finishes. **The package must pin v0.1.3 or later.**
 Earlier pins are not merely missing features: v0.1.0 strands users at first run,
 v0.1.1 predates the claim guard, and v0.1.2's guard is bypassable through
 `/auth/magic-link` ([#53](https://github.com/tx-joshg/recat-qbo/issues/53)). The
-package currently pins v0.1.5, which additionally recognizes localized
-QuickBooks companies ([#66](https://github.com/tx-joshg/recat-qbo/pull/66)).
+package currently pins v0.1.6. v0.1.5 added recognition of localized QuickBooks
+companies ([#66](https://github.com/tx-joshg/recat-qbo/pull/66)); v0.1.6 adds
+dependency security updates, the Zod 4 migration and the 2026-10-13 review
+fixes.
 
 A user can still type a different address, and the wizard now warns that password
 sign-in will not apply to it. That is the remaining support case, and it is a
@@ -282,13 +284,15 @@ and the MCP host guard, both closed in
 contributor's rather than something reproduced here. It is specific and measured,
 which is why it was acted on, but it is one person on one device.
 
-**The v0.1.5 images have not themselves been booted.** The verification above ran
-against v0.1.3. Carrying it forward rests on the boot-relevant surface being
-unchanged between the two — `git diff v0.1.3 v0.1.5` is empty for
-`prisma/migrations`, `server/src/index.ts`, `server/src/env.ts`, the `Dockerfile`,
-and the auth, setup and trusted-proxy code. What changed is reporting, the probe
-CLI, holding-account matching and CSS. That is a strong argument rather than a
-run, and a boot check belongs in the submission checklist below.
+**The v0.1.6 images have not themselves been booted.** The verification above ran
+against v0.1.3, and unlike v0.1.5 the boot-relevant surface has changed since:
+`git diff v0.1.5 v0.1.6` adds four migrations under `prisma/migrations`, and the
+`Dockerfile` now copies `prisma.config.ts` and runs the app as the unprivileged
+`node` user. The same changes have shipped in the `:latest` images built from
+main since October, but no Umbrel boot of them is on record. A boot from the
+pinned digests (first-run migrations, setup with the app password, a `down` /
+`up` cycle) belongs in the submission checklist below before this pin goes
+upstream.
 
 **@salmonumbrella has since confirmed the package works on a real device**,
 including QuickBooks connecting through a TLS front. That closes the largest gap

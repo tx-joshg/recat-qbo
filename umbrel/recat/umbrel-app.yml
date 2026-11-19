@@ -33,16 +33,16 @@ description: >-
   address and the password stops working — Umbrel installs have no outbound
   email, so until you add SMTP in Settings you would have to fetch each sign-in
   link from this app's logs by hand.
-version: "0.1.5"
+version: "0.1.6"
 releaseNotes: >-
-  First Umbrel release. Setup requires the app password shown on this page, so
-  an instance reachable before it is configured cannot be claimed by anyone
-  else, and no sign-in link is ever handed out to an unauthenticated caller.
-  Sign-in rate limits apply per client rather than to the whole install, so
-  nobody else's wrong guesses can lock you out. QuickBooks companies outside the
-  US are recognized, including their localized account names. The wizard fills
-  in the administrator address, and that same password signs you in once setup
-  finishes.
+  Security and reliability release. Updates the MCP server SDK, which fixes
+  messages reaching the wrong client on shared connections, a memory exhaustion
+  from a single oversized request, and bearer tokens accepted for another
+  service. Moves the server to Zod 4 and patches body-parser, qs and nodemailer.
+  Fixes from a full code review harden QuickBooks writes and undo, keep tax and
+  deposit details intact, and stop a failing receipt export from crashing the
+  app. The app now runs as an unprivileged user. Four database migrations apply
+  automatically on start.
 developer: Josh Goble
 website: https://github.com/tx-joshg/recat-qbo
 repo: https://github.com/tx-joshg/recat-qbo
